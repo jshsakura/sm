@@ -11,6 +11,10 @@
 #include "../types.h"
 #ifdef TARGET_GNW
 #include "gw_malloc.h"
+/* The device framebuffer is RGB565. */
+#ifndef PPU_RGB565
+#define PPU_RGB565 1
+#endif
 #endif
 typedef uint64_t uint64;
 typedef uint32_t uint32;
@@ -735,7 +739,11 @@ static void PpuDrawBackgrounds(Ppu *ppu, int y, bool sub) {
 static NOINLINE void PpuDrawWholeLine(Ppu *ppu, uint y) {
   if (ppu->forcedBlank) {
     uint8 *dst = &ppu->renderBuffer[(y - 1) * ppu->renderPitch];
+#ifdef PPU_RGB565
+    size_t n = sizeof(uint16_t) * (256 + ppu->extraLeftRight * 2);
+#else
     size_t n = sizeof(uint32) * (256 + ppu->extraLeftRight * 2);
+#endif
     memset(dst, 0, n);
     return;
   }
@@ -771,7 +779,11 @@ static NOINLINE void PpuDrawWholeLine(Ppu *ppu, uint y) {
   uint32 cw_clip_math = ((cwin.bits & kCwBitsMod[ppu->clipMode]) ^ kCwBitsMod[ppu->clipMode + 4]) |
     ((cwin.bits & kCwBitsMod[ppu->preventMathMode]) ^ kCwBitsMod[ppu->preventMathMode + 4]) << 8;
 
+#ifdef PPU_RGB565
+  uint16_t *dst = (uint16_t*)&ppu->renderBuffer[(y - 1) * ppu->renderPitch], *dst_org = dst;
+#else
   uint32 *dst = (uint32*)&ppu->renderBuffer[(y - 1) * ppu->renderPitch], *dst_org = dst;
+#endif
 
   dst += (ppu->extraLeftRight - ppu->extraLeftCur);
 
@@ -787,9 +799,15 @@ static NOINLINE void PpuDrawWholeLine(Ppu *ppu, uint y) {
       uint32 i = left;
       do {
         uint32 color = ppu->cgram[ppu->bgBuffers[0].data[i] & 0xff];
+#ifdef PPU_RGB565
+        dst[0] = (ppu->brightnessMult[color & clip_color_mask] >> 3) << 11 |
+                 (ppu->brightnessMult[(color >> 5) & clip_color_mask] >> 2) << 5 |
+                 (ppu->brightnessMult[(color >> 10) & clip_color_mask] >> 3);
+#else
         dst[0] = ppu->brightnessMult[color & clip_color_mask] << 16 |
           ppu->brightnessMult[(color >> 5) & clip_color_mask] << 8 |
           ppu->brightnessMult[(color >> 10) & clip_color_mask];
+#endif
       } while (dst++, ++i < right);
     } else {
       uint8 *half_color_map = ppu->halfColor ? ppu->brightnessMultHalf : ppu->brightnessMult;
@@ -824,7 +842,11 @@ static NOINLINE void PpuDrawWholeLine(Ppu *ppu, uint y) {
             b += b2;
           }
         }
+#ifdef PPU_RGB565
+        dst[0] = (color_map[b] >> 3) | (color_map[g] >> 2) << 5 | (color_map[r] >> 3) << 11;
+#else
         dst[0] = color_map[b] | color_map[g] << 8 | color_map[r] << 16;
+#endif
       } while (dst++, ++i < right);
     }
   } while (cw_clip_math >>= 1, ++windex < cwin.nr);
@@ -886,11 +908,21 @@ static void ppu_handlePixel(Ppu* ppu, int x, int y) {
     }
   }
   int row = y - 1;
+#ifdef PPU_RGB565
+  uint8 *pixelBuffer = (uint8*) &ppu->renderBuffer[row * ppu->renderPitch + (x + ppu->extraLeftRight) * 2];
+  uint32 r8 = ((r << 3) | (r >> 2)) * ppu->brightness / 15;
+  uint32 g8 = ((g << 3) | (g >> 2)) * ppu->brightness / 15;
+  uint32 b8 = ((b << 3) | (b >> 2)) * ppu->brightness / 15;
+  uint16_t px = (uint16_t)(((r8 >> 3) << 11) | ((g8 >> 2) << 5) | (b8 >> 3));
+  pixelBuffer[0] = (uint8)px;
+  pixelBuffer[1] = (uint8)(px >> 8);
+#else
   uint8 *pixelBuffer = (uint8*) &ppu->renderBuffer[row * ppu->renderPitch + (x + ppu->extraLeftRight) * 4];
   pixelBuffer[0] = ((b << 3) | (b >> 2)) * ppu->brightness / 15;
   pixelBuffer[1] = ((g << 3) | (g >> 2)) * ppu->brightness / 15;
   pixelBuffer[2] = ((r << 3) | (r >> 2)) * ppu->brightness / 15;
   pixelBuffer[3] = 0;
+#endif
 }
 
 static int ppu_getPixel(Ppu* ppu, int x, int y, bool sub, int* r, int* g, int* b) {
