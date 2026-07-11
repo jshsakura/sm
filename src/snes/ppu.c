@@ -9,9 +9,14 @@
 #include "ppu.h"
 #include "snes.h"
 #include "../types.h"
+#ifdef TARGET_GNW
+#include "gw_malloc.h"
+#endif
 typedef uint64_t uint64;
 typedef uint32_t uint32;
+#ifndef TARGET_GNW
 typedef uint32_t uint;
+#endif
 typedef uint16_t uint16;
 typedef int16_t int16;
 typedef uint8_t uint8;
@@ -97,15 +102,27 @@ enum {
 };
 
 Ppu* ppu_init(Snes* snes) {
+#ifdef TARGET_GNW
+  /* One PPU on the device (there is no reference emulator to run alongside), so
+   * a static instance beats a malloc from the overlay pool. VRAM goes to ITC RAM. */
+  static Ppu g_ppu;
+  Ppu* ppu = &g_ppu;
+  if (ppu->vram == NULL)
+    ppu->vram = (uint16_t *)itc_calloc(1, 0x10000);
+#else
   Ppu* ppu = malloc(sizeof(Ppu));
+#endif
   ppu->snes = snes;
   return ppu;
 }
 
 void ppu_free(Ppu* ppu) {
+#ifndef TARGET_GNW
   free(ppu);
+#endif
 }
 
+#ifndef TARGET_GNW
 void ppu_copy(Ppu *ppu, Ppu *ppu_src) {
   Snes *snes = ppu->snes;
   size_t pitch = ppu->renderPitch;
@@ -115,13 +132,22 @@ void ppu_copy(Ppu *ppu, Ppu *ppu_src) {
   ppu->renderPitch = (uint32_t)pitch;
   ppu->snes = snes;
 }
+#endif  /* !TARGET_GNW */
 
 void ppu_reset(Ppu* ppu) {
   {
     Snes *snes = ppu->snes;
     size_t pitch = ppu->renderPitch;
     uint8_t *renderBuffer = ppu->renderBuffer;
+#ifdef TARGET_GNW
+    /* vram is a pointer now: the wholesale memset below would throw it away. */
+    uint16_t *vram = ppu->vram;
+#endif
     memset(ppu, 0, sizeof(*ppu));
+#ifdef TARGET_GNW
+    ppu->vram = vram;
+    memset(ppu->vram, 0, 0x10000);
+#endif
     ppu->renderBuffer = renderBuffer;
     ppu->renderPitch = (uint32_t)pitch;
     ppu->snes = snes;
@@ -220,7 +246,16 @@ void ppu_reset(Ppu* ppu) {
 }
 
 void ppu_saveload(Ppu *ppu, SaveLoadFunc *func, void *ctx) {
+#ifdef TARGET_GNW
+  /* vram lives in ITC RAM now, so it is no longer contiguous with the rest of
+   * the struct. Emit the identical byte stream — VRAM first, then everything
+   * from vramPointer on — so savestates stay compatible with the PC build. */
+  func(ctx, ppu->vram, 0x8000 * sizeof(uint16_t));
+  func(ctx, &ppu->vramPointer,
+       offsetof(Ppu, pixelbuffer_placeholder) - offsetof(Ppu, vramPointer));
+#else
   func(ctx, &ppu->vram, offsetof(Ppu, pixelbuffer_placeholder) - offsetof(Ppu, vram));
+#endif
 }
 
 void PpuBeginDrawing(Ppu *ppu, uint8_t *pixels, size_t pitch, uint32_t render_flags) {

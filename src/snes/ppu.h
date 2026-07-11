@@ -64,7 +64,14 @@ typedef struct WindowLayer {
 struct Ppu {
   Snes* snes;
   // vram access
+#ifdef TARGET_GNW
+  /* 64 KB of VRAM would dominate this struct, and the struct has to live in the
+   * RAM_EMU overlay pool that also holds the game's code. Point at ITC RAM
+   * instead (see ppu_init) — same trick the zelda3 G&W port uses. */
+  uint16_t *vram;
+#else
   uint16_t vram[0x8000];
+#endif
   uint16_t vramPointer;
   bool vramIncrementOnHigh;
   uint16_t vramIncrement;

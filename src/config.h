@@ -1,6 +1,8 @@
 #pragma once
 #include "types.h"
+#ifndef HEADLESS
 #include <SDL_keycode.h>
+#endif
 
 enum {
   kKeys_Null,

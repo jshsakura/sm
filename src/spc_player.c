@@ -1511,7 +1511,12 @@ void Sfx3_Init(SpcPlayer *p) {
 }
 
 SpcPlayer *SpcPlayer_Create(void) {
+#ifdef TARGET_GNW
+  /* 66 KB (64 KB of it is APU RAM). Take it from AHB RAM, not the overlay pool. */
+  SpcPlayer *p = (SpcPlayer *)ahb_malloc(sizeof(SpcPlayer));
+#else
   SpcPlayer *p = (SpcPlayer *)malloc(sizeof(SpcPlayer));
+#endif
   memset(p, 0, sizeof(SpcPlayer));
   p->dsp = dsp_init(p->ram);
   p->reg_write_history = 0;

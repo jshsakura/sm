@@ -33,11 +33,22 @@ Snes* snes_init(uint8_t *ram) {
   snes->runningWhichVersion = 0;
 
   snes->cpu = cpu_init(snes, 0);
+#ifdef TARGET_GNW
+  /* No reference emulator on the device: the SPC700 emulator (66 KB, incl. 64 KB
+   * of ARAM) is dead weight because g_use_my_apu_code routes audio through
+   * spc_player, and the second PPU exists only to diff against. */
+  snes->apu = NULL;
+  snes->dma = dma_init(snes);
+  snes->my_ppu = ppu_init(snes);
+  snes->snes_ppu = snes->my_ppu;
+  snes->ppu = snes->my_ppu;
+#else
   snes->apu = apu_init();
   snes->dma = dma_init(snes);
   snes->my_ppu = ppu_init(snes);
   snes->snes_ppu = ppu_init(snes);
   snes->ppu = snes->snes_ppu;
+#endif
   snes->cart = cart_init(snes);
   snes->input1 = input_init(snes);
   snes->input2 = input_init(snes);
