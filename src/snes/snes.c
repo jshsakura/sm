@@ -502,9 +502,10 @@ uint8_t snes_read(Snes* snes, uint32_t adr) {
     if(adr >= 0x2100 && adr < 0x2200) {
       return snes_readBBus(snes, adr & 0xff); // B-bus
     }
-    if (adr == 0x4016 || adr == 0x4017) {
-      assert(0);
-    }
+    if (adr == 0x4016)
+      return input_read(snes->input1) | (snes->openBus & 0xfc);
+    if (adr == 0x4017)
+      return input_read(snes->input2) | 0x1c;
     if(adr >= 0x4200 && adr < 0x4220 || adr >= 0x4218 && adr < 0x4220) {
       return snes_readReg(snes, adr); // internal registers
     }
@@ -543,6 +544,10 @@ void snes_write(Snes* snes, uint32_t adr, uint8_t val) {
     }
     if(adr >= 0x2100 && adr < 0x2200) {
       snes_writeBBus(snes, adr & 0xff, val); // B-bus
+    }
+    if(adr == 0x4016) {
+      input_latch(snes->input1, val & 1); // strobe both controller ports
+      input_latch(snes->input2, val & 1);
     }
     if(adr >= 0x4200 && adr < 0x4220) {
       snes_writeReg(snes, adr, val); // internal registers

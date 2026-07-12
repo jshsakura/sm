@@ -105,6 +105,13 @@ int cpu_runOpcode(Cpu* cpu) {
   cpu->cyclesUsed = 0;
   if(cpu->stopped) return 1;
 
+  if(cpu->waiting) {
+    /* WAI holds the CPU until an interrupt is pending — including one the I flag
+     * will not let it take, which still wakes it. */
+    if(!(cpu->irqWanted || cpu->nmiWanted)) return 1;
+    cpu->waiting = false;
+  }
+
   // not stopped or waiting, execute a opcode or go to interrupt
   if((!cpu->i && cpu->irqWanted) || cpu->nmiWanted) {
     cpu->cyclesUsed = 7; // interrupt: at least 7 cycles
@@ -2056,7 +2063,13 @@ restart:
       break;
     }
     case 0xcb: { // wai imp
-      assert(0);
+      /* Halt until an interrupt. Super Metroid's reimplementation never runs a
+       * 65816 instruction, so this was left as assert(0) — and with -DNDEBUG that
+       * is a no-op, which means WAI silently did nothing. Games that idle their
+       * main loop on WAI (most of them) then run their vblank code at full tilt
+       * against a screen that is not in vblank. */
+      cpu->waiting = true;
+      cpu->cyclesUsed = 3;
       break;
     }
     case 0xcc: { // cpy abs
