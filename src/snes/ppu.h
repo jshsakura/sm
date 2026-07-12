@@ -43,6 +43,18 @@ enum {
  * which is where the work is. */
 extern bool g_ppu_skip_render;
 
+#ifdef TARGET_GNW
+/* Per-line hand-off. There is no room on the device for a 256x224 staging buffer,
+ * so this PPU has always rendered straight into the LCD framebuffer at its native
+ * size — which is exactly why the launcher's scaling options did nothing for this
+ * core: there was nothing between the renderer and the screen to scale.
+ *
+ * Point renderBuffer at a one-line buffer (renderPitch 0, so every line lands in
+ * the same place) and set this, and the port gets each finished line to place or
+ * stretch as it likes. y is 1-based, as ppu_runLine counts. */
+extern void (*g_ppu_line_cb)(unsigned y, const uint16_t *line);
+#endif
+
 typedef uint16_t PpuZbufType;
 
 // ClearBackdrop() fills these through a *(uint64*) cast. On ARM that compiles to

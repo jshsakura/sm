@@ -285,6 +285,10 @@ void ppu_handleVblank(Ppu* ppu) {
 
 bool g_ppu_skip_render;
 
+#ifdef TARGET_GNW
+void (*g_ppu_line_cb)(unsigned y, const uint16_t *line);
+#endif
+
 _Static_assert(_Alignof(PpuPixelPrioBufs) >= 8,
                "ClearBackdrop writes 64 bits at a time; on ARM that is STRD, which "
                "faults on an unaligned address. Keep the aligned(8) on the struct.");
@@ -774,6 +778,10 @@ static NOINLINE void PpuDrawWholeLine(Ppu *ppu, uint y) {
     size_t n = sizeof(uint32) * (256 + ppu->extraLeftRight * 2);
 #endif
     memset(dst, 0, n);
+#ifdef TARGET_GNW
+    if (g_ppu_line_cb)
+      g_ppu_line_cb(y, (const uint16_t *)dst);
+#endif
     return;
   }
 
@@ -889,6 +897,10 @@ static NOINLINE void PpuDrawWholeLine(Ppu *ppu, uint y) {
     }
   } while (cw_clip_math >>= 1, ++windex < cwin.nr);
 
+#ifdef TARGET_GNW
+  if (g_ppu_line_cb)
+    g_ppu_line_cb(y, dst_org);
+#endif
 }
 
 
