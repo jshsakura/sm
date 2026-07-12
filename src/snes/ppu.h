@@ -11,6 +11,15 @@ typedef struct Ppu Ppu;
 
 #include "snes.h"
 
+#ifdef TARGET_GNW
+/* The device framebuffer is RGB565. This used to be defined in ppu.c *after* it
+ * included this header, which meant every #ifdef PPU_RGB565 in the struct was
+ * silently false while the ones in the code were true. */
+#ifndef PPU_RGB565
+#define PPU_RGB565 1
+#endif
+#endif
+
 typedef struct BgLayer {
   uint16_t hScroll;
   uint16_t vScroll;
@@ -187,6 +196,15 @@ struct Ppu {
   uint8_t brightnessMultHalf[32 * 2];
   uint8_t mosaicModulo[kPpuXPixels];
 
+#ifdef PPU_RGB565
+  /* The composite loop's inner statement was four table lookups and a pack, per
+   * pixel: cgram[idx], then brightnessMult[] three times for R, G and B. But the
+   * result is a function of cgram and brightness alone — not of the pixel — so it
+   * is the same answer 57,344 times a frame. Bake it once, look it up once.
+   * Rebuilt when either input changes, which is a handful of times a frame. */
+  uint16_t palette565[256];
+  bool paletteDirty;
+#endif
 };
 
 Ppu* ppu_init(Snes* snes);

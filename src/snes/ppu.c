@@ -312,6 +312,9 @@ void ppu_runLine(Ppu* ppu, int line) {
         ((i << 3) | (i >> 2)) * ppu_brightness / 15;
       // Store 31 extra entries to remove the need for clamping to 31.
       memset(&ppu->brightnessMult[32], ppu->brightnessMult[31], 31);
+#ifdef PPU_RGB565
+      ppu->paletteDirty = true;
+#endif
     }
 
     // evaluate sprites
@@ -745,7 +748,24 @@ static void PpuDrawBackgrounds(Ppu *ppu, int y, bool sub) {
   }
 }
 
+#ifdef PPU_RGB565
+static void PpuRebuildPalette(Ppu *ppu) {
+  for (int i = 0; i < 256; i++) {
+    uint32 color = ppu->cgram[i];
+    ppu->palette565[i] = (uint16_t)(
+        (ppu->brightnessMult[color & 0x1f] >> 3) << 11 |
+        (ppu->brightnessMult[(color >> 5) & 0x1f] >> 2) << 5 |
+        (ppu->brightnessMult[(color >> 10) & 0x1f] >> 3));
+  }
+  ppu->paletteDirty = false;
+}
+#endif
+
 static NOINLINE void PpuDrawWholeLine(Ppu *ppu, uint y) {
+#ifdef PPU_RGB565
+  if (ppu->paletteDirty)
+    PpuRebuildPalette(ppu);   /* cgram or brightness moved since the last line */
+#endif
   if (ppu->forcedBlank) {
     uint8 *dst = &ppu->renderBuffer[(y - 1) * ppu->renderPitch];
 #ifdef PPU_RGB565
@@ -806,18 +826,27 @@ static NOINLINE void PpuDrawWholeLine(Ppu *ppu, uint y) {
     if (math_enabled_cur == 0 || fixed_color == 0 && !ppu->halfColor && !rendered_subscreen) {
       // Math is disabled (or has no effect), so can avoid the per-pixel maths check
       uint32 i = left;
+#ifdef PPU_RGB565
+      if (clip_color_mask == 0x1f) {
+        const uint16_t *pal = ppu->palette565;
+        const PpuZbufType *src = ppu->bgBuffers[0].data;
+        do {
+          dst[0] = pal[src[i] & 0xff];
+        } while (dst++, ++i < right);
+      } else {
+        /* clip: every component masks to index 0, and brightnessMult[0] is 0 */
+        do {
+          dst[0] = 0;
+        } while (dst++, ++i < right);
+      }
+#else
       do {
         uint32 color = ppu->cgram[ppu->bgBuffers[0].data[i] & 0xff];
-#ifdef PPU_RGB565
-        dst[0] = (ppu->brightnessMult[color & clip_color_mask] >> 3) << 11 |
-                 (ppu->brightnessMult[(color >> 5) & clip_color_mask] >> 2) << 5 |
-                 (ppu->brightnessMult[(color >> 10) & clip_color_mask] >> 3);
-#else
         dst[0] = ppu->brightnessMult[color & clip_color_mask] << 16 |
           ppu->brightnessMult[(color >> 5) & clip_color_mask] << 8 |
           ppu->brightnessMult[(color >> 10) & clip_color_mask];
-#endif
       } while (dst++, ++i < right);
+#endif
     } else {
       uint8 *half_color_map = ppu->halfColor ? ppu->brightnessMultHalf : ppu->brightnessMult;
       // Store this in locals
@@ -1566,6 +1595,9 @@ void ppu_write(Ppu* ppu, uint8_t adr, uint8_t val) {
         ppu->cgramBuffer = val;
       } else {
         ppu->cgram[ppu->cgramPointer++] = (val << 8) | ppu->cgramBuffer;
+#ifdef PPU_RGB565
+        ppu->paletteDirty = true;
+#endif
       }
       ppu->cgramSecondWrite = !ppu->cgramSecondWrite;
       break;
