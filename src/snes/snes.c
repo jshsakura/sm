@@ -33,13 +33,21 @@ Snes* snes_init(uint8_t *ram) {
   snes->runningWhichVersion = 0;
 
   snes->cpu = cpu_init(snes, 0);
-#ifdef TARGET_GNW
-  /* No reference emulator on the device: the SPC700 emulator (66 KB, incl. 64 KB
-   * of ARAM) is dead weight because g_use_my_apu_code routes audio through
-   * spc_player, and the second PPU exists only to diff against. */
+#if defined(TARGET_GNW) && !defined(GNW_SNES_CORE)
+  /* The Super Metroid port has no reference emulator on the device: the SPC700
+   * emulator (66 KB, incl. 64 KB of ARAM) is dead weight because g_use_my_apu_code
+   * routes audio through spc_player, and the second PPU exists only to diff
+   * against. The standalone SNES core (GNW_SNES_CORE) needs both back — it has no
+   * reimplementation to lean on. */
   snes->apu = NULL;
   snes->dma = dma_init(snes);
   snes->my_ppu = ppu_init(snes);
+  snes->snes_ppu = snes->my_ppu;
+  snes->ppu = snes->my_ppu;
+#elif defined(GNW_SNES_CORE)
+  snes->apu = apu_init();
+  snes->dma = dma_init(snes);
+  snes->my_ppu = ppu_init(snes);   /* one PPU: nothing to compare against */
   snes->snes_ppu = snes->my_ppu;
   snes->ppu = snes->my_ppu;
 #else
@@ -141,9 +149,16 @@ void snes_handle_pos_stuff(Snes *snes) {
       ppu_handleVblank(snes->ppu);
       snes->inVblank = true;
       snes->inNmi = true;
-//      if (snes->nmiEnabled) {
+#ifdef GNW_SNES_CORE
+      /* Only if the game asked for it. Super Metroid always has NMI on, so its
+       * reimplementation could take the shortcut of firing unconditionally — but
+       * an arbitrary game gets an NMI before it has set up its vector, and dies.
+       * (This alone was 100 of 125 games booting to a black screen.) */
+      if (snes->nmiEnabled)
+        snes->cpu->nmiWanted = true;
+#else
       snes->cpu->nmiWanted = true; // request NMI on CPU
-//      }
+#endif
       if (snes->autoJoyRead) {
         // TODO: this starts a little after start of vblank
         snes->autoJoyTimer = 0;
@@ -158,6 +173,21 @@ void snes_handle_pos_stuff(Snes *snes) {
     if (!snes->inVblank)
       dma_doHdma(snes->dma);
   }
+#ifdef GNW_SNES_CORE
+  /* H/V timer IRQ. Raster splits, mid-frame scroll changes and mode switches all
+   * hang off this; without it a great many games either freeze or render one
+   * frozen layer. Super Metroid's reimplementation raised its own IRQ, so the
+   * emulator never needed to. */
+  if (snes->hIrqEnabled || snes->vIrqEnabled) {
+    bool match = true;
+    if (snes->vIrqEnabled && snes->vPos != snes->vTimer) match = false;
+    if (snes->hIrqEnabled && snes->hPos != snes->hTimer * 4) match = false;
+    if (match) {
+      snes->inIrq = true;
+      snes->cpu->irqWanted = true;
+    }
+  }
+#endif
   // handle autoJoyRead-timer
   //if (snes->autoJoyTimer > 0) snes->autoJoyTimer -= 2;
   // increment position

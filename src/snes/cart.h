@@ -18,6 +18,7 @@ struct Cart {
 
   uint8_t* rom;
   uint32_t romSize;
+  uint32_t romMask;   /* nonzero only when romSize is a power of 2 (fast path) */
   uint8_t* ram;
   uint32_t ramSize;
 };
@@ -25,6 +26,7 @@ struct Cart {
 // TODO: how to handle reset & load? (especially where to init ram)
 
 Cart* cart_init(Snes* snes);
+void cart_setRomSize(Cart* cart, int size);
 void cart_free(Cart* cart);
 void cart_reset(Cart* cart); // will reset special chips etc, general reading is set up in load
 void cart_load(Cart* cart, int type, uint8_t* rom, int romSize, int ramSize); // TODO: figure out how to handle (battery, cart-chips etc)

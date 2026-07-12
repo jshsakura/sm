@@ -21,7 +21,14 @@ static const uint8_t bootRom[0x40] = {
 };
 
 Apu* apu_init(void) {
+#ifdef TARGET_GNW
+  /* 66 KB (64 KB of it ARAM). The firmware's main heap is 85 KB and shared, so
+   * take it from AHB SRAM, which nothing else in this core touches. */
+  extern void *ahb_malloc(size_t size);
+  Apu* apu = ahb_malloc(sizeof(Apu));
+#else
   Apu* apu = malloc(sizeof(Apu));
+#endif
   apu->spc = spc_init(apu);
   apu->dsp = dsp_init(apu->ram);
   return apu;
