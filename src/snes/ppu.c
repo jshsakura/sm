@@ -250,6 +250,16 @@ void ppu_reset(Ppu* ppu) {
 }
 
 void ppu_saveload(Ppu *ppu, SaveLoadFunc *func, void *ctx) {
+#ifdef PPU_RGB565
+  /* Everything the PPU derives from cgram and brightness lives outside the saved
+   * region — the RGB565 palette and the brightness table are caches, not state.
+   * A load restores cgram underneath them and nothing tells them so: the screen
+   * then draws the scene you loaded with the colours of the scene you left, or,
+   * on a PPU that has drawn nothing yet, with no colours at all. Invalidate them.
+   * (0xff is not a brightness, so the table rebuilds on the next line.) */
+  ppu->paletteDirty = true;
+  ppu->lastBrightnessMult = 0xff;
+#endif
 #ifdef TARGET_GNW
   /* vram lives in ITC RAM now, so it is no longer contiguous with the rest of
    * the struct. Emit the identical byte stream — VRAM first, then everything
