@@ -573,11 +573,25 @@ void dsp_getSamples(Dsp* dsp, int16_t* sampleData, int samplesPerFrame, int numC
     // The Game & Watch's SAI is mono. Downmix rather than writing two samples per
     // frame into a buffer that only has room for one — which is what a stereo
     // write into a mono buffer does, and it runs off the end of it.
+    //
+    // And average the samples we pass over instead of picking one and dropping the
+    // rest. The DSP runs at 32 kHz and the SAI at 16, so point-sampling folds
+    // everything above 8 kHz back down into the audible band — which is heard as a
+    // buzz on bright material (the title theme) and on nothing else. Averaging the
+    // source samples that fall in each output sample is a one-pole-cheap box filter
+    // and it is the difference between "aliased" and "clean" here.
     for(int i = 0; i < samplesPerFrame; i++) {
-      int l = dsp->sampleBuffer[((int) location) * 2];
-      int r = dsp->sampleBuffer[((int) location) * 2 + 1];
-      sampleData[i] = (int16_t)((l + r) >> 1);
+      int start = (int)location;
       location += adder;
+      int end = (int)location;
+      if (end <= start) end = start + 1;
+      if (end > 534) end = 534;
+
+      int32_t sum = 0;
+      for (int s = start; s < end; s++)
+        sum += dsp->sampleBuffer[s * 2] + dsp->sampleBuffer[s * 2 + 1];
+
+      sampleData[i] = (int16_t)(sum / (2 * (end - start)));
     }
   } else {
     for(int i = 0; i < samplesPerFrame; i++) {
