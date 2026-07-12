@@ -571,8 +571,12 @@ void RtlApuWrite(uint32 adr, uint8 val) {
   assert(adr >= APUI00 && adr <= APUI03);
 
   if (is_uploading_apu) {
-    snes_catchupApu(g_snes); // catch up the apu before writing
-    g_snes->apu->inPorts[adr & 0x3] = val;
+    /* No SPC700 emulator on the Game & Watch: snes->apu is NULL and spc_player IS
+     * the sound chip. Every apu deref below has to survive that. */
+    if (g_snes->apu) {
+      snes_catchupApu(g_snes); // catch up the apu before writing
+      g_snes->apu->inPorts[adr & 0x3] = val;
+    }
     return;
   }
 
@@ -622,7 +626,10 @@ static void RtlPopApuState_Locked(void) {
   if (is_uploading_apu)
     return;
 
-  uint8 *input_ports = g_use_my_apu_code ? g_spc_player->input_ports : g_snes->apu->inPorts;
+  uint8 *input_ports = g_use_my_apu_code ? g_spc_player->input_ports
+                                        : (g_snes->apu ? g_snes->apu->inPorts : NULL);
+  if (input_ports == NULL)
+    return;
   if (g_apu_queue_size != 0) {
     ApuWriteEnt *w = &g_apu_write_ents[(g_apu_write_ent_pos - g_apu_queue_size--) & (kApuMaxQueueSize - 1)];
     for (int i = 0; i != 4; i++) {
@@ -645,7 +652,9 @@ void RtlApuUpload(const uint8 *p) {
 }
 
 void RtlRestoreMusicAfterLoad_Locked(bool is_reset) {
-  if (g_use_my_apu_code) {
+  /* Seed spc_player from the emulated APU — only meaningful when there IS one.
+   * On the device there is not, and this memcpy'd 64 KB from NULL+8. */
+  if (g_use_my_apu_code && g_snes->apu) {
     memcpy(g_spc_player->ram, g_snes->apu->ram, 65536);
     memcpy(g_spc_player->dsp->ram, g_snes->apu->dsp->ram, sizeof(Dsp) - offsetof(Dsp, ram));
     SpcPlayer_CopyVariablesFromRam(g_spc_player);
@@ -670,8 +679,10 @@ void RtlSaveMusicStateToRam_Locked(void) {
       }
     }
     SpcPlayer_CopyVariablesToRam(g_spc_player);
-    memcpy(g_snes->apu->dsp->ram, g_spc_player->dsp->ram, sizeof(Dsp) - offsetof(Dsp, ram));
-    memcpy(g_snes->apu->ram, g_spc_player->ram, 65536);
+    if (g_snes->apu) {   /* mirror it back into the emulated APU, if we have one */
+      memcpy(g_snes->apu->dsp->ram, g_spc_player->dsp->ram, sizeof(Dsp) - offsetof(Dsp, ram));
+      memcpy(g_snes->apu->ram, g_spc_player->ram, 65536);
+    }
   }
 }
 
@@ -682,7 +693,7 @@ void RtlRenderAudio(int16 *audio_buffer, int samples, int channels) {
   RtlPopApuState_Locked();
 
   if (!g_use_my_apu_code) {
-    if (!is_uploading_apu) {
+    if (!is_uploading_apu && g_snes->apu) {
       while (g_snes->apu->dsp->sampleOffset < 534)
         apu_cycle(g_snes->apu);
       dsp_getSamples(g_snes->apu->dsp, audio_buffer, samples, channels);

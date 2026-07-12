@@ -208,6 +208,8 @@ void snes_handle_pos_stuff(Snes *snes) {
 #define IS_ADR(x) (x == 0xfffff)
 
 void snes_catchupApu(Snes* snes) {
+  if (snes->apu == NULL)
+    return;
   if (snes->apuCatchupCycles > 10000)
     snes->apuCatchupCycles = 10000;
 
@@ -224,7 +226,8 @@ uint8_t snes_readBBus(Snes* snes, uint8_t adr) {
     return ppu_read(snes->ppu, adr);
   }
   if(adr < 0x80) {
-    assert(0);
+    if (snes->apu == NULL)
+      return snes->openBus;   /* no SPC700 here: spc_player is the sound chip */
     snes->apuCatchupCycles = 32;
     snes_catchupApu(snes); // catch up the apu before reading
     return snes->apu->outPorts[adr & 0x3];
