@@ -771,7 +771,44 @@ void ComposeFadingPalettes(void) {  // 0x8B8CEA
   } while (--v1);
 }
 
+/* The Korean fan patch (2017 — analysis 열정페이, translation 한마루) contains no
+ * new 65816 code. What it does to the intro is move the text tables into bank
+ * $8B's free space and rewrite the operand of every
+ *
+ *     LDY #table : JSR CinematicFunction_Intro_Func20
+ *
+ * to name the new one. This decompilation baked those operands in as constants,
+ * so it would carry on reading the Japanese tables while the ROM supplies a
+ * Korean font — which is exactly the tile garbage you get from page two onward.
+ *
+ * So take the operand back out of the ROM instead of trusting the constant. On an
+ * unpatched ROM every entry still holds the value this file was compiled with,
+ * making the lookup an identity; on a patched one it simply follows the patch.
+ * Nothing here is specific to Korean: any patch that redirects these the same way
+ * works, and no patched data is needed in the binary. */
+static uint16 IntroTextTable(uint16 japanese_table) {
+  /* Where each caller's LDY operand sits in bank $8B. */
+  static const struct { uint16 operand; uint16 table; } kSites[] = {
+    { 0xB509, addr_word_8BD389 }, { 0xB53F, addr_word_8BCF75 },
+    { 0xB545, addr_word_8BCFBD }, { 0xB575, addr_word_8BCFFD },
+    { 0xB57B, addr_word_8BD055 }, { 0xB5A3, addr_word_8BD085 },
+    { 0xB5A9, addr_word_8BD0E1 }, { 0xB5E4, addr_word_8BD0F9 },
+    { 0xB60C, addr_word_8BD15D }, { 0xB647, addr_word_8BD1B9 },
+    { 0xB64D, addr_word_8BD215 }, { 0xB675, addr_word_8BD259 },
+    { 0xB67B, addr_word_8BD2A5 }, { 0xB6B6, addr_word_8BD2D5 },
+    { 0xB6DE, addr_word_8BD30D }, { 0xB701, addr_word_8BD371 },
+  };
+  for (int i = 0; i != (int)arraysize(kSites); i++) {
+    if (kSites[i].table == japanese_table) {
+      const uint8 *p = RomPtr_8B(kSites[i].operand);   /* operands are unaligned */
+      return (uint16)(p[0] | (p[1] << 8));
+    }
+  }
+  return japanese_table;
+}
+
 void CinematicFunction_Intro_Func20(uint16 j) {  // 0x8B8D23
+  j = IntroTextTable(j);
   uint16 *tt = (uint16 *)RomPtr_8B(j);
   uint16 v2 = tt[0];
   int r18 = tt[1];
