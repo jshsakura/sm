@@ -283,6 +283,10 @@ void ppu_handleVblank(Ppu* ppu) {
   ppu->frameInterlace = ppu->interlace; // set if we have a interlaced frame
 }
 
+_Static_assert(_Alignof(PpuPixelPrioBufs) >= 8,
+               "ClearBackdrop writes 64 bits at a time; on ARM that is STRD, which "
+               "faults on an unaligned address. Keep the aligned(8) on the struct.");
+
 static inline void ClearBackdrop(PpuPixelPrioBufs *buf) {
   for (size_t i = 0; i != arraysize(buf->data); i += 4)
     *(uint64*)&buf->data[i] = 0x0500050005000500;

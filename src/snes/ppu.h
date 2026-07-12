@@ -29,10 +29,15 @@ enum {
 
 typedef uint16_t PpuZbufType;
 
+// ClearBackdrop() fills these through a *(uint64*) cast. On ARM that compiles to
+// STRD, which faults unless the address is word-aligned — and PpuZbufType only
+// asks for 2. Left to the compiler these land at offset 0x702 inside Ppu, which
+// is 2 mod 4, and the device takes a UsageFault on the first rendered line. The
+// alignment the cast assumes has to be stated, not hoped for.
 typedef struct PpuPixelPrioBufs {
   // This holds the prio in the upper 8 bits and the color in the lower 8 bits.
   PpuZbufType data[kPpuXPixels];
-} PpuPixelPrioBufs;
+} __attribute__((aligned(8))) PpuPixelPrioBufs;
 
 enum {
   kPpuRenderFlags_NewRenderer = 1,

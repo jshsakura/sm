@@ -8,6 +8,13 @@
 #include "snes/spc.h"
 #include "snes/dsp_regs.h"
 #include "tracing.h"
+#ifdef TARGET_GNW
+/* SpcPlayer_Create() calls ahb_malloc(). Without this the call is an implicit
+ * declaration returning int: on the 32-bit device the pointer survives by luck,
+ * on a 64-bit host it is truncated and the first memset walks off a wild address.
+ * That is what stopped the harness from ever reaching the PPU. */
+#include "gw_malloc.h"
+#endif
 
 void Sfx1_HandleCmdFromSnes(SpcPlayer *p);
 void Sfx2_HandleCmdFromSnes(SpcPlayer *p);
