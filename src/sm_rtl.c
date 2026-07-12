@@ -676,7 +676,7 @@ void RtlSaveMusicStateToRam_Locked(void) {
 }
 
 void RtlRenderAudio(int16 *audio_buffer, int samples, int channels) {
-  assert(channels == 2);
+  assert(channels == 1 || channels == 2);
   RtlApuLock();
 
   RtlPopApuState_Locked();
@@ -685,11 +685,11 @@ void RtlRenderAudio(int16 *audio_buffer, int samples, int channels) {
     if (!is_uploading_apu) {
       while (g_snes->apu->dsp->sampleOffset < 534)
         apu_cycle(g_snes->apu);
-      dsp_getSamples(g_snes->apu->dsp, audio_buffer, samples);
+      dsp_getSamples(g_snes->apu->dsp, audio_buffer, samples, channels);
     }
   } else {
     SpcPlayer_GenerateSamples(g_spc_player);
-    dsp_getSamples(g_spc_player->dsp, audio_buffer, samples);
+    dsp_getSamples(g_spc_player->dsp, audio_buffer, samples, channels);
   }
 
   RtlApuUnlock();
