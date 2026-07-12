@@ -290,7 +290,11 @@ uint8_t snes_readBBus(Snes* snes, uint8_t adr) {
   if(adr < 0x80) {
     if (snes->apu == NULL)
       return snes->openBus;   /* no SPC700 here: spc_player is the sound chip */
-    snes->apuCatchupCycles = 32;
+    /* Catch the APU up to *now*, which is what apuCatchupCycles has been counting.
+     * Overwriting it with a flat 32 first (as this did) starves the SPC700: the
+     * boot handshake every game does through these ports never completes and the
+     * screen stays black. Dead code in the Super Metroid port — it returns above,
+     * with no APU at all — and wrong everywhere else. */
     snes_catchupApu(snes); // catch up the apu before reading
     return snes->apu->outPorts[adr & 0x3];
   }
