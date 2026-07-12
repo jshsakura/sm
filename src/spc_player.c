@@ -1530,6 +1530,17 @@ SpcPlayer *SpcPlayer_Create(void) {
   return p;
 }
 
+void SpcPlayer_SaveLoad(SpcPlayer *p, SaveLoadFunc *func, void *ctx) {
+  /* Two pointers sit at the head of the struct (reg_write_history, dsp) and one
+   * inside Dsp (apu_ram); saving a pointer and loading it back into a different
+   * allocation is how a savestate turns into a wild jump. Emit the two ranges
+   * that hold no pointers instead — the same two RtlRestoreMusicAfterLoad uses
+   * to seed the player from an emulated APU. */
+  func(ctx, &p->timer_cycles, sizeof(p->timer_cycles));
+  func(ctx, &p->port_to_snes, sizeof(SpcPlayer) - offsetof(SpcPlayer, port_to_snes));
+  func(ctx, (uint8 *)p->dsp + offsetof(Dsp, ram), sizeof(Dsp) - offsetof(Dsp, ram));
+}
+
 void SpcPlayer_Initialize(SpcPlayer *p) {
   Vector_Reset_Spc(p);
   Spc_Loop_Part1(p);

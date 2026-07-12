@@ -27,6 +27,13 @@ enum {
   kPpuExtraLeftRight = 0,
 };
 
+/* Frameskip. The launcher drops video frames when it cannot hold 60 Hz, but the
+ * SNES renders line by line from inside the frame's timing loop, so there is no
+ * outer draw call to skip. Set this and the line renderer does the timing and
+ * the sprite evaluation (the game can read range/time-over) but not the pixels,
+ * which is where the work is. */
+extern bool g_ppu_skip_render;
+
 typedef uint16_t PpuZbufType;
 
 // ClearBackdrop() fills these through a *(uint64*) cast. On ARM that compiles to

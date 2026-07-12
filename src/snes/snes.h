@@ -92,6 +92,8 @@ bool snes_loadRom(Snes* snes, const uint8_t* data, int length);
 void snes_setPixels(Snes* snes, uint8_t* pixelData);
 void snes_setSamples(Snes* snes, int16_t* sampleData, int samplesPerFrame);
 void snes_saveload(Snes *snes, SaveLoadFunc *func, void *ctx);
+/* One scanline of dot-clock events in one call — see snes.c. */
+void snes_run_line(Snes *snes);
 uint8_t snes_readBBusOrg(Snes *snes, uint8_t adr);
 void snes_catchupApu(Snes *snes);
 

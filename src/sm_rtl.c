@@ -11,6 +11,7 @@ struct StateRecorder;
 
 static void RtlSaveMusicStateToRam_Locked();
 static void RtlRestoreMusicAfterLoad_Locked(bool is_reset);
+static void RtlResetApuQueue(void);
 
 uint8 g_ram[0x20000];
 uint8 *g_sram;
@@ -429,6 +430,31 @@ bool RtlRunFrame(int inputs) {
 
   RtlPushApuState();
   return is_replay;
+}
+
+/* The device's savestate. RtlSaveLoad() below cannot be used there: it goes
+ * through StateRecorder, which builds the whole ~270 KB snapshot in a ByteArray
+ * first — more RAM than the core has left — and writes it to a fixed "saves/"
+ * path the launcher does not own. Stream the same state straight through the
+ * caller's func() instead, and let the launcher pick the file.
+ *
+ * The SPC player has to go with it: on the device it IS the sound chip
+ * (snes->apu is NULL, so apu_saveload writes nothing). */
+void RtlSaveLoadState(int cmd, SaveLoadFunc *func, void *ctx) {
+  RtlApuLock();
+  if (cmd == kSaveLoad_Save) {
+    RtlSaveMusicStateToRam_Locked();   /* drain the APU write queue into the player */
+    snes_saveload(g_snes, func, ctx);
+    SpcPlayer_SaveLoad(g_spc_player, func, ctx);
+    RtlApuUnlock();
+  } else {
+    snes_saveload(g_snes, func, ctx);
+    SpcPlayer_SaveLoad(g_spc_player, func, ctx);
+    SpcPlayer_CopyVariablesFromRam(g_spc_player);
+    RtlResetApuQueue();
+    RtlApuUnlock();
+    RtlSynchronizeWholeState();
+  }
 }
 
 void RtlSaveSnapshot(const char *filename, bool saving_with_bug) {

@@ -2,6 +2,7 @@
 #include <stddef.h>
 #include "types.h"
 #include "snes/dsp.h"
+#include "snes/saveload.h"
 
 typedef struct Channel {
   uint16 pattern_order_ptr_for_chan;
@@ -165,6 +166,11 @@ typedef struct SpcPlayer {
   uint8 input_ports[4];
   uint8 ram[65536]; // rest of ram
 } SpcPlayer;
+
+/* Serialize everything the player owns that is not a pointer: its registers,
+ * its 64 KB of APU RAM, and the DSP tail. On the device this IS the sound chip
+ * (snes->apu is NULL), so a savestate that skips it loads back with dead music. */
+void SpcPlayer_SaveLoad(SpcPlayer *p, SaveLoadFunc *func, void *ctx);
 
 SpcPlayer *SpcPlayer_Create();
 void SpcPlayer_GenerateSamples(SpcPlayer *p);

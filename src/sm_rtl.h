@@ -1,5 +1,6 @@
 #pragma once
 #include "types.h"
+#include "snes/saveload.h"
 #include <string.h>
 #include <stdio.h>
 
@@ -108,6 +109,9 @@ enum {
 };
 
 void RtlSaveLoad(int cmd, int slot);
+/* Device savestate: streams the state through func() instead of building it in
+ * RAM and writing it to a "saves/" path of its own. See sm_rtl.c. */
+void RtlSaveLoadState(int cmd, SaveLoadFunc *func, void *ctx);
 void RtlCheat(char c);
 void RtlApuLock();
 void RtlApuUnlock();

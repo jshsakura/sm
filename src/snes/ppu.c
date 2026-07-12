@@ -283,6 +283,8 @@ void ppu_handleVblank(Ppu* ppu) {
   ppu->frameInterlace = ppu->interlace; // set if we have a interlaced frame
 }
 
+bool g_ppu_skip_render;
+
 _Static_assert(_Alignof(PpuPixelPrioBufs) >= 8,
                "ClearBackdrop writes 64 bits at a time; on ARM that is STRD, which "
                "faults on an unaligned address. Keep the aligned(8) on the struct.");
@@ -315,6 +317,9 @@ void ppu_runLine(Ppu* ppu, int line) {
     // evaluate sprites
     ClearBackdrop(&ppu->objBuffer);
     ppu->lineHasSprites = !ppu->forcedBlank && ppu_evaluateSprites(ppu, line - 1);
+
+    if (g_ppu_skip_render)
+      return;   /* frameskip: the flags above still matter, the pixels below do not */
 
     if (g_new_ppu) {
       PpuDrawWholeLine(ppu, line);
