@@ -249,6 +249,50 @@ void ppu_reset(Ppu* ppu) {
   ppu->ppu2openBus = 0;
 }
 
+/* ppu_write() stores every screen-enable and window register TWICE: unpacked into
+ * layer[]/windowLayer[], and packed into screenEnabled/screenWindowed/windowsel —
+ * the byte the game actually wrote. The renderer reads only the packed copies:
+ *
+ *     #define IS_SCREEN_ENABLED(ppu, sub, layer) (ppu->screenEnabled[sub] & (1 << layer))
+ *
+ * and the packed copies sit past pixelbuffer_placeholder, so the savestate does
+ * not carry them. They are caches, exactly like palette565 — and like palette565
+ * a load has to rebuild them, because the unpacked originals it DID restore are
+ * not what anything looks at.
+ *
+ * Left alone, screenEnabled stays whatever it was. Load into a PPU that was just
+ * ppu_reset() — which is every "resume from a savestate" on the G&W, because the
+ * launcher boots the core and loads second — and it is zero: no BG, no sprites,
+ * every line composited as bare backdrop. A black screen that still runs at full
+ * speed on almost no CPU, because there is nothing left to draw. */
+static void ppu_rebuild_packed_registers(Ppu *ppu) {
+  uint8_t tm = 0, ts = 0, tmw = 0, tsw = 0;
+
+  for (int i = 0; i < 5; i++) {   /* BG1..BG4, OBJ — $212C/$212D/$212E/$212F */
+    if (ppu->layer[i].mainScreenEnabled)  tm  |= 1 << i;
+    if (ppu->layer[i].subScreenEnabled)   ts  |= 1 << i;
+    if (ppu->layer[i].mainScreenWindowed) tmw |= 1 << i;
+    if (ppu->layer[i].subScreenWindowed)  tsw |= 1 << i;
+  }
+  ppu->screenEnabled[0] = tm;
+  ppu->screenEnabled[1] = ts;
+  ppu->screenWindowed[0] = tmw;
+  ppu->screenWindowed[1] = tsw;
+
+  /* windowsel is six 4-bit fields, one per layer, in the order GET_WINDOW_FLAGS
+   * indexes them — the same nibble ppu_write() packs from $2123..$2125. */
+  uint32_t sel = 0;
+  for (int i = 0; i < 6; i++) {
+    uint32_t flags = 0;
+    if (ppu->windowLayer[i].window1inversed) flags |= kWindow1Inversed;
+    if (ppu->windowLayer[i].window1enabled)  flags |= kWindow1Enabled;
+    if (ppu->windowLayer[i].window2inversed) flags |= kWindow2Inversed;
+    if (ppu->windowLayer[i].window2enabled)  flags |= kWindow2Enabled;
+    sel |= flags << (i * 4);
+  }
+  ppu->windowsel = sel;
+}
+
 void ppu_saveload(Ppu *ppu, SaveLoadFunc *func, void *ctx) {
 #ifdef PPU_RGB565
   /* Everything the PPU derives from cgram and brightness lives outside the saved
@@ -270,6 +314,11 @@ void ppu_saveload(Ppu *ppu, SaveLoadFunc *func, void *ctx) {
 #else
   func(ctx, &ppu->vram, offsetof(Ppu, pixelbuffer_placeholder) - offsetof(Ppu, vram));
 #endif
+
+  /* After the stream, so a load rebuilds from what it just read. On a save this
+   * recomputes the values it already had — the two copies agree by construction,
+   * ppu_write() writes both — so it is a no-op there rather than a special case. */
+  ppu_rebuild_packed_registers(ppu);
 }
 
 void PpuBeginDrawing(Ppu *ppu, uint8_t *pixels, size_t pitch, uint32_t render_flags) {
