@@ -239,6 +239,12 @@ static void dsp_cycleChannel(Dsp* dsp, int ch) {
   int16_t sample = 0;
   if(dsp->channel[ch].useNoise) {
     sample = dsp->noiseSample;
+  } else if(dsp->channel[ch].gain == 0 && dsp->channel[ch].adsrState == 4) {
+    /* Released and silent: this sample is multiplied by gain (0) below, so the
+     * Gaussian interpolation's result is zeroed anyway. Skip it — dsp_getSample is
+     * a pure read (no ENDx/decode side effects, those already ran above), so the
+     * output is bit-identical. Saves interpolation for every idle voice. */
+    sample = 0;
   } else {
     sample = dsp_getSample(dsp, ch, dsp->channel[ch].pitchCounter >> 12, (dsp->channel[ch].pitchCounter >> 4) & 0xff);
   }
