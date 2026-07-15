@@ -745,13 +745,17 @@ void DumpCpuHistory() {
 }
 
 static void cpu_doOpcode(Cpu* cpu, uint8_t opcode) {
+#ifdef SNES_CPU_DEBUG
+  /* PC-history ring + breakpoint compare — a debug facility (DumpCpuHistory).
+   * It was running unguarded on every opcode, i.e. in release; the device pays
+   * ~6 instructions/opcode for a feature only a debugger uses. Guarded off. */
   uint32 cur_pc = ((cpu->k << 16) | cpu->pc - 1);
   pc_hist[pc_hist_ctr] = cur_pc;
   pc_hist_ctr = (pc_hist_ctr + 1) & 7;
-  
   if (cur_pc == pc_bp) {
     opcode += 0;
   }
+#endif
 
 restart:
   switch(opcode) {

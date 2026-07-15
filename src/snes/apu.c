@@ -103,6 +103,63 @@ void apu_cycle(Apu* apu) {
   apu->cycles++;
 }
 
+/* Advance the APU by `cyclesToRun` SPC cycles. Identical machine to calling
+ * apu_cycle() that many times, but the per-cycle DSP tick and the three timers are
+ * folded into closed-form bulk updates between opcode boundaries — the SPC700's idle
+ * cycles charged in one step, exactly as the main CPU's dot loop was collapsed
+ * (snes_run_line). apu_cycle() called this ~17,000x/frame doing a 3-timer loop and a
+ * DSP branch every single cycle; an opcode already told us its whole cost. Cycle-exact:
+ * the framebuffer/WRAM/SRAM state hash is bit-identical to the per-cycle loop. */
+void apu_run(Apu* apu, int cyclesToRun) {
+  while (cyclesToRun > 0) {
+    if (apu->cpuCyclesLeft == 0)
+      apu->cpuCyclesLeft = spc_runOpcode(apu->spc);
+
+    int step = apu->cpuCyclesLeft < cyclesToRun ? apu->cpuCyclesLeft : cyclesToRun;
+    if (step <= 0) step = 1;   /* an opcode charging 0: step one and wrap like the ref */
+
+    /* DSP fires when (cycles & 0x1f)==0, tested before the increment — so once for
+     * every multiple of 32 in [cycles, cycles+step). */
+    uint32_t start = apu->cycles, end = start + (uint32_t)step;
+    for (uint32_t m = (start + 31u) & ~31u; m < end; m += 32u)
+      dsp_cycle(apu->dsp);
+
+    /* Each timer counts down; when it passes 0 it reloads to R and, if enabled,
+     * advances divider->counter. Over `step` cycles the zero-crossings land at
+     * k = C, C+R, C+2R, ... for k in [0,step). step <= cpuCyclesLeft (<=255), so the
+     * fallback loops are tiny. */
+    for (int i = 0; i < 3; i++) {
+      Timer* t = &apu->timer[i];
+      int R = (i == 2) ? 16 : 128;
+      int C = t->cycles;
+      int ticks = (C < step) ? ((step - 1 - C) / R + 1) : 0;
+      if (ticks) {
+        if (t->enabled) {
+          if (t->target && t->divider < t->target) {
+            int total = t->divider + ticks;
+            t->counter = (uint8_t)((t->counter + total / t->target) & 0xf);
+            t->divider = (uint8_t)(total % t->target);
+          } else {
+            /* target 0 (==test only on the 256-wrap) or divider>=target: step it */
+            for (int k = 0; k < ticks; k++) {
+              t->divider++;
+              if (t->divider == t->target) { t->divider = 0; t->counter = (t->counter + 1) & 0xf; }
+            }
+          }
+        }
+        int lastK = C + (ticks - 1) * R;
+        t->cycles = (uint8_t)(R + lastK - step);   /* value after the last reload */
+      } else {
+        t->cycles = (uint8_t)(C - step);
+      }
+    }
+
+    apu->cycles = end;
+    apu->cpuCyclesLeft -= (uint8_t)step;
+    cyclesToRun -= step;
+  }
+}
+
 uint8_t apu_cpuRead(Apu* apu, uint16_t adr) {
   switch(adr) {
     case 0xf0:

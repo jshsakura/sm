@@ -277,9 +277,7 @@ void snes_catchupApu(Snes* snes) {
 
   int catchupCycles = (int) snes->apuCatchupCycles;
 
-  for(int i = 0; i < catchupCycles; i++) {
-    apu_cycle(snes->apu);
-  }
+  apu_run(snes->apu, catchupCycles);
   snes->apuCatchupCycles -= (double) catchupCycles;
 }
 
@@ -561,15 +559,41 @@ void snes_write(Snes* snes, uint32_t adr, uint8_t val) {
 }
 
 
+/* WRAM fast paths: the DP/stack/data accesses that dominate CPU traffic resolve
+ * to one array index, skipping the snes_read -> cart_read -> cart_readLorom call
+ * chain. Anything with a side effect (B-bus/MMIO) or in ROM/SRAM keeps the slow
+ * path, so behaviour is unchanged (state hash identical). Standard emulator
+ * page-fast-path, minus the page table. */
 uint8_t snes_cpuRead(Snes* snes, uint32_t adr) {
   snes->cpuMemOps++;
   snes->cpuCyclesLeft += 8;
+  uint8_t bank = adr >> 16;
+  uint16_t off = (uint16_t)adr;
+  if(bank == 0x7e || bank == 0x7f)
+    return snes->ram[((bank & 1) << 16) | off];
+  if(off < 0x2000 && (bank < 0x40 || (bank >= 0x80 && bank < 0xc0)))
+    return snes->ram[off];
+  /* ROM fast path — the opcode/operand fetch that is ~77% of CPU reads. adr>=0x8000
+   * is always ROM in LoROM/HiROM (SRAM/MMIO are all <0x8000), so only the mapper
+   * index differs. Power-of-2 ROMs (romMask set = the common case) index with one
+   * AND; odd sizes fall to the folding slow path. */
+  Cart* cart = snes->cart;
+  if(off >= 0x8000 && cart->romMask) {
+    uint32_t idx = (cart->type == 1)
+      ? (((uint32_t)(bank & 0x7f) << 15) | (off & 0x7fff))   /* LoROM */
+      : (((uint32_t)(bank & 0x3f) << 16) | off);             /* HiROM */
+    return cart->rom[idx & cart->romMask];
+  }
   return snes_read(snes, adr);
 }
 
 void snes_cpuWrite(Snes* snes, uint32_t adr, uint8_t val) {
   snes->cpuMemOps++;
   snes->cpuCyclesLeft += 8;
+  uint8_t bank = adr >> 16;
+  uint16_t off = (uint16_t)adr;
+  if(bank == 0x7e || bank == 0x7f) { snes->ram[((bank & 1) << 16) | off] = val; return; }
+  if(off < 0x2000 && (bank < 0x40 || (bank >= 0x80 && bank < 0xc0))) { snes->ram[off] = val; return; }
   snes_write(snes, adr, val);
 }
 
