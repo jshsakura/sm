@@ -6,6 +6,22 @@
 #include "../types.h"
 #include "cart.h"
 #include "snes.h"
+#include "dsp1_hle.h"
+
+/* Weak fallbacks so build scripts that list snes/*.c files explicitly and
+ * predate dsp1_hle.c still link; without the strong definitions a DSP cart
+ * just behaves as before (status reads 0). Harness globs pick up the real
+ * implementation automatically. */
+__attribute__((weak)) void dsp1_reset(Dsp1* d) { (void)d; }
+__attribute__((weak)) uint8_t dsp1_readDR(Dsp1* d) { (void)d; return 0; }
+__attribute__((weak)) void dsp1_writeDR(Dsp1* d, uint8_t v) { (void)d; (void)v; }
+__attribute__((weak)) uint8_t dsp1_readSR(Dsp1* d) { (void)d; return 0; }
+
+/* sizeof(Dsp1) is unknown when only weak stubs are linked, so allocation lives
+ * here behind the same weak mechanism: the strong version in dsp1_hle.c
+ * allocates for real. */
+__attribute__((weak)) Dsp1* dsp1_alloc(void) { return NULL; }
+__attribute__((weak)) uint32_t dsp1_size(void) { return 0; }
 
 
 /* SNES carts mirror their ROM across the address space. A power-of-2 image needs
@@ -49,7 +65,20 @@ Cart* cart_init(Snes* snes) {
   cart->romMask = 0;
   cart->ram = NULL;
   cart->ramSize = 0;
+  cart->dsp1 = NULL;
   return cart;
+}
+
+void cart_attachDsp1(Cart* cart) {
+  if (cart->dsp1 == NULL) cart->dsp1 = dsp1_alloc();
+  if (cart->dsp1) {
+    dsp1_reset(cart->dsp1);
+    /* LoROM boards decode the DSP at banks $30-$3f, $8000-$ffff — inside the
+     * range snes_cpuRead's ROM fast path would otherwise claim. Dropping the
+     * power-of-2 mask sends this cart down the slow path where our branch
+     * runs; every other cart keeps the fast path untouched. */
+    if (cart->type == 1) cart->romMask = 0;
+  }
 }
 
 void cart_free(Cart* cart) {
@@ -58,10 +87,15 @@ void cart_free(Cart* cart) {
 
 void cart_reset(Cart* cart) {
   //if(cart->ramSize > 0 && cart->ram != NULL) memset(cart->ram, 0, cart->ramSize); // for now
+  if (cart->dsp1) dsp1_reset(cart->dsp1);
 }
 
 void cart_saveload(Cart *cart, SaveLoadFunc *func, void *ctx) {
   func(ctx, cart->ram, cart->ramSize);
+  /* DSP carts append the chip state (plain data, versioned via its first
+   * field). Normal carts write exactly what they always did, so existing
+   * savestates stay byte-compatible. */
+  if (cart->dsp1) func(ctx, cart->dsp1, dsp1_size());
 }
 
 void cart_load(Cart* cart, int type, uint8_t* rom, int romSize, int ramSize) {
@@ -108,6 +142,10 @@ static uint8_t cart_readLorom(Cart* cart, uint8_t bank, uint16_t adr) {
     return cart->ram[(((bank & 0xf) << 15) | adr) & (cart->ramSize - 1)];
   }
   bank &= 0x7f;
+  // DSP-1 on LoROM boards: banks 30-3f, DR 8000-bfff / SR c000-ffff
+  if(cart->dsp1 && bank >= 0x30 && bank < 0x40 && adr >= 0x8000) {
+    return adr < 0xc000 ? dsp1_readDR(cart->dsp1) : dsp1_readSR(cart->dsp1);
+  }
   if(adr >= 0x8000 || bank >= 0x40) {
     // adr 8000-ffff in all banks or all addresses in banks 40-7f and c0-ff
     return cart->rom[cart_romIndex(cart, ((uint32_t)bank << 15) | (adr & 0x7fff))];
@@ -119,6 +157,10 @@ static uint8_t cart_readLorom(Cart* cart, uint8_t bank, uint16_t adr) {
 }
 
 static void cart_writeLorom(Cart* cart, uint8_t bank, uint16_t adr, uint8_t val) {
+  if(cart->dsp1 && (bank & 0x7f) >= 0x30 && (bank & 0x7f) < 0x40 && adr >= 0x8000) {
+    if (adr < 0xc000) dsp1_writeDR(cart->dsp1, val);
+    return;
+  }
   if(((bank >= 0x70 && bank < 0x7e) || bank > 0xf0) && adr < 0x8000 && cart->ramSize > 0) {
     // banks 70-7e and f0-ff, adr 0000-7fff
     cart->ram[(((bank & 0xf) << 15) | adr) & (cart->ramSize - 1)] = val;
@@ -127,6 +169,11 @@ static void cart_writeLorom(Cart* cart, uint8_t bank, uint16_t adr, uint8_t val)
 
 static uint8_t cart_readHirom(Cart* cart, uint8_t bank, uint16_t adr) {
   bank &= 0x7f;
+  // DSP-1 on HiROM boards: banks 00-1f, DR 6000-6fff / SR 7000-7fff.
+  // SRAM decode moves up to banks 20-3f (matching real HiROM+DSP boards).
+  if(cart->dsp1 && bank < 0x20 && adr >= 0x6000 && adr < 0x8000) {
+    return adr < 0x7000 ? dsp1_readDR(cart->dsp1) : dsp1_readSR(cart->dsp1);
+  }
   if(bank < 0x40 && adr >= 0x6000 && adr < 0x8000 && cart->ramSize > 0) {
     // banks 00-3f and 80-bf, adr 6000-7fff
     return cart->ram[(((bank & 0x3f) << 13) | (adr & 0x1fff)) & (cart->ramSize - 1)];
@@ -141,6 +188,10 @@ static uint8_t cart_readHirom(Cart* cart, uint8_t bank, uint16_t adr) {
 
 static void cart_writeHirom(Cart* cart, uint8_t bank, uint16_t adr, uint8_t val) {
   bank &= 0x7f;
+  if(cart->dsp1 && bank < 0x20 && adr >= 0x6000 && adr < 0x8000) {
+    if (adr < 0x7000) dsp1_writeDR(cart->dsp1, val);
+    return;
+  }
   if(bank < 0x40 && adr >= 0x6000 && adr < 0x8000 && cart->ramSize > 0) {
     // banks 00-3f and 80-bf, adr 6000-7fff
     cart->ram[(((bank & 0x3f) << 13) | (adr & 0x1fff)) & (cart->ramSize - 1)] = val;
