@@ -343,6 +343,15 @@ static void dsp_handleGain(Dsp* dsp, int ch) {
 }
 
 static int16_t dsp_getSample(Dsp* dsp, int ch, int sampleNum, int offset) {
+#if defined(SNES_LINEAR_INTERP) || defined(GNW_SNES_CORE)
+  /* Reduced-accuracy: 2-point linear instead of the 4-tap Gaussian. One lerp vs
+   * four table[512] lookups + four MACs — and no 1 KB LUT competing for the M7's
+   * 16 KB D-cache. Loses the SNES's characteristic HF muffling (many prefer the
+   * crisper linear). A toggle; the accurate path stays the default. */
+  int16_t olds = dsp->channel[ch].decodeBuffer[sampleNum + 2];
+  int16_t news = dsp->channel[ch].decodeBuffer[sampleNum + 3];
+  return (int16_t)(olds + (((news - olds) * offset) >> 8));
+#else
   int16_t news = dsp->channel[ch].decodeBuffer[sampleNum + 3];
   int16_t olds = dsp->channel[ch].decodeBuffer[sampleNum + 2];
   int16_t olders = dsp->channel[ch].decodeBuffer[sampleNum + 1];
@@ -354,6 +363,7 @@ static int16_t dsp_getSample(Dsp* dsp, int ch, int sampleNum, int offset) {
   out += (gaussValues[offset] * news) >> 10;
   out = out < -0x8000 ? -0x8000 : (out > 0x7fff ? 0x7fff : out); // clamp 16-bit
   return out >> 1;
+#endif
 }
 
 static void dsp_decodeBrr(Dsp* dsp, int ch) {
