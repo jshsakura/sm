@@ -7,6 +7,17 @@
 #include "cart.h"
 #include "snes.h"
 
+#ifdef GNW_SNES_CORE
+#include <assert.h>
+/* Device save-RAM. Writable, so it can't be XIP'd from flash like the ROM is —
+ * but the ~81 KB DTCM heap can't malloc a 32 KB SRAM either. Park it in a static
+ * buffer, which lands in .overlay_snes_bss (RAM_EMU, 724 KB — the roomy region
+ * where WRAM already lives), not the heap. 0x8000 is the largest SRAM a plain
+ * LoROM/HiROM cart declares; coprocessor carts (which can want more) are rejected
+ * at load, and the assert in cart_load() catches anything that slips past. */
+static uint8_t gnw_cart_sram[0x8000];
+#endif
+
 
 /* SNES carts mirror their ROM across the address space. A power-of-2 image needs
  * only a mask, but 1.5 MB / 3 MB / 6 MB images are common (37% of a real library)
@@ -66,17 +77,24 @@ void cart_saveload(Cart *cart, SaveLoadFunc *func, void *ctx) {
 
 void cart_load(Cart* cart, int type, uint8_t* rom, int romSize, int ramSize) {
   cart->type = type;
-  if(cart->ram != NULL) free(cart->ram);
 #ifdef GNW_SNES_CORE
-  // Device: `rom` is the flash-mapped image (read-only, never our malloc). Point
-  // at it in place — a multi-MB copy would blow the ~81 KB heap. cart->rom is
-  // therefore never freed; only cart->ram (save RAM, <=32 KB) lives on the heap.
+  // Device: neither the ROM nor the SRAM touches the ~81 KB heap. `rom` is the
+  // flash-mapped image used in place (never freed); the SRAM lives in a static
+  // RAM_EMU buffer, not malloc. Nothing here is heap-owned, so nothing is freed.
   cart->rom = rom;
+  cart_setRomSize(cart, romSize);
+  if(ramSize > 0) {
+    assert(ramSize <= (int)sizeof(gnw_cart_sram));
+    cart->ram = gnw_cart_sram;
+    memset(cart->ram, 0, ramSize);
+  } else {
+    cart->ram = NULL;
+  }
+  cart->ramSize = ramSize;
 #else
   if(cart->rom != NULL) free(cart->rom);
+  if(cart->ram != NULL) free(cart->ram);
   cart->rom = malloc(romSize);
-  memcpy(cart->rom, rom, romSize);
-#endif
   cart_setRomSize(cart, romSize);
   if(ramSize > 0) {
     cart->ram = malloc(ramSize);
@@ -85,6 +103,8 @@ void cart_load(Cart* cart, int type, uint8_t* rom, int romSize, int ramSize) {
     cart->ram = NULL;
   }
   cart->ramSize = ramSize;
+  memcpy(cart->rom, rom, romSize);
+#endif
 }
 
 uint8_t cart_read(Cart* cart, uint8_t bank, uint16_t adr) {
