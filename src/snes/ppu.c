@@ -304,6 +304,10 @@ void ppu_saveload(Ppu *ppu, SaveLoadFunc *func, void *ctx) {
   ppu->paletteDirty = true;
   ppu->lastBrightnessMult = 0xff;
 #endif
+  /* Same rule for the sprite cache: a load restores OAM underneath it. And the
+   * objBuffer contents aren't part of the stream either, so stop trusting them. */
+  ppu->objCacheValid = 0;
+  ppu->objBufferClean = 0;
 #ifdef TARGET_GNW
   /* vram lives in ITC RAM now, so it is no longer contiguous with the rest of
    * the struct. Emit the identical byte stream — VRAM first, then everything
@@ -380,9 +384,12 @@ void ppu_runLine(Ppu* ppu, int line) {
 #endif
     }
 
-    // evaluate sprites
-    ClearBackdrop(&ppu->objBuffer);
+    // evaluate sprites. The buffer only needs wiping if the previous line put
+    // something in it — most lines of most frames have no sprites at all.
+    if (!ppu->objBufferClean)
+      ClearBackdrop(&ppu->objBuffer);
     ppu->lineHasSprites = !ppu->forcedBlank && ppu_evaluateSprites(ppu, line - 1);
+    ppu->objBufferClean = !ppu->lineHasSprites;
 
     if (g_ppu_skip_render)
       return;   /* frameskip: the flags above still matter, the pixels below do not */
@@ -897,9 +904,21 @@ static NOINLINE void PpuDrawWholeLine(Ppu *ppu, uint y) {
       if (clip_color_mask == 0x1f) {
         const uint16_t *pal = ppu->palette565;
         const PpuZbufType *src = ppu->bgBuffers[0].data;
-        do {
+        /* Two pixels per iteration: one 32-bit load of two z-entries, one 32-bit
+         * store of two RGB565 pixels (little-endian pairing, like the 64-bit fill
+         * in ClearBackdrop). src and dst advance in lockstep, so when they are
+         * co-aligned one odd head pixel word-aligns both; when they are not
+         * (odd render pitch), the plain tail loop does the whole span. */
+        if ((((uintptr_t)dst ^ (uintptr_t)&src[i]) & 3) == 0) {
+          if ((uintptr_t)dst & 3)
+            dst[0] = pal[src[i] & 0xff], dst++, i++;
+          for (; i + 1 < right; i += 2, dst += 2) {
+            uint32 zz = *(const uint32 *)&src[i];
+            *(uint32 *)dst = pal[zz & 0xff] | (uint32)pal[(zz >> 16) & 0xff] << 16;
+          }
+        }
+        for (; i < right; i++, dst++)
           dst[0] = pal[src[i] & 0xff];
-        } while (dst++, ++i < right);
       } else {
         /* clip: every component masks to index 0, and brightnessMult[0] is 0 */
         do {
@@ -1280,80 +1299,117 @@ static bool ppu_getWindowState(Ppu* ppu, int layer, int x) {
   return false;
 }
 
+/* One pass over OAM builds, for every scanline, the set of sprites whose
+ * y-range covers it — so the per-line evaluation only visits candidates
+ * instead of rescanning all 128 entries 224 times a frame. Candidacy is a
+ * function of OAM y bytes, the highOam size bits, OBSEL and SETINI alone;
+ * writes to any of those clear objCacheValid. x, priority rotation and the
+ * hardware's 32-sprite/34-tile limits are still applied per line, in the
+ * exact order of the full scan, so the output is bit-identical. */
+static void ppu_rebuildSpriteLineCache(Ppu *ppu) {
+  memset(ppu->objLineCand, 0, sizeof(ppu->objLineCand));
+  for (int s = 0; s < 128; s++) {
+    uint8_t index = (uint8_t)(s * 2);
+    uint8_t y = ppu->oam[index] >> 8;
+    int spriteSize = spriteSizes[ppu->objSize][(ppu->highOam[index >> 3] >> ((index & 7) + 1)) & 1];
+    int spriteHeight = ppu->objInterlace ? spriteSize / 2 : spriteSize;
+    for (int row = 0; row < spriteHeight; row++) {
+      uint8_t l = (uint8_t)(y + row);   /* same wraparound as (uint8)(line - y) < height */
+      if (l < 240)
+        ppu->objLineCand[l][s >> 5] |= 1u << (s & 31);
+    }
+  }
+  ppu->objCacheValid = 1;
+}
+
 static bool ppu_evaluateSprites(Ppu* ppu, int line) {
   // TODO: iterate over oam normally to determine in-range sprites,
   //   then iterate those in-range sprites in reverse for tile-fetching
   // TODO: rectangular sprites, wierdness with sprites at -256
-  uint8_t index = ppu->objPriority ? (ppu->oamAdr & 0xfe) : 0;
+  if (!ppu->objCacheValid)
+    ppu_rebuildSpriteLineCache(ppu);
+  const uint32_t *cand = ppu->objLineCand[line];
   int spritesFound = 0;
   int tilesFound = 0;
-  for(int i = 0; i < 128; i++) {
-    uint8_t y = ppu->oam[index] >> 8;
-    // check if the sprite is on this line and get the sprite size
-    uint8_t row = line - y;
-    int spriteSize = spriteSizes[ppu->objSize][(ppu->highOam[index >> 3] >> ((index & 7) + 1)) & 1];
-    int spriteHeight = ppu->objInterlace ? spriteSize / 2 : spriteSize;
-    if(row < spriteHeight) {
-      // in y-range, get the x location, using the high bit as well
-      int x = ppu->oam[index] & 0xff;
-      x |= ((ppu->highOam[index >> 3] >> (index & 7)) & 1) << 8;
-      if(x > 255) x -= 512;
-      // if in x-range
-      if(x > -spriteSize) {
-        // break if we found 32 sprites already
-        spritesFound++;
-        if(spritesFound > 32) {
-          ppu->rangeOver = true;
-          break;
-        }
-        // update row according to obj-interlace
-        if(ppu->objInterlace) row = row * 2 + (ppu->evenFrame ? 0 : 1);
-        // get some data for the sprite and y-flip row if needed
-        int oam1 = ppu->oam[index + 1];
-        int tile = oam1 & 0xff;
-        int objAdr = (oam1 & 0x100) ? ppu->objTileAdr2 : ppu->objTileAdr1;
-        int palette = (oam1 & 0xe00) >> 9;
-        bool hFlipped = oam1 & 0x4000;
-        if(oam1 & 0x8000) row = spriteSize - 1 - row;
-        // fetch all tiles in x-range
-        int paletteBase = 0x80 + 16 * ((oam1 & 0xe00) >> 9);
-        int prio = SPRITE_PRIO_TO_PRIO((oam1 & 0x3000) >> 12, (oam1 & 0x800) == 0);
-        PpuZbufType z = paletteBase + (prio << 8);
-
-        for(int col = 0; col < spriteSize; col += 8) {
-          if(col + x > -8 && col + x < 256) {
-            // break if we found 34 8*1 slivers already
-            tilesFound++;
-            if(tilesFound > 34) {
-              ppu->timeOver = true;
-              break;
+  /* the full scan started at this sprite and wrapped through all 128;
+   * visit the candidates in that same order: s0..127, then 0..s0-1 */
+  int s0 = ppu->objPriority ? ((ppu->oamAdr & 0xfe) >> 1) : 0;
+  for (int half = 0; half != 2; half++) {
+    int lo = half ? 0 : s0, hi = half ? s0 : 128;
+    for (int w = lo >> 5; w * 32 < hi; w++) {
+      uint32_t bits = cand[w];
+      if (w == lo >> 5)
+        bits &= ~0u << (lo & 31);
+      if (hi - w * 32 < 32)
+        bits &= (1u << (hi & 31)) - 1;
+      while (bits) {
+        int s = w * 32 + __builtin_ctz(bits);
+        bits &= bits - 1;
+        uint8_t index = (uint8_t)(s * 2);
+        uint8_t y = ppu->oam[index] >> 8;
+        // check if the sprite is on this line and get the sprite size
+        uint8_t row = line - y;
+        int spriteSize = spriteSizes[ppu->objSize][(ppu->highOam[index >> 3] >> ((index & 7) + 1)) & 1];
+        int spriteHeight = ppu->objInterlace ? spriteSize / 2 : spriteSize;
+        if(row < spriteHeight) {
+          // in y-range, get the x location, using the high bit as well
+          int x = ppu->oam[index] & 0xff;
+          x |= ((ppu->highOam[index >> 3] >> (index & 7)) & 1) << 8;
+          if(x > 255) x -= 512;
+          // if in x-range
+          if(x > -spriteSize) {
+            // break if we found 32 sprites already
+            spritesFound++;
+            if(spritesFound > 32) {
+              ppu->rangeOver = true;
+              goto done;
             }
-            // figure out which tile this uses, looping within 16x16 pages, and get it's data
-            int usedCol = oam1 & 0x4000 ? spriteSize - 1 - col : col;
-            int usedTile = ((((oam1 & 0xff) >> 4) + (row >> 3)) << 4) | (((oam1 & 0xf) + (usedCol >> 3)) & 0xf);
-            uint16 *addr = &ppu->vram[(objAdr + usedTile * 16 + (row & 0x7)) & 0x7fff];
-            uint32 plane = addr[0] | addr[8] << 16;
-            // go over each pixel
-            int px_left = IntMax(-(col + x + kPpuExtraLeftRight), 0);
-            int px_right = IntMin(256 + kPpuExtraLeftRight - (col + x), 8);
-            PpuZbufType *dst = ppu->objBuffer.data + col + x + px_left + kPpuExtraLeftRight;
+            // update row according to obj-interlace
+            if(ppu->objInterlace) row = row * 2 + (ppu->evenFrame ? 0 : 1);
+            // get some data for the sprite and y-flip row if needed
+            int oam1 = ppu->oam[index + 1];
+            int objAdr = (oam1 & 0x100) ? ppu->objTileAdr2 : ppu->objTileAdr1;
+            if(oam1 & 0x8000) row = spriteSize - 1 - row;
+            // fetch all tiles in x-range
+            int paletteBase = 0x80 + 16 * ((oam1 & 0xe00) >> 9);
+            int prio = SPRITE_PRIO_TO_PRIO((oam1 & 0x3000) >> 12, (oam1 & 0x800) == 0);
+            PpuZbufType z = paletteBase + (prio << 8);
 
-            for (int px = px_left; px < px_right; px++, dst++) {
-              int shift = oam1 & 0x4000 ? px : 7 - px;
-              uint32 bits = plane >> shift;
-              int pixel = (bits >> 0) & 1 | (bits >> 7) & 2 | (bits >> 14) & 4 | (bits >> 21) & 8;
-              // draw it in the buffer if there is a pixel here, and the buffer there is still empty
-              if (pixel != 0 && (dst[0] & 0xff) == 0)
-                dst[0] = z + pixel;
+            for(int col = 0; col < spriteSize; col += 8) {
+              if(col + x > -8 && col + x < 256) {
+                // break if we found 34 8*1 slivers already
+                tilesFound++;
+                if(tilesFound > 34) {
+                  ppu->timeOver = true;
+                  goto done;
+                }
+                // figure out which tile this uses, looping within 16x16 pages, and get it's data
+                int usedCol = oam1 & 0x4000 ? spriteSize - 1 - col : col;
+                int usedTile = ((((oam1 & 0xff) >> 4) + (row >> 3)) << 4) | (((oam1 & 0xf) + (usedCol >> 3)) & 0xf);
+                uint16 *addr = &ppu->vram[(objAdr + usedTile * 16 + (row & 0x7)) & 0x7fff];
+                uint32 plane = addr[0] | addr[8] << 16;
+                // go over each pixel
+                int px_left = IntMax(-(col + x + kPpuExtraLeftRight), 0);
+                int px_right = IntMin(256 + kPpuExtraLeftRight - (col + x), 8);
+                PpuZbufType *dst = ppu->objBuffer.data + col + x + px_left + kPpuExtraLeftRight;
+
+                for (int px = px_left; px < px_right; px++, dst++) {
+                  int shift = oam1 & 0x4000 ? px : 7 - px;
+                  uint32 bits2 = plane >> shift;
+                  int pixel = (bits2 >> 0) & 1 | (bits2 >> 7) & 2 | (bits2 >> 14) & 4 | (bits2 >> 21) & 8;
+                  // draw it in the buffer if there is a pixel here, and the buffer there is still empty
+                  if (pixel != 0 && (dst[0] & 0xff) == 0)
+                    dst[0] = z + pixel;
+                }
+
+              }
             }
-
           }
         }
-        if(tilesFound > 34) break; // break out of sprite-loop if max tiles found
       }
     }
-    index += 2;
   }
+done:
   return tilesFound != 0;
 }
 
@@ -1502,6 +1558,7 @@ void ppu_write(Ppu* ppu, uint8_t adr, uint8_t val) {
       ppu->objSize = val >> 5;
       ppu->objTileAdr1 = (val & 7) << 13;
       ppu->objTileAdr2 = ppu->objTileAdr1 + (((val & 0x18) + 8) << 9);
+      ppu->objCacheValid = 0;   /* sprite sizes moved */
       break;
     }
     case 0x02: {
@@ -1522,6 +1579,7 @@ void ppu_write(Ppu* ppu, uint8_t adr, uint8_t val) {
     case 0x04: {
       if(ppu->oamInHigh) {
         ppu->highOam[((ppu->oamAdr & 0xf) << 1) | ppu->oamSecondWrite] = val;
+        ppu->objCacheValid = 0;   /* size / x-high bits moved */
         if(ppu->oamSecondWrite) {
           ppu->oamAdr++;
           if(ppu->oamAdr == 0) ppu->oamInHigh = false;
@@ -1531,6 +1589,7 @@ void ppu_write(Ppu* ppu, uint8_t adr, uint8_t val) {
           ppu->oamBuffer = val;
         } else {
           ppu->oam[ppu->oamAdr++] = (val << 8) | ppu->oamBuffer;
+          ppu->objCacheValid = 0;   /* a sprite may have moved vertically */
           if(ppu->oamAdr == 0) ppu->oamInHigh = true;
         }
       }
@@ -1781,6 +1840,8 @@ void ppu_write(Ppu* ppu, uint8_t adr, uint8_t val) {
     }
     case 0x33: {
       ppu->interlace = val & 0x1;
+      if (ppu->objInterlace != (bool)(val & 0x2))
+        ppu->objCacheValid = 0;   /* sprite heights halve/double */
       ppu->objInterlace = val & 0x2;
       ppu->overscan = val & 0x4;
       ppu->pseudoHires = val & 0x8;

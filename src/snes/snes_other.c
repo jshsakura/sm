@@ -111,6 +111,12 @@ bool snes_loadRom(Snes* snes, const uint8_t* data, int length) {
     snes->cart, headers[used].cartType,
     newData, newLength, headers[used].chips > 0 ? headers[used].ramSize : 0
   );
+  // $ffd6: low nibble 3-5 = cart carries a coprocessor; high nibble 0 = the
+  // DSP family. Attach the DSP-1 HLE (Mario Kart / Pilotwings class). DSP-2/3/4
+  // titles share this encoding and will log unknown commands rather than hang.
+  if(headers[used].coprocessor == 0 && headers[used].chips >= 3 && headers[used].chips <= 5) {
+    cart_attachDsp1(snes->cart);
+  }
   snes_reset(snes, true); // reset after loading
   free(newData);
   return true;

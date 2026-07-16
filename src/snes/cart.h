@@ -12,6 +12,8 @@ typedef struct Cart Cart;
 
 #include "snes.h"
 
+typedef struct Dsp1 Dsp1;
+
 struct Cart {
   Snes* snes;
   uint8_t type;
@@ -21,12 +23,17 @@ struct Cart {
   uint32_t romMask;   /* nonzero only when romSize is a power of 2 (fast path) */
   uint8_t* ram;
   uint32_t ramSize;
+
+  /* DSP-1 coprocessor (Mario Kart / Pilotwings class). NULL for normal carts —
+   * every added branch below is behind this test, so plain games cost nothing. */
+  Dsp1* dsp1;
 };
 
 // TODO: how to handle reset & load? (especially where to init ram)
 
 Cart* cart_init(Snes* snes);
 void cart_setRomSize(Cart* cart, int size);
+void cart_attachDsp1(Cart* cart);   /* call after cart_load for DSP carts */
 void cart_free(Cart* cart);
 void cart_reset(Cart* cart); // will reset special chips etc, general reading is set up in load
 void cart_load(Cart* cart, int type, uint8_t* rom, int romSize, int ramSize); // TODO: figure out how to handle (battery, cart-chips etc)

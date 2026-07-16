@@ -762,13 +762,24 @@ void DumpCpuHistory() {
 }
 
 static void cpu_doOpcode(Cpu* cpu, uint8_t opcode) {
+#ifdef SNES_PC_HISTOGRAM
+  /* Per-ROM execution map: count every executed opcode by its 24-bit address, so
+   * the hot banks/routines stand out. The histogram (16M entries) lives in the
+   * harness; this just bumps it. Measurement build only. */
+  extern uint32_t *g_pchist;
+  if (g_pchist) g_pchist[(((uint32_t)cpu->k << 16) | (uint16_t)(cpu->pc - 1)) & 0xffffff]++;
+#endif
+#ifdef SNES_CPU_DEBUG
+  /* PC-history ring + breakpoint compare — a debug facility (DumpCpuHistory).
+   * It was running unguarded on every opcode, i.e. in release; the device pays
+   * ~6 instructions/opcode for a feature only a debugger uses. Guarded off. */
   uint32 cur_pc = ((cpu->k << 16) | cpu->pc - 1);
   pc_hist[pc_hist_ctr] = cur_pc;
   pc_hist_ctr = (pc_hist_ctr + 1) & 7;
-  
   if (cur_pc == pc_bp) {
     opcode += 0;
   }
+#endif
 
 restart:
   switch(opcode) {

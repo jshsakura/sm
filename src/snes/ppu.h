@@ -217,6 +217,20 @@ struct Ppu {
   uint16_t palette565[256];
   bool paletteDirty;
 #endif
+
+  /* Sprite line-candidacy cache — derived state, deliberately past
+   * pixelbuffer_placeholder so it is never part of the savestate stream.
+   * Bit s of objLineCand[line][s>>5] says sprite s covers that scanline
+   * (y position and size only; x range and the 32-sprite/34-tile limits are
+   * still evaluated per line, in the same order as the full scan). A write
+   * that can move a sprite vertically (OAM, OBSEL, SETINI) clears
+   * objCacheValid, and so does a savestate load. */
+  uint32_t objLineCand[240][4];
+  uint8_t objCacheValid;
+  /* objBuffer is known to still be all-backdrop when the previous line
+   * fetched no sprite tiles; lets ppu_runLine skip the 512-byte ClearBackdrop.
+   * Zeroed (= not clean) by ppu_reset's memset. */
+  uint8_t objBufferClean;
 };
 
 Ppu* ppu_init(Snes* snes);
