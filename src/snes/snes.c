@@ -31,6 +31,12 @@ Snes* snes_init(uint8_t *ram) {
   snes->debug_cycles = false;
   snes->debug_apu_cycles = false;
   snes->runningWhichVersion = 0;
+  /* NEVER initialized anywhere else, yet gated on at snes_handle_pos_stuff()
+   * (hPos==512): a malloc'd Snes leaves it garbage. On a host the heap happens to
+   * be zero so the line renders; on the device the DTCM heap is non-zero, so
+   * disableRender reads true, ppu_runLine is skipped every scanline, and the
+   * screen is black while the game runs fine (cb=0, cgram populated). */
+  snes->disableRender = false;
 
   snes->cpu = cpu_init(snes, 0);
 #if defined(TARGET_GNW) && !defined(GNW_SNES_CORE)
