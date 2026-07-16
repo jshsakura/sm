@@ -66,9 +66,17 @@ void cart_saveload(Cart *cart, SaveLoadFunc *func, void *ctx) {
 
 void cart_load(Cart* cart, int type, uint8_t* rom, int romSize, int ramSize) {
   cart->type = type;
-  if(cart->rom != NULL) free(cart->rom);
   if(cart->ram != NULL) free(cart->ram);
+#ifdef GNW_SNES_CORE
+  // Device: `rom` is the flash-mapped image (read-only, never our malloc). Point
+  // at it in place — a multi-MB copy would blow the ~81 KB heap. cart->rom is
+  // therefore never freed; only cart->ram (save RAM, <=32 KB) lives on the heap.
+  cart->rom = rom;
+#else
+  if(cart->rom != NULL) free(cart->rom);
   cart->rom = malloc(romSize);
+  memcpy(cart->rom, rom, romSize);
+#endif
   cart_setRomSize(cart, romSize);
   if(ramSize > 0) {
     cart->ram = malloc(ramSize);
@@ -77,7 +85,6 @@ void cart_load(Cart* cart, int type, uint8_t* rom, int romSize, int ramSize) {
     cart->ram = NULL;
   }
   cart->ramSize = ramSize;
-  memcpy(cart->rom, rom, romSize);
 }
 
 uint8_t cart_read(Cart* cart, uint8_t bank, uint16_t adr) {

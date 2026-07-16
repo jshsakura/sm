@@ -75,6 +75,19 @@ bool snes_loadRom(Snes* snes, const uint8_t* data, int length) {
     printf("Failed to load rom: unsupported type (%d)\n", headers[used].cartType);
     return false;
   }
+#ifdef GNW_SNES_CORE
+  // Device: the ROM is memory-mapped from flash (the launcher caches it there)
+  // and is megabytes large — the pow2 expand+malloc+copy below cannot fit the
+  // ~81 KB DTCM heap. Hand cart_load the flash pointer at its true size; the
+  // non-power-of-2 mirroring the expansion would bake in is done at access time
+  // by cart_fold(), so nothing is allocated or copied.
+  cart_load(
+    snes->cart, headers[used].cartType,
+    (uint8_t*)data, length, headers[used].chips > 0 ? headers[used].ramSize : 0
+  );
+  snes_reset(snes, true); // reset after loading
+  return true;
+#else
   // expand to a power of 2
   int newLength = 0x8000;
   while(true) {
@@ -101,6 +114,7 @@ bool snes_loadRom(Snes* snes, const uint8_t* data, int length) {
   snes_reset(snes, true); // reset after loading
   free(newData);
   return true;
+#endif
 }
 
 void snes_setSamples(Snes* snes, int16_t* sampleData, int samplesPerFrame) {
