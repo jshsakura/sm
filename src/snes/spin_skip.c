@@ -1,6 +1,9 @@
-/* Exact-replay spin-skip learner. See spin_skip.h for the contract; the logic is
- * the harness-proven implementation from tools/snes_spin/skip_harness.c, moved
- * here so the device and the gate harness compile the SAME code. */
+/* Two-phase exact-replay spin-skip learner. See spin_skip.h for the phase
+ * design; the replay semantics (and the purity rules) are the harness-proven
+ * ones — the phases only change WHEN the expensive bookkeeping runs, never what
+ * is proven before a loop is adopted. Adoption requires, exactly as before:
+ * the same PC revisited with registers identical and not a single write or
+ * IO-classified read across two full laps. */
 #include "spin_skip.h"
 #include "cpu.h"
 
@@ -9,9 +12,10 @@ SpinSkip g_spin;
 /* Reads within +-6 bytes of the PC are the opcode/operand fetch; WRAM and ROM
  * reads are side-effect-free. Anything else ($21xx APU ports, $42xx HVBJOY/joy,
  * $43xx DMA regs, expansion) observably moves state: an iteration that touches
- * one can terminate on its own and must never be replayed. */
+ * one can terminate on its own and must never be replayed. Classification only
+ * runs while VERIFY shadows a candidate — outside it this is one branch. */
 void spin_hook_read(Cpu *cpu, uint32_t adr) {
-  if (!g_spin.gate_on) return;
+  if (!g_spin.phase) return;
   uint32_t pcb = ((uint32_t)cpu->k << 16) | cpu->pc;
   if (adr - (pcb - 6) <= 12) return;
   uint8_t bank = adr >> 16;
@@ -27,54 +31,83 @@ void spin_hook_read(Cpu *cpu, uint32_t adr) {
 /* Register identity is REQUIRED, not optional: a delay loop (`dey / bne`) writes
  * nothing and reads nothing yet terminates on its own — without the regs check
  * it gets adopted and replayed forever (the first harness build did exactly that
- * and died in cart_readLorom). Equal regs at the same PC + no writes + no IO
- * reads = the machine state truly recurred, so the loop provably cannot exit by
- * itself. */
-void spin_note(uint32_t pc24, uint8_t charge, int dispatched,
-               uint64_t r1, uint64_t r2) {
+ * and died in cart_readLorom). Equal regs at the anchor on consecutive laps + no
+ * writes + no IO reads = the machine state truly recurred, so the loop provably
+ * cannot exit by itself. (Compared post-opcode both times: a consistent sample
+ * point proves recurrence just as well as the old pre-opcode one.) */
+static inline void spin_pack_regs(Cpu *cpu, uint64_t *r1, uint64_t *r2) {
+  *r1 = (uint64_t)cpu->a | ((uint64_t)cpu->x << 16) |
+        ((uint64_t)cpu->y << 32) | ((uint64_t)cpu->sp << 48);
+  *r2 = (uint64_t)cpu->dp | ((uint64_t)cpu->k << 16) |
+        ((uint64_t)cpu->db << 24) | ((uint64_t)cpu_getFlags(cpu) << 32) |
+        ((uint64_t)cpu->e << 40);
+}
+
+void spin_note(Cpu *cpu, uint32_t pc24, uint8_t charge, int dispatched) {
   SpinSkip *s = &g_spin;
+
+  /* keep an adopted pattern honest against real execution */
   if (s->on) {
     if (dispatched || pc24 != s->pc[s->idx]) s->on = false;
     else s->idx = (s->idx + 1) % s->len;
   }
   if (!s->gate_on) return;
-  s->lr[s->lr_h].pc = pc24; s->lr[s->lr_h].charge = charge;
-  s->lr[s->lr_h].w = s->write_seq; s->lr[s->lr_h].io = s->io_seq;
-  s->lr[s->lr_h].r1 = r1; s->lr[s->lr_h].r2 = r2;
-  s->lr_h = (s->lr_h + 1) % SPIN_LR; if (s->lr_n < SPIN_LR) s->lr_n++;
-  if (s->on || dispatched) return;
 
-  for (int d = 1; d <= SPIN_PMAX && 2 * d + 1 <= s->lr_n; d++) {
-    int j = (s->lr_h - 1 - d + SPIN_LR) % SPIN_LR;
-    if (s->lr[j].pc != pc24) continue;
-    /* regs identical at this PC on both prior visits */
-    if (s->lr[j].r1 != r1 || s->lr[j].r2 != r2) return;
-    /* wseq/ioseq frozen across the last TWO iterations */
-    int oldest = (s->lr_h - 1 - 2 * d + SPIN_LR) % SPIN_LR;
-    if (s->lr[oldest].w != s->write_seq || s->lr[oldest].io != s->io_seq) return;
-    if (s->lr[oldest].pc != pc24) return;
-    if (s->lr[oldest].r1 != r1 || s->lr[oldest].r2 != r2) return;
-    for (int q = 1; q < d; q++) {
-      int a = (s->lr_h - 1 - q + SPIN_LR) % SPIN_LR,
-          b = (s->lr_h - 1 - q - d + SPIN_LR) % SPIN_LR;
-      if (s->lr[a].pc != s->lr[b].pc || s->lr[a].charge != s->lr[b].charge) return;
+  if (s->phase) {
+    /* ---- VERIFY: shadow the candidate for two laps ---- */
+    if (dispatched) { s->phase = 0; return; }
+    int pos = s->v_pos, d = s->v_d;
+    if (pos < d) {
+      /* first lap: record */
+      s->vpc[pos] = pc24; s->vcharge[pos] = charge;
+      s->v_pos = pos + 1;
+      if (pos + 1 == d) {
+        /* anchor reached again: registers must match the entry sample */
+        uint64_t r1, r2; spin_pack_regs(cpu, &r1, &r2);
+        if (r1 != s->v_r1 || r2 != s->v_r2) { s->phase = 0; return; }
+      }
+      return;
     }
-    /* adopt: entries [lr_h-d .. lr_h-1] are one iteration ending at pc24;
-     * the next opcode to execute is the one that followed the previous pc24 */
-    for (int q = 0; q < d; q++) {
-      int a = (s->lr_h - d + q + SPIN_LR) % SPIN_LR;
-      s->pc[q] = s->lr[a].pc; s->charge[q] = s->lr[a].charge;
+    /* second lap: compare */
+    if (s->vpc[pos - d] != pc24 || s->vcharge[pos - d] != charge) {
+      s->phase = 0;
+      return;
     }
-    s->len = d; s->idx = 0; s->on = true;
+    s->v_pos = pos + 1;
+    if (pos + 1 == 2 * d) {
+      /* anchor a third time: regs identical + not one write/IO across both laps */
+      uint64_t r1, r2; spin_pack_regs(cpu, &r1, &r2);
+      if (r1 == s->v_r1 && r2 == s->v_r2 &&
+          s->write_seq == 0 && s->io_seq == 0) {
+        for (int q = 0; q < d; q++) { s->pc[q] = s->vpc[q]; s->charge[q] = s->vcharge[q]; }
+        s->len = d; s->idx = 0; s->on = true;
+      }
+      s->phase = 0;
+    }
     return;
+  }
+
+  /* ---- WATCH: one ring store + a short revisit scan, nothing else ---- */
+  int h = s->w_h;
+  s->wpc[h] = pc24;
+  s->w_h = (h + 1) & (SPIN_WR - 1);
+  if (s->on || dispatched) return;
+  for (int d = 1; d <= SPIN_PMAX; d++) {
+    if (s->wpc[(h - d) & (SPIN_WR - 1)] == pc24) {
+      /* candidate loop of period d: start shadowing it */
+      s->phase = 1;
+      s->v_d = d; s->v_pos = 0;
+      s->write_seq = 0; s->io_seq = 0;
+      spin_pack_regs(cpu, &s->v_r1, &s->v_r2);
+      return;
+    }
   }
 }
 
-/* Observation-window auto-gate. Window = 600 frames (~10 s). A game that ended
- * the window with <1% of its opcodes replayed is not spinning — park the learner
- * for 1800 frames (~30 s) so it costs nothing, then try again (loading screens
- * end; RPGs start polling once gameplay begins). Replay itself stays armed even
- * while parked: an adopted pattern keeps paying, only LEARNING pauses. */
+/* Observation-window auto-gate. Window = 600 frames (~10 s). A cart that ended
+ * the window with (almost) no replayed ops is not spinning — park the learner
+ * for 1800 frames (~30 s) so it costs nothing, then retry (loading screens end).
+ * An adopted pattern keeps replaying even while parked; only LEARNING pauses. */
 #define SPIN_WIN_FRAMES  600u
 #define SPIN_PARK_FRAMES 1800u
 
@@ -83,20 +116,20 @@ void spin_frame_tick(void) {
   if (!s->gate_on) {
     if (s->park_frames > 0 && --s->park_frames == 0) {
       s->gate_on = true;
-      s->win_real = 0;
-      s->win_virtual = (uint32_t)s->ops_virtual;
+      s->win_frames = 0;
+      s->win_virt_snap = (uint32_t)s->ops_virtual;
     }
     return;
   }
-  s->win_real++;   /* frame count doubles as the window clock */
-  if (s->win_real < SPIN_WIN_FRAMES) return;
-  /* win_virtual snapshots (truncated) ops_virtual at window start; the delta
-   * over 600 frames always fits 32 bits (<= ~360M ops even at full tilt). */
-  uint32_t replayed = (uint32_t)s->ops_virtual - s->win_virtual;
-  s->win_real = 0;
-  s->win_virtual = (uint32_t)s->ops_virtual;
+  if (++s->win_frames < SPIN_WIN_FRAMES) return;
+  /* win_virt_snap holds (truncated) ops_virtual at window start; the delta over
+   * 600 frames always fits 32 bits. */
+  uint32_t replayed = (uint32_t)s->ops_virtual - s->win_virt_snap;
+  s->win_frames = 0;
+  s->win_virt_snap = (uint32_t)s->ops_virtual;
   if (replayed < SPIN_WIN_FRAMES * 3u) {   /* < ~3 replayed ops/frame: not a spinner */
     s->gate_on = false;
+    s->phase = 0;
     s->park_frames = SPIN_PARK_FRAMES;
   }
 }

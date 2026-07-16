@@ -4,24 +4,31 @@
  * WRAM/DP-flag wait loops (`spin: LDA $12 / BEQ spin`). Those iterations are
  * semantic no-ops: registers bit-identical each pass, no writes, no IO reads —
  * only the NMI handler can change the polled byte, and no handler can run inside
- * a run_dots span (events fire only at span boundaries). So inside a span the
- * loop provably cannot exit, and each iteration can be replayed without the
- * interpreter: charge the recorded cycle pattern, advance pc along the recorded
- * opcode ring, and let the SAME bulk-consume code chunk the dots — identical
- * hPos steps, identical apuCatchupCycles FMA sequence, identical cpuCyclesLeft
- * arithmetic. Bit-identical state, minus the interpreter work.
+ * a run_dots span. So inside a span the loop provably cannot exit, and each
+ * iteration can be replayed without the interpreter: charge the recorded cycle
+ * pattern, advance pc along the recorded ring, and let the SAME bulk-consume
+ * code chunk the dots. Bit-identical state, minus the interpreter work.
  *
- * This is the ONE implementation: the device port (main_snes.c) and the host
- * gate harness (tools/snes_spin) both compile this file, so what the harness
- * proves is what the device runs. Gate: skip off vs on must produce identical
- * state and audio hashes (tools/snes_spin/run_skip.sh).
+ * TWO-PHASE learner (the M7 rig showed the always-on version costing MORE than
+ * the replay saved: +0.9M insn/frame of ring stores, register packing and purity
+ * classification on every real opcode/read — an in-order core pays all of it):
+ *
+ *   WATCH  (default): per opcode, one PC ring store + a d<=8 revisit scan.
+ *          The read hook is a single predictable branch. Nothing else.
+ *   VERIFY (a PC revisited at period d): NOW pack registers, snapshot the
+ *          write/io counters, and shadow the next 2*d opcodes against the
+ *          candidate. Registers identical at the anchor on both laps + counters
+ *          frozen => the machine state truly recurred => adopt for replay.
+ *   REPLAY (adopted): the interpreter does not run; any interrupt, DMA, armed
+ *          IRQ or PC mismatch drops the pattern (relearn costs 2 iterations).
+ *
+ * This is the ONE implementation: the device port (main_snes.c), the host gate
+ * harness (tools/snes_spin) and the M7 rig compile this same file. Gate: skip
+ * off vs on must produce identical state and audio hashes.
  *
  * Runtime auto-gate (address-agnostic, NO per-game list — Korean-patched and
- * rom-hacked carts behave identically): games that never spin (TMNT-class)
- * would pay the learner's per-opcode cost for nothing, so if an observation
- * window ends with (almost) no replayed ops the learner parks itself and
- * retries later — a cart that starts spinning after a loading phase is picked
- * back up within a window. */
+ * rom-hacked carts behave identically): a cart that ends an observation window
+ * with (almost) no replayed ops parks the learner and retries later. */
 #ifndef SNES_SPIN_SKIP_H
 #define SNES_SPIN_SKIP_H
 
@@ -30,8 +37,8 @@
 
 typedef struct Cpu Cpu;
 
-#define SPIN_PMAX 8   /* longest loop body (opcodes) we replay */
-#define SPIN_LR   16  /* learning ring: recent real opcode calls */
+#define SPIN_PMAX 8    /* longest loop body (opcodes) we replay */
+#define SPIN_WR   16   /* WATCH ring size (PCs only) */
 
 typedef struct {
   /* adopted pattern (the loop being replayed) */
@@ -39,39 +46,48 @@ typedef struct {
   uint8_t  charge[SPIN_PMAX];
   int      len, idx;
   bool     on;
-  /* purity sequence numbers, bumped by the cpu.c hooks */
-  uint64_t write_seq;
-  uint64_t io_seq;
-  /* learning ring of recent (pc24, ccl-charge, seqs, regs) real calls */
-  struct { uint32_t pc; uint8_t charge; uint64_t w, io, r1, r2; } lr[SPIN_LR];
-  int      lr_h, lr_n;
-  /* auto-gate: learning enabled + observation-window bookkeeping */
+
+  /* learner phase: 0 = WATCH, 1 = VERIFY */
+  uint8_t  phase;
+
+  /* WATCH: ring of recent opcode PCs, nothing else */
+  uint32_t wpc[SPIN_WR];
+  int      w_h;
+
+  /* VERIFY: candidate loop being shadowed */
+  uint32_t vpc[SPIN_PMAX];     /* PCs of one iteration (anchor at [0]) */
+  uint8_t  vcharge[SPIN_PMAX];
+  int      v_d;                /* period */
+  int      v_pos;              /* opcodes seen since anchor, 0..2*d */
+  uint64_t v_r1, v_r2;         /* registers at the anchor */
+  uint32_t v_w, v_io;          /* write/io counters (only counted in VERIFY) */
+
+  /* purity counters — ONLY advanced while phase==VERIFY (cheap hooks otherwise) */
+  uint32_t write_seq, io_seq;
+
+  /* auto-gate */
   bool     gate_on;
-  uint32_t win_real, win_virtual;
-  uint32_t park_frames;   /* frames left to sit out after gating off */
-  /* stats (read by the port for diagnostics) */
+  uint32_t win_frames, win_virt_snap;
+  uint32_t park_frames;
+
+  /* stats */
   uint64_t ops_real, ops_virtual;
 } SpinSkip;
 
 extern SpinSkip g_spin;
 
-/* cpu.c write hook: any store breaks purity. */
-static inline void spin_hook_write(void) { g_spin.write_seq++; }
+/* cpu.c hooks. Deliberately tiny outside VERIFY: one predictable branch. */
+static inline void spin_hook_write(void) {
+  if (g_spin.phase) g_spin.write_seq++;
+}
+void spin_hook_read(Cpu *cpu, uint32_t adr);   /* classifies only in VERIFY */
 
-/* cpu.c read hook: classify a read as side-effect-free (opcode-adjacent, WRAM,
- * ROM) or an IO read that breaks purity ($21xx/$42xx/$43xx: reading APU ports or
- * HVBJOY moves observable state). Address-agnostic, exactly the harness rule. */
-void spin_hook_read(Cpu *cpu, uint32_t adr);
+/* Per real opcode call (pre-call pc24, post-call ccl charge). Registers are
+ * read from `cpu` INSIDE the learner, and only in VERIFY — the always-on
+ * 64-bit packing was a measured chunk of the old version's overhead. */
+void spin_note(Cpu *cpu, uint32_t pc24, uint8_t charge, int dispatched);
 
-/* Record one real opcode call (pre-call pc24, total ccl charge, pre-call regs);
- * learns/keeps/drops the pattern. dispatched = an interrupt entered
- * cpu_runOpcode instead of the opcode at pc24. */
-void spin_note(uint32_t pc24, uint8_t charge, int dispatched,
-               uint64_t r1, uint64_t r2);
-
-/* Once per emulated frame: runs the observation-window auto-gate. */
-void spin_frame_tick(void);
-
+void spin_frame_tick(void);   /* once per emulated frame: auto-gate */
 void spin_reset(void);
 
 #endif
