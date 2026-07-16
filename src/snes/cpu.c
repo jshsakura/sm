@@ -49,6 +49,22 @@ extern Snes *g_snes; // for debugging
 
 // addressing modes and opcode functions not declared, only used after defintions
 
+#ifdef SNES_SPIN_SKIP
+/* Spin-skip purity hooks (spin_skip.h): every read is classified (IO reads break
+ * an iteration's purity), every write bumps the write sequence. The SAME hooks
+ * feed the host gate harness (tools/snes_spin) — one implementation, proven
+ * bit-identical there, running here. */
+#include "spin_skip.h"
+static uint8_t cpu_read(Cpu* cpu, uint32_t adr) {
+  spin_hook_read(cpu, adr);
+  return snes_cpuRead((Snes*) cpu->mem, adr);
+}
+
+static void cpu_write(Cpu* cpu, uint32_t adr, uint8_t val) {
+  spin_hook_write();
+  snes_cpuWrite((Snes*) cpu->mem, adr, val);
+}
+#else
 static uint8_t cpu_read(Cpu* cpu, uint32_t adr) {
   // assume mem is a pointer to a Snes
   return snes_cpuRead((Snes*) cpu->mem, adr);
@@ -58,6 +74,7 @@ static void cpu_write(Cpu* cpu, uint32_t adr, uint8_t val) {
   // assume mem is a pointer to a Snes
   snes_cpuWrite((Snes*) cpu->mem, adr, val);
 }
+#endif
 
 Cpu* cpu_init(void* mem, int memType) {
   Cpu* cpu = malloc(sizeof(Cpu));
