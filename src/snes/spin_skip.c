@@ -142,12 +142,22 @@ void spin_reset(void) {
   s->gate_on = g_spin_whitelist;
 }
 
-/* ROM whitelist: only ROMs whose measured gameplay skip% is above the ~50%
- * breakeven benefit from spin-skip; the per-access hook overhead hurts low-spin
- * carts (Zelda ALttP: +16% rig insn/frame).  Pre-analyzed via the M7 rig.
- * Default OFF — unregistered ROMs get no spin-skip (safe).
- * Key = FNV-1a 32-bit hash of the 21-byte internal title at the LoROM (0x7fc0)
- * or HiROM (0xffc0) header offset. */
+/* ROM spin-skip table: pre-analyzed per-ROM via the M7 rig
+ * (tools/m7_qemu_rig/run_snes_spin.sh <rom> 1200).  Each entry records the
+ * measured gameplay skip% and whether spin-skip is beneficial (skip% above
+ * the ~50% breakeven).  Unregistered ROMs default OFF — the per-access hook
+ * overhead hurts low-spin carts more than replay saves.
+ *
+ * Key = FNV-1a 32-bit hash of the 21-byte internal title at the LoROM
+ * (0x7fc0) or HiROM (0xffc0) header offset.  To add a ROM: measure its
+ * 1200-frame skip% in the spin rig, compute its title hash, add an entry. */
+typedef struct { uint32_t hash; bool enable; const char *name; } spin_entry_t;
+static const spin_entry_t spin_table[] = {
+  { 0xFB0BD0ECu, true,  "SUPER MARIOWORLD  (skip% 56.6% — ON)"  },
+  { 0x9C75F6EEu, false, "THE LEGEND OF ZELDA  (skip% 25.0% — OFF)" },
+};
+#define SPIN_TABLE_LEN (int)(sizeof(spin_table) / sizeof(spin_table[0]))
+
 void spin_whitelist_set(const uint8_t *rom, uint32_t len) {
   g_spin_whitelist = false;
   static const uint32_t offs[2] = { 0x7fc0, 0xffc0 };
@@ -158,7 +168,11 @@ void spin_whitelist_set(const uint8_t *rom, uint32_t len) {
       h ^= rom[offs[i] + j];
       h *= 16777619u;
     }
-    /* SMW "SUPER MARIOWORLD": gameplay skip% 56.6% — ON */
-    if (h == 0xFB0BD0ECu) { g_spin_whitelist = true; return; }
+    for (int k = 0; k < SPIN_TABLE_LEN; k++) {
+      if (spin_table[k].hash == h) {
+        g_spin_whitelist = spin_table[k].enable;
+        return;
+      }
+    }
   }
 }
