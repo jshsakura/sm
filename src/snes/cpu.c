@@ -56,12 +56,12 @@ extern Snes *g_snes; // for debugging
  * bit-identical there, running here. */
 #include "spin_skip.h"
 static uint8_t cpu_read(Cpu* cpu, uint32_t adr) {
-  spin_hook_read(cpu, adr);
+  if (g_spin.phase) spin_hook_read(cpu, adr);
   return snes_cpuRead((Snes*) cpu->mem, adr);
 }
 
 static void cpu_write(Cpu* cpu, uint32_t adr, uint8_t val) {
-  spin_hook_write();
+  if (g_spin.phase) spin_hook_write();
   snes_cpuWrite((Snes*) cpu->mem, adr, val);
 }
 #else

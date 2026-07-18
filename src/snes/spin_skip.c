@@ -8,6 +8,7 @@
 #include "cpu.h"
 
 SpinSkip g_spin;
+bool g_spin_whitelist = false;
 
 /* Reads within +-6 bytes of the PC are the opcode/operand fetch; WRAM and ROM
  * reads are side-effect-free. Anything else ($21xx APU ports, $42xx HVBJOY/joy,
@@ -115,7 +116,7 @@ void spin_frame_tick(void) {
   SpinSkip *s = &g_spin;
   if (!s->gate_on) {
     if (s->park_frames > 0 && --s->park_frames == 0) {
-      s->gate_on = true;
+      s->gate_on = g_spin_whitelist;
       s->win_frames = 0;
       s->win_virt_snap = (uint32_t)s->ops_virtual;
     }
@@ -131,11 +132,33 @@ void spin_frame_tick(void) {
     s->gate_on = false;
     s->phase = 0;
     s->park_frames = SPIN_PARK_FRAMES;
+    return;
   }
 }
 
 void spin_reset(void) {
   SpinSkip *s = &g_spin;
   *s = (SpinSkip){0};
-  s->gate_on = true;
+  s->gate_on = g_spin_whitelist;
+}
+
+/* ROM whitelist: only ROMs whose measured gameplay skip% is above the ~50%
+ * breakeven benefit from spin-skip; the per-access hook overhead hurts low-spin
+ * carts (Zelda ALttP: +16% rig insn/frame).  Pre-analyzed via the M7 rig.
+ * Default OFF — unregistered ROMs get no spin-skip (safe).
+ * Key = FNV-1a 32-bit hash of the 21-byte internal title at the LoROM (0x7fc0)
+ * or HiROM (0xffc0) header offset. */
+void spin_whitelist_set(const uint8_t *rom, uint32_t len) {
+  g_spin_whitelist = false;
+  static const uint32_t offs[2] = { 0x7fc0, 0xffc0 };
+  for (int i = 0; i < 2; i++) {
+    if (offs[i] + 21 > len) continue;
+    uint32_t h = 2166136261u;
+    for (int j = 0; j < 21; j++) {
+      h ^= rom[offs[i] + j];
+      h *= 16777619u;
+    }
+    /* SMW "SUPER MARIOWORLD": gameplay skip% 56.6% — ON */
+    if (h == 0xFB0BD0ECu) { g_spin_whitelist = true; return; }
+  }
 }

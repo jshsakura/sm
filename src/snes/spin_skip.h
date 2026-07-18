@@ -76,6 +76,13 @@ typedef struct {
 
 extern SpinSkip g_spin;
 
+/* ROM whitelist: set by main_snes.c at ROM load from a pre-analyzed title-hash
+ * table.  When false (default), spin_reset() parks the learner — the per-access
+ * hook overhead hurts low-spin carts more than the replay saves (Zelda: +16%
+ * rig insn).  Only ROMs with measured gameplay skip% above the ~50% breakeven
+ * (SMW: 57%) are whitelisted. */
+extern bool g_spin_whitelist;
+
 /* cpu.c hooks. Deliberately tiny outside VERIFY: one predictable branch. */
 static inline void spin_hook_write(void) {
   if (g_spin.phase) g_spin.write_seq++;
@@ -89,5 +96,6 @@ void spin_note(Cpu *cpu, uint32_t pc24, uint8_t charge, int dispatched);
 
 void spin_frame_tick(void);   /* once per emulated frame: auto-gate */
 void spin_reset(void);
+void spin_whitelist_set(const uint8_t *rom, uint32_t len);  /* call before spin_reset */
 
 #endif
