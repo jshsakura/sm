@@ -11,6 +11,7 @@
 #include "../ida_types.h"
 #include "../enemy_types.h"
 #include "../variables.h"
+#include "rc_dispatch.h"
 static const int cyclesPerOpcode[256] = {
   7, 6, 7, 4, 5, 3, 5, 6, 3, 2, 2, 4, 6, 4, 6, 5,
   2, 5, 5, 7, 5, 4, 6, 6, 2, 4, 2, 2, 6, 4, 7, 5,
@@ -139,6 +140,12 @@ int cpu_runOpcode(Cpu* cpu) {
       // must be irq
       cpu_doInterrupt(cpu, true);
     }
+  }
+  /* rc static recompiler: if active, dispatch to native site (−42% insn on SMW).
+   * One never-taken branch when inactive (g_rc_active defaults false). */
+  if (g_rc_active) {
+    uint16_t id = rc_dispatch_lookup(cpu->k, cpu->pc);
+    if (id) { rc_dispatch_call(id, cpu); return cpu->cyclesUsed; }
   }
   uint8_t opcode = cpu_readOpcode(cpu);
   cpu->cyclesUsed = cyclesPerOpcode[opcode];
