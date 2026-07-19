@@ -1021,11 +1021,19 @@ static NOINLINE void PpuDrawWholeLine(Ppu *ppu, uint y) {
       do {
         PpuZbufType main_z = ppu->bgBuffers[0].data[i];
         uint8 main_layer = (main_z >> 8) & 0xf;
-        /* Fixed-color or transparent-subscreen pixels are a pure function of
-         * clip state, main layer and CGRAM index. One lookup replaces component
+        /* Fixed-color, transparent-subscreen AND math-disabled-layer pixels are
+         * all a pure function of clip state, main layer and CGRAM index. When
+         * this layer's mathEnabled bit is off, PpuRebuildMathFixed() built its
+         * table entry with do_math=false — the exact same brightnessMult-only
+         * formula the manual path below falls through to when the per-pixel
+         * `math_enabled_cur & (1 << main_layer)` test fails. So a bypassing
+         * pixel needs neither the real subscreen value nor the manual
+         * extract/blend/repack below; it needs the same one lookup the
+         * fixed-color case already uses. One lookup replaces component
          * extraction, layer test, add/subtract, clamp and RGB565 packing. */
         if (main_layer < 6 &&
-            (!ppu->addSubscreen || (ppu->bgBuffers[1].data[i] & 0xff) == 0)) {
+            (!(math_enabled_cur & (1 << main_layer)) ||
+             !ppu->addSubscreen || (ppu->bgBuffers[1].data[i] & 0xff) == 0)) {
           dst[0] = ppu->mathFixed565[clip_color_mask != 0][main_layer][main_z & 0xff];
           continue;
         }
