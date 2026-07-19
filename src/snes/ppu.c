@@ -108,11 +108,22 @@ enum {
 Ppu* ppu_init(Snes* snes) {
 #ifdef TARGET_GNW
   /* One PPU on the device (there is no reference emulator to run alongside), so
-   * a static instance beats a malloc from the overlay pool. VRAM goes to ITC RAM. */
+   * a static instance beats a malloc from the overlay pool. */
   static Ppu g_ppu;
   Ppu* ppu = &g_ppu;
+#if defined(GNW_SNES_CORE)
+  /* SNES overlay only: VRAM in overlay BSS (RAM_EMU) as a static array — frees
+   * 64 KB of ITCM for the rc hot subset. The GNW_SNES_CORE guard keeps this
+   * array out of the SM overlay (which also compiles ppu.o for shared symbols
+   * but has its own PPU and its own tight BSS budget). */
+  static uint16_t g_ppu_vram[0x8000];
+  if (ppu->vram == NULL)
+    ppu->vram = g_ppu_vram;
+#else
+  /* Other GNW overlays (SM etc.): VRAM in ITCM as before. */
   if (ppu->vram == NULL)
     ppu->vram = (uint16_t *)itc_calloc(1, 0x10000);
+#endif
 #else
   Ppu* ppu = malloc(sizeof(Ppu));
 #endif
