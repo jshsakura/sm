@@ -840,12 +840,61 @@ static void PpuRebuildPalette(Ppu *ppu) {
   }
   ppu->paletteDirty = false;
 }
+
+static uint32_t PpuMathFixedKey(Ppu *ppu) {
+  uint32_t key = ppu->fixedColorR | ppu->fixedColorG << 5 | ppu->fixedColorB << 10;
+  key |= (uint32_t)ppu->subtractColor << 15;
+  key |= (uint32_t)ppu->halfColor << 16;
+  key |= (uint32_t)ppu->addSubscreen << 17;
+  for (int layer = 0; layer < 6; layer++)
+    key |= (uint32_t)ppu->mathEnabled[layer] << (18 + layer);
+  return key;
+}
+
+static void PpuRebuildMathFixed(Ppu *ppu, uint32_t key) {
+  uint32_t fixed = ppu->fixedColorR | ppu->fixedColorG << 5 | ppu->fixedColorB << 10;
+  uint32_t r2 = fixed & 0x1f, g2 = fixed >> 5 & 0x1f, b2 = fixed >> 10 & 0x1f;
+  /* With addSubscreen enabled, a transparent subscreen pixel falls back to the
+   * fixed color but is deliberately NOT halved (SNES rule, matching the old
+   * loop). Otherwise fixed-color half math uses brightnessMultHalf. */
+  uint8_t *math_map = ppu->halfColor && !ppu->addSubscreen ?
+      ppu->brightnessMultHalf : ppu->brightnessMult;
+  for (int clip = 0; clip < 2; clip++) {
+    uint32_t mask = clip ? 0x1f : 0;
+    for (int layer = 0; layer < 6; layer++) {
+      bool do_math = ppu->mathEnabled[layer];
+      for (int index = 0; index < 256; index++) {
+        uint32_t color = ppu->cgram[index];
+        uint32_t r = color & mask, g = color >> 5 & mask, b = color >> 10 & mask;
+        uint8_t *color_map = ppu->brightnessMult;
+        if (do_math) {
+          color_map = math_map;
+          if (ppu->subtractColor) {
+            r = r >= r2 ? r - r2 : 0;
+            g = g >= g2 ? g - g2 : 0;
+            b = b >= b2 ? b - b2 : 0;
+          } else {
+            r += r2, g += g2, b += b2;
+          }
+        }
+        ppu->mathFixed565[clip][layer][index] =
+            (color_map[b] >> 3) | (color_map[g] >> 2) << 5 | (color_map[r] >> 3) << 11;
+      }
+    }
+  }
+  ppu->mathFixedKey = key;
+}
+
 #endif
 
 static NOINLINE void PpuDrawWholeLine(Ppu *ppu, uint y) {
 #ifdef PPU_RGB565
-  if (ppu->paletteDirty)
+  bool palette_was_dirty = ppu->paletteDirty;
+  if (palette_was_dirty)
     PpuRebuildPalette(ppu);   /* cgram or brightness moved since the last line */
+  uint32_t math_fixed_key = PpuMathFixedKey(ppu);
+  if (palette_was_dirty || math_fixed_key != ppu->mathFixedKey)
+    PpuRebuildMathFixed(ppu, math_fixed_key);
 #endif
   if (ppu->forcedBlank) {
     uint8 *dst = &ppu->renderBuffer[(y - 1) * ppu->renderPitch];
@@ -951,8 +1000,17 @@ static NOINLINE void PpuDrawWholeLine(Ppu *ppu, uint y) {
       // Need to check for each pixel whether to use math or not based on the main screen layer.
       uint32 i = left;
       do {
-        uint32 color = ppu->cgram[ppu->bgBuffers[0].data[i] & 0xff], color2;
-        uint8 main_layer = (ppu->bgBuffers[0].data[i] >> 8) & 0xf;
+        PpuZbufType main_z = ppu->bgBuffers[0].data[i];
+        uint8 main_layer = (main_z >> 8) & 0xf;
+        /* Fixed-color or transparent-subscreen pixels are a pure function of
+         * clip state, main layer and CGRAM index. One lookup replaces component
+         * extraction, layer test, add/subtract, clamp and RGB565 packing. */
+        if (main_layer < 6 &&
+            (!ppu->addSubscreen || (ppu->bgBuffers[1].data[i] & 0xff) == 0)) {
+          dst[0] = ppu->mathFixed565[clip_color_mask != 0][main_layer][main_z & 0xff];
+          continue;
+        }
+        uint32 color = ppu->cgram[main_z & 0xff], color2;
         uint32 r = color & clip_color_mask;
         uint32 g = (color >> 5) & clip_color_mask;
         uint32 b = (color >> 10) & clip_color_mask;

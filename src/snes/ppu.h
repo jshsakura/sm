@@ -216,6 +216,15 @@ struct Ppu {
    * Rebuilt when either input changes, which is a handful of times a frame. */
   uint16_t palette565[256];
   bool paletteDirty;
+
+  /* Derived fixed-color math cache. The slow composite path used to split the
+   * same CGRAM color into RGB, add/subtract the same fixed color, clamp through
+   * brightness tables and repack RGB565 for every pixel. Cache that pure result
+   * for both color-window clip states and all six SNES layers. Subscreen pixels
+   * still use the exact per-pixel path because their second color varies.
+   * Kept after pixelbuffer_placeholder, so savestates never serialize it. */
+  uint16_t mathFixed565[2][6][256];
+  uint32_t mathFixedKey;
 #endif
 
   /* Sprite line-candidacy cache — derived state, deliberately past
