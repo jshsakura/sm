@@ -170,6 +170,11 @@ static void dsp_handleEcho(Dsp* dsp, int* outputL, int* outputR) {
     dsp->apu_ram[(adr + 2) & 0xffff] + (dsp->apu_ram[(adr + 3) & 0xffff] << 8)
   );
   dsp->firBufferR[dsp->firBufferIndex] >>= 1;
+  /* If echo cannot affect this output or ARAM, the FIR sum and eight-channel
+   * feedback mix are dead work. Loading the current delay-line values and
+   * advancing both indexes preserves the exact history for a later enable. */
+  if (!dsp->echoWrites && dsp->echoVolumeL == 0 && dsp->echoVolumeR == 0)
+    goto handle_indexes;
   // calculate FIR-sum
   int sumL = 0, sumR = 0;
   for(int i = 0; i < 8; i++) {
@@ -211,6 +216,7 @@ static void dsp_handleEcho(Dsp* dsp, int* outputL, int* outputR) {
     dsp->apu_ram[(adr + 2) & 0xffff] = inR & 0xff;
     dsp->apu_ram[(adr + 3) & 0xffff] = inR >> 8;
   }
+handle_indexes:
   // handle indexes
   dsp->firBufferIndex++;
   dsp->firBufferIndex &= 7;
