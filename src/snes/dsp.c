@@ -53,7 +53,11 @@ static const uint16_t gaussValues[512] = {
   0x513, 0x514, 0x514, 0x515, 0x516, 0x516, 0x517, 0x517, 0x517, 0x518, 0x518, 0x518, 0x518, 0x518, 0x519, 0x519
 };
 
+#ifdef SNES_DSP_MONO
+static void dsp_cycleChannel(Dsp* dsp, int ch, bool needSample);
+#else
 static void dsp_cycleChannel(Dsp* dsp, int ch);
+#endif
 static void dsp_handleEcho(Dsp* dsp, int* outputL, int* outputR);
 static void dsp_handleGain(Dsp* dsp, int ch);
 static void dsp_decodeBrr(Dsp* dsp, int ch);
@@ -132,17 +136,48 @@ void dsp_saveload(Dsp *dsp, SaveLoadFunc *func, void *ctx) {
 void dsp_cycle(Dsp* dsp) {
   int totalL = 0;
   int totalR = 0;
+#ifdef SNES_DSP_MONO
+  /* The Game & Watch consumes 266 mono samples per 60 Hz frame. Keep source
+   * ticks 0,2,...530; the 32 kHz DSP state and echo delay line still advance
+   * on every tick, but the discarded main output is never synthesized. */
+  bool emitSample = dsp->sampleOffset < 532 && (dsp->sampleOffset & 1) == 0;
+#endif
   for(int i = 0; i < 8; i++) {
+#ifdef SNES_DSP_MONO
+    /* A discarded sample remains live if the next voice uses it for pitch
+     * modulation or the full-rate echo path writes it back to ARAM. */
+    bool needSample = emitSample ||
+      (i < 7 && dsp->channel[i + 1].pitchModulation) ||
+      (dsp->echoWrites && dsp->channel[i].echoEnable);
+    dsp_cycleChannel(dsp, i, needSample);
+    if (!emitSample)
+      continue;
+    int monoVolume = (int)dsp->channel[i].volumeL + dsp->channel[i].volumeR;
+    totalL += (dsp->channel[i].sampleOut * monoVolume) >> 7;
+    totalL = totalL < -0x8000 ? -0x8000 : (totalL > 0x7fff ? 0x7fff : totalL);
+#else
     dsp_cycleChannel(dsp, i);
     totalL += (dsp->channel[i].sampleOut * dsp->channel[i].volumeL) >> 6;
     totalR += (dsp->channel[i].sampleOut * dsp->channel[i].volumeR) >> 6;
     totalL = totalL < -0x8000 ? -0x8000 : (totalL > 0x7fff ? 0x7fff : totalL); // clamp 16-bit
     totalR = totalR < -0x8000 ? -0x8000 : (totalR > 0x7fff ? 0x7fff : totalR); // clamp 16-bit
+#endif
   }
+#ifdef SNES_DSP_MONO
+  if (emitSample) {
+    int monoMaster = (int)dsp->masterVolumeL + dsp->masterVolumeR;
+    totalL = (totalL * monoMaster) >> 8;
+    totalL = totalL < -0x8000 ? -0x8000 : (totalL > 0x7fff ? 0x7fff : totalL);
+    totalR = totalL;
+  }
+#else
   totalL = (totalL * dsp->masterVolumeL) >> 7;
   totalR = (totalR * dsp->masterVolumeR) >> 7;
   totalL = totalL < -0x8000 ? -0x8000 : (totalL > 0x7fff ? 0x7fff : totalL); // clamp 16-bit
   totalR = totalR < -0x8000 ? -0x8000 : (totalR > 0x7fff ? 0x7fff : totalR); // clamp 16-bit
+#endif
+  /* Echo remains full-rate: its FIR history, feedback and ARAM writes are
+   * updated even on main-output ticks that SNES_DSP_MONO discards. */
   dsp_handleEcho(dsp, &totalL, &totalR);
   if(dsp->mute) {
     totalL = 0;
@@ -151,8 +186,14 @@ void dsp_cycle(Dsp* dsp) {
   dsp_handleNoise(dsp);
   // put it in the samplebuffer
   if (dsp->sampleOffset < 534) {
+#ifdef SNES_DSP_MONO
+    if (emitSample)
+      dsp->sampleBuffer[dsp->sampleOffset >> 1] =
+        (int16_t)((totalL + totalR) / 2);
+#else
     dsp->sampleBuffer[dsp->sampleOffset * 2] = totalL;
     dsp->sampleBuffer[dsp->sampleOffset * 2 + 1] = totalR;
+#endif
     // prevent sampleOffset from going above 534-1 (out of sampleBuffer bounds)
     dsp->sampleOffset++;
   }
@@ -228,7 +269,11 @@ handle_indexes:
   }
 }
 
+#ifdef SNES_DSP_MONO
+static void dsp_cycleChannel(Dsp* dsp, int ch, bool needSample) {
+#else
 static void dsp_cycleChannel(Dsp* dsp, int ch) {
+#endif
   // handle pitch counter
   uint16_t pitch = dsp->channel[ch].pitch;
   if(ch > 0 && dsp->channel[ch].pitchModulation) {
@@ -243,6 +288,9 @@ static void dsp_cycleChannel(Dsp* dsp, int ch) {
   }
   dsp->channel[ch].pitchCounter = newCounter;
   int16_t sample = 0;
+#ifdef SNES_DSP_MONO
+  if (needSample) {
+#endif
   if(dsp->channel[ch].useNoise) {
     sample = dsp->noiseSample;
   } else if(dsp->channel[ch].gain == 0 && dsp->channel[ch].adsrState == 4) {
@@ -254,6 +302,9 @@ static void dsp_cycleChannel(Dsp* dsp, int ch) {
   } else {
     sample = dsp_getSample(dsp, ch, dsp->channel[ch].pitchCounter >> 12, (dsp->channel[ch].pitchCounter >> 4) & 0xff);
   }
+#ifdef SNES_DSP_MONO
+  }
+#endif
 #if !MY_CHANGES
   if(dsp->evenCycle) {
     // handle keyon/off (every other cycle)
@@ -291,9 +342,15 @@ static void dsp_cycleChannel(Dsp* dsp, int ch) {
   if(doingDirectGain) dsp->channel[ch].gain = dsp->channel[ch].gainValue;
   // set outputs
   dsp->ram[(ch << 4) | 8] = dsp->channel[ch].gain >> 4;
+#ifdef SNES_DSP_MONO
+  if (needSample) {
+#endif
   sample = (sample * dsp->channel[ch].gain) >> 11;
   dsp->ram[(ch << 4) | 9] = sample >> 7;
   dsp->channel[ch].sampleOut = sample;
+#ifdef SNES_DSP_MONO
+  }
+#endif
 }
 
 static void dsp_handleGain(Dsp* dsp, int ch) {
@@ -588,6 +645,21 @@ void dsp_write(Dsp* dsp, uint8_t adr, uint8_t val) {
 }
 
 void dsp_getSamples(Dsp* dsp, int16_t* sampleData, int samplesPerFrame, int numChannels) {
+#ifdef SNES_DSP_MONO
+  /* The device-rate mono samples were emitted directly by dsp_cycle(). */
+  const int available = 266;
+  if (numChannels == 1) {
+    for (int i = 0; i < samplesPerFrame; i++)
+      sampleData[i] = dsp->sampleBuffer[i < available ? i : available - 1];
+  } else {
+    for (int i = 0; i < samplesPerFrame; i++) {
+      int16_t sample = dsp->sampleBuffer[i < available ? i : available - 1];
+      sampleData[i * 2] = sample;
+      sampleData[i * 2 + 1] = sample;
+    }
+  }
+  dsp->sampleOffset = 0;
+#else
   // resample from 534 samples per frame to wanted value
   double adder = 534.0 / samplesPerFrame;
   double location = 0.0;
@@ -623,4 +695,5 @@ void dsp_getSamples(Dsp* dsp, int16_t* sampleData, int samplesPerFrame, int numC
     }
   }
   dsp->sampleOffset = 0;
+#endif
 }
