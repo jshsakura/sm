@@ -994,6 +994,25 @@ static NOINLINE void PpuDrawWholeLine(Ppu *ppu, uint y) {
       } while (dst++, ++i < right);
 #endif
     } else {
+#if defined(PPU_RGB565) && defined(SNES_PPU_DIRECT_MATH)
+      /* No subscreen means the result is solely a function of the main z/color
+       * word and clip state.  Its low 12 bits are already laid out exactly as
+       * mathFixed565[layer][index]. One lookup replaces math-enable branches
+       * and the per-pixel fixed/subscreen test. Layer 6 (OBJ palettes exempt
+       * from color math) falls back to the already-built plain palette. */
+      if (!ppu->addSubscreen) {
+        const uint16_t *direct = &ppu->mathFixed565[clip_color_mask != 0][0][0];
+        const PpuZbufType *src = ppu->bgBuffers[0].data;
+        uint32 i = left;
+        do {
+          uint32 main_z = src[i];
+          uint32 layer = main_z >> 8 & 0xf;
+          dst[0] = layer < 6 ? direct[(layer << 8) | (main_z & 0xff)] :
+              (clip_color_mask ? ppu->palette565[main_z & 0xff] : 0);
+        } while (dst++, ++i < right);
+        continue;
+      }
+#endif
       uint8 *half_color_map = ppu->halfColor ? ppu->brightnessMultHalf : ppu->brightnessMult;
       // Store this in locals
       math_enabled_cur |= ppu->addSubscreen << 8 | ppu->subtractColor << 9;
