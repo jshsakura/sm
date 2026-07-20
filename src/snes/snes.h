@@ -68,6 +68,13 @@ struct Snes {
   // misc
   bool fastMem;
   uint8_t openBus;
+  /* ROM fetch-page cache for snes_cpuRead(). Deliberately declared AFTER
+   * openBus: snes_saveload() serializes the byte range hPos..openBus, so
+   * anything past it stays out of the savestate -- which is what we want,
+   * these are a derived host pointer and its tag, not emulated state, and a
+   * savestate must never carry a host address across a load. */
+  const uint8_t *romPageBase;
+  uint32_t romPageTag;
 };
 
 Snes* snes_init(uint8_t *ram);

@@ -38,6 +38,13 @@ Snes* snes_init(uint8_t *ram) {
    * screen is black while the game runs fine (cb=0, cgram populated). */
   snes->disableRender = false;
 
+  /* snes_init() only malloc()s and assigns fields -- it never memsets the
+   * struct -- so every new field starts as heap garbage. On a host that heap
+   * reads back as zeros and nothing shows; on the device's DTCM heap it does
+   * not, and a garbage tag that happened to match a page would dereference a
+   * garbage pointer. Set it here as well as in snes_reset(). */
+  snes->romPageTag = ~(uint32_t)0;
+  snes->romPageBase = NULL;
   snes->cpu = cpu_init(snes, 0);
 #if defined(TARGET_GNW) && !defined(GNW_SNES_CORE)
   /* The Super Metroid port has no reference emulator on the device: the SPC700
@@ -92,9 +99,21 @@ void snes_saveload(Snes *snes, SaveLoadFunc *func, void *ctx) {
   func(ctx, &snes->ramAdr, 4);
 
   snes->runningWhichVersion = 0;
+  /* The fetch-page cache is deliberately not part of the range above (a host
+   * pointer must never be written to or read from a savestate). Drop it on
+   * both save and load so a load can never resume on a pointer built before
+   * it -- cheap, and it removes the whole question. */
+  snes->romPageTag = ~(uint32_t)0;
+  snes->romPageBase = NULL;
 }
 
 void snes_reset(Snes* snes, bool hard) {
+  /* Drop the fetch-page cache BEFORE anything reads through snes_cpuRead():
+   * cart_reset() may map a different ROM, and cpu_reset() immediately below
+   * fetches the reset vector. The tag is always page-aligned inside a 24-bit
+   * bus, so ~0 can never match a real address. */
+  snes->romPageTag = ~(uint32_t)0;
+  snes->romPageBase = NULL;
   cart_reset(snes->cart); // reset cart first, because resetting cpu will read from it (reset vector)
   cpu_reset(snes->cpu);
   apu_reset(snes->apu);
@@ -573,6 +592,24 @@ void snes_write(Snes* snes, uint32_t adr, uint8_t val) {
 uint8_t snes_cpuRead(Snes* snes, uint32_t adr) {
   snes->cpuMemOps++;
   snes->cpuCyclesLeft += 8;
+  /* Fetch-page cache. The ROM fast path below already collapsed the mapper to
+   * one AND, but every single byte still re-ran the whole classification
+   * chain above it -- two bank compares, the WRAM range test, the >=0x8000
+   * test, the LoROM/HiROM select -- even though an opcode fetch walks the
+   * same 8 KB of ROM for long stretches (fetch is ~77% of CPU reads). Cache
+   * the host base of the last ROM page and serve a hit with one compare and
+   * one index.
+   *
+   * Only the ROM branch ever installs a tag, so a tag match implies ROM:
+   * WRAM, SRAM and MMIO all live below 0x8000 (or in banks 7e/7f) and keep
+   * the slow path, which is also why no write path has to invalidate this --
+   * ROM does not change under us. An 8 KB page cannot straddle a LoROM 32 KB
+   * mapping boundary, and cannot straddle a romMask wrap either (romMask is
+   * 2^n-1 with n >= 13 for any real cart), so base+offset stays linear for
+   * the whole page. The tag holds the page-aligned address, so the sentinel
+   * below (low bits set, and beyond the 24-bit bus) can never collide. */
+  if((adr & ~(uint32_t)0x1fff) == snes->romPageTag)
+    return snes->romPageBase[adr & 0x1fff];
   uint8_t bank = adr >> 16;
   uint16_t off = (uint16_t)adr;
   if(bank == 0x7e || bank == 0x7f)
@@ -585,10 +622,13 @@ uint8_t snes_cpuRead(Snes* snes, uint32_t adr) {
    * AND; odd sizes fall to the folding slow path. */
   Cart* cart = snes->cart;
   if(off >= 0x8000 && cart->romMask) {
-    uint32_t idx = (cart->type == 1)
-      ? (((uint32_t)(bank & 0x7f) << 15) | (off & 0x7fff))   /* LoROM */
-      : (((uint32_t)(bank & 0x3f) << 16) | off);             /* HiROM */
-    return cart->rom[idx & cart->romMask];
+    uint32_t page = adr & ~(uint32_t)0x1fff;
+    uint32_t pidx = (cart->type == 1)
+      ? (((uint32_t)((page >> 16) & 0x7f) << 15) | (page & 0x7fff))  /* LoROM */
+      : (((uint32_t)((page >> 16) & 0x3f) << 16) | (page & 0xffff)); /* HiROM */
+    snes->romPageBase = cart->rom + (pidx & cart->romMask);
+    snes->romPageTag = page;
+    return snes->romPageBase[adr & 0x1fff];
   }
   return snes_read(snes, adr);
 }

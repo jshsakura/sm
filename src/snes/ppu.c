@@ -491,14 +491,40 @@ static void PpuWindows_Calc(PpuWindows *win, Ppu *ppu, uint layer) {
   win->bits = w1_bits | w2_bits;
 }
 
+static inline uint32 PpuSpreadByteToNibbles(uint32 x) {
+  /* Insert three zero bits between each source bit. Four spread bitplanes OR
+   * directly into eight chunky 4bpp pixels, avoiding four extracts per pixel. */
+  x = (x | x << 12) & 0x000f000f;
+  x = (x | x << 6) & 0x03030303;
+  return (x | x << 3) & 0x11111111;
+}
+
+static inline uint32 PpuDecode4bpp(uint32 bits) {
+  return PpuSpreadByteToNibbles(bits & 0xff) |
+         PpuSpreadByteToNibbles(bits >> 8 & 0xff) << 1 |
+         PpuSpreadByteToNibbles(bits >> 16 & 0xff) << 2 |
+         PpuSpreadByteToNibbles(bits >> 24) << 3;
+}
+
+static inline uint32 PpuDecode2bpp(uint32 bits) {
+  return PpuSpreadByteToNibbles(bits & 0xff) |
+         PpuSpreadByteToNibbles(bits >> 8) << 1;
+}
+
 // Draw a whole line of a 4bpp background layer into bgBuffers
 static void PpuDrawBackground_4bpp(Ppu *ppu, uint y, bool sub, uint layer, PpuZbufType zhi, PpuZbufType zlo) {
 #define DO_PIXEL(i) do { \
   pixel = (bits >> i) & 1 | (bits >> (7 + i)) & 2 | (bits >> (14 + i)) & 4 | (bits >> (21 + i)) & 8; \
-  if ((bits & (0x01010101 << i)) && z > dstz[i]) dstz[i] = z + pixel; } while (0)
+  if (pixel && z > dstz[i]) dstz[i] = z + pixel; } while (0)
 #define DO_PIXEL_HFLIP(i) do { \
   pixel = (bits >> (7 - i)) & 1 | (bits >> (14 - i)) & 2 | (bits >> (21 - i)) & 4 | (bits >> (28 - i)) & 8; \
-  if ((bits & (0x80808080 >> i)) && z > dstz[i]) dstz[i] = z + pixel; } while (0)
+  if (pixel && z > dstz[i]) dstz[i] = z + pixel; } while (0)
+#define DO_CHUNKY_PIXEL(i) do { \
+  pixel = (chunky >> (4 * i)) & 0xf; \
+  if (pixel && z > dstz[i]) dstz[i] = z + pixel; } while (0)
+#define DO_CHUNKY_PIXEL_HFLIP(i) do { \
+  pixel = (chunky >> (4 * (7 - i))) & 0xf; \
+  if (pixel && z > dstz[i]) dstz[i] = z + pixel; } while (0)
 #define READ_BITS(ta, tile) (addr = &ppu->vram[((ta) + (tile) * 16) & 0x7fff], addr[0] | addr[8] << 16)
   enum { kPaletteShift = 6 };
   if (!IS_SCREEN_ENABLED(ppu, sub, layer))
@@ -557,13 +583,14 @@ static void PpuDrawBackground_4bpp(Ppu *ppu, uint y, bool sub, uint layer, PpuZb
       PpuZbufType z = (tile & 0x2000) ? zhi : zlo;
       uint32 bits = READ_BITS(ta, tile & 0x3ff);
       if (bits) {
+        uint32 chunky = PpuDecode4bpp(bits);
         z += ((tile & 0x1c00) >> kPaletteShift);
         if (tile & 0x4000) {
-          DO_PIXEL(0); DO_PIXEL(1); DO_PIXEL(2); DO_PIXEL(3);
-          DO_PIXEL(4); DO_PIXEL(5); DO_PIXEL(6); DO_PIXEL(7);
+          DO_CHUNKY_PIXEL(0); DO_CHUNKY_PIXEL(1); DO_CHUNKY_PIXEL(2); DO_CHUNKY_PIXEL(3);
+          DO_CHUNKY_PIXEL(4); DO_CHUNKY_PIXEL(5); DO_CHUNKY_PIXEL(6); DO_CHUNKY_PIXEL(7);
         } else {
-          DO_PIXEL_HFLIP(0); DO_PIXEL_HFLIP(1); DO_PIXEL_HFLIP(2); DO_PIXEL_HFLIP(3);
-          DO_PIXEL_HFLIP(4); DO_PIXEL_HFLIP(5); DO_PIXEL_HFLIP(6); DO_PIXEL_HFLIP(7);
+          DO_CHUNKY_PIXEL_HFLIP(0); DO_CHUNKY_PIXEL_HFLIP(1); DO_CHUNKY_PIXEL_HFLIP(2); DO_CHUNKY_PIXEL_HFLIP(3);
+          DO_CHUNKY_PIXEL_HFLIP(4); DO_CHUNKY_PIXEL_HFLIP(5); DO_CHUNKY_PIXEL_HFLIP(6); DO_CHUNKY_PIXEL_HFLIP(7);
         }
       }
       dstz += 8, w -= 8;
@@ -585,6 +612,8 @@ static void PpuDrawBackground_4bpp(Ppu *ppu, uint y, bool sub, uint layer, PpuZb
     }
   }
 #undef READ_BITS
+#undef DO_CHUNKY_PIXEL_HFLIP
+#undef DO_CHUNKY_PIXEL
 #undef DO_PIXEL
 #undef DO_PIXEL_HFLIP
 }
@@ -597,6 +626,18 @@ static void PpuDrawBackground_2bpp(Ppu *ppu, uint y, bool sub, uint layer, PpuZb
 #define DO_PIXEL_HFLIP(i) do { \
   pixel = (bits >> (7 - i)) & 1 | (bits >> (14 - i)) & 2; \
   if (pixel && z > dstz[i]) dstz[i] = z + pixel; } while (0)
+#define DO_CHUNKY_PIXEL(i) do { \
+  pixel = (chunky >> (4 * i)) & 3; \
+  if (pixel && z > dstz[i]) dstz[i] = z + pixel; } while (0)
+#define DO_CHUNKY_PIXEL_HFLIP(i) do { \
+  pixel = (chunky >> (4 * (7 - i))) & 3; \
+  if (pixel && z > dstz[i]) dstz[i] = z + pixel; } while (0)
+#define DO_TOP_CHUNKY_PIXEL(i) do { \
+  pixel = (chunky >> (4 * i)) & 3; \
+  if (pixel) dstz[i] = z + pixel; } while (0)
+#define DO_TOP_CHUNKY_PIXEL_HFLIP(i) do { \
+  pixel = (chunky >> (4 * (7 - i))) & 3; \
+  if (pixel) dstz[i] = z + pixel; } while (0)
 #define READ_BITS(ta, tile) (addr = &ppu->vram[(ta) + (tile) * 8 & 0x7fff], addr[0])
   enum { kPaletteShift = 8 };
   if (!IS_SCREEN_ENABLED(ppu, sub, layer))
@@ -657,13 +698,26 @@ static void PpuDrawBackground_2bpp(Ppu *ppu, uint y, bool sub, uint layer, PpuZb
       PpuZbufType z = (tile & 0x2000) ? zhi : zlo;
       uint32 bits = READ_BITS(ta, tile & 0x3ff);
       if (bits) {
+        uint32 chunky = PpuDecode2bpp(bits);
         z += ((tile & 0x1c00) >> kPaletteShift);
+        /* This 2bpp renderer is BG3 in mode 1. Its high priority (0xf2) is
+         * above every BG1/BG2/OBJ priority, so the z test is always true. */
         if (tile & 0x4000) {
-          DO_PIXEL(0); DO_PIXEL(1); DO_PIXEL(2); DO_PIXEL(3);
-          DO_PIXEL(4); DO_PIXEL(5); DO_PIXEL(6); DO_PIXEL(7);
+          if (tile & 0x2000) {
+            DO_TOP_CHUNKY_PIXEL(0); DO_TOP_CHUNKY_PIXEL(1); DO_TOP_CHUNKY_PIXEL(2); DO_TOP_CHUNKY_PIXEL(3);
+            DO_TOP_CHUNKY_PIXEL(4); DO_TOP_CHUNKY_PIXEL(5); DO_TOP_CHUNKY_PIXEL(6); DO_TOP_CHUNKY_PIXEL(7);
+          } else {
+            DO_CHUNKY_PIXEL(0); DO_CHUNKY_PIXEL(1); DO_CHUNKY_PIXEL(2); DO_CHUNKY_PIXEL(3);
+            DO_CHUNKY_PIXEL(4); DO_CHUNKY_PIXEL(5); DO_CHUNKY_PIXEL(6); DO_CHUNKY_PIXEL(7);
+          }
         } else {
-          DO_PIXEL_HFLIP(0); DO_PIXEL_HFLIP(1); DO_PIXEL_HFLIP(2); DO_PIXEL_HFLIP(3);
-          DO_PIXEL_HFLIP(4); DO_PIXEL_HFLIP(5); DO_PIXEL_HFLIP(6); DO_PIXEL_HFLIP(7);
+          if (tile & 0x2000) {
+            DO_TOP_CHUNKY_PIXEL_HFLIP(0); DO_TOP_CHUNKY_PIXEL_HFLIP(1); DO_TOP_CHUNKY_PIXEL_HFLIP(2); DO_TOP_CHUNKY_PIXEL_HFLIP(3);
+            DO_TOP_CHUNKY_PIXEL_HFLIP(4); DO_TOP_CHUNKY_PIXEL_HFLIP(5); DO_TOP_CHUNKY_PIXEL_HFLIP(6); DO_TOP_CHUNKY_PIXEL_HFLIP(7);
+          } else {
+            DO_CHUNKY_PIXEL_HFLIP(0); DO_CHUNKY_PIXEL_HFLIP(1); DO_CHUNKY_PIXEL_HFLIP(2); DO_CHUNKY_PIXEL_HFLIP(3);
+            DO_CHUNKY_PIXEL_HFLIP(4); DO_CHUNKY_PIXEL_HFLIP(5); DO_CHUNKY_PIXEL_HFLIP(6); DO_CHUNKY_PIXEL_HFLIP(7);
+          }
         }
       }
       dstz += 8, w -= 8;
@@ -686,6 +740,10 @@ static void PpuDrawBackground_2bpp(Ppu *ppu, uint y, bool sub, uint layer, PpuZb
   }
 #undef NEXT_TP
 #undef READ_BITS
+#undef DO_TOP_CHUNKY_PIXEL_HFLIP
+#undef DO_TOP_CHUNKY_PIXEL
+#undef DO_CHUNKY_PIXEL_HFLIP
+#undef DO_CHUNKY_PIXEL
 #undef DO_PIXEL
 #undef DO_PIXEL_HFLIP
 }
@@ -1014,6 +1072,9 @@ static NOINLINE void PpuDrawWholeLine(Ppu *ppu, uint y) {
       }
 #endif
       uint8 *half_color_map = ppu->halfColor ? ppu->brightnessMultHalf : ppu->brightnessMult;
+      /* The z word already stores [layer:4][CGRAM index:8] in its low 12 bits,
+       * exactly matching the last two dimensions of mathFixed565. */
+      const uint16_t *math_fixed = &ppu->mathFixed565[clip_color_mask != 0][0][0];
       // Store this in locals
       math_enabled_cur |= ppu->addSubscreen << 8 | ppu->subtractColor << 9;
       // Need to check for each pixel whether to use math or not based on the main screen layer.
@@ -1034,7 +1095,7 @@ static NOINLINE void PpuDrawWholeLine(Ppu *ppu, uint y) {
         if (main_layer < 6 &&
             (!(math_enabled_cur & (1 << main_layer)) ||
              !ppu->addSubscreen || (ppu->bgBuffers[1].data[i] & 0xff) == 0)) {
-          dst[0] = ppu->mathFixed565[clip_color_mask != 0][main_layer][main_z & 0xff];
+          dst[0] = math_fixed[main_z & 0xfff];
           continue;
         }
         uint32 color = ppu->cgram[main_z & 0xff], color2;
