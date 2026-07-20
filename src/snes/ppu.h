@@ -253,6 +253,13 @@ uint8_t ppu_read(Ppu* ppu, uint8_t adr);
 void ppu_write(Ppu* ppu, uint8_t adr, uint8_t val);
 void ppu_saveload(Ppu *ppu, SaveLoadFunc *func, void *ctx);
 void PpuBeginDrawing(Ppu *ppu, uint8_t *pixels, size_t pitch, uint32_t render_flags);
+#ifdef SNES_LINE_REUSE_PROBE
+void ppu_lineReuseProbeReport(void);
+#endif
+#ifdef SNES_LINE_CACHE
+void ppu_lineCacheReport(void);
+void ppu_lineCacheInvalidate(void);
+#endif
 
 int PpuGetCurrentRenderScale(Ppu *ppu, uint32_t render_flags);
 

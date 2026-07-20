@@ -258,6 +258,9 @@ void ppu_reset(Ppu* ppu) {
   ppu->countersLatched = false;
   ppu->ppu1openBus = 0;
   ppu->ppu2openBus = 0;
+#ifdef SNES_LINE_CACHE
+  ppu_lineCacheInvalidate();
+#endif
 }
 
 /* ppu_write() stores every screen-enable and window register TWICE: unpacked into
@@ -334,6 +337,11 @@ void ppu_saveload(Ppu *ppu, SaveLoadFunc *func, void *ctx) {
    * recomputes the values it already had — the two copies agree by construction,
    * ppu_write() writes both — so it is a no-op there rather than a special case. */
   ppu_rebuild_packed_registers(ppu);
+#ifdef SNES_LINE_CACHE
+  /* The framebuffer is not part of the savestate stream.  Whether this call
+   * saved or loaded, stop trusting its pixels until every line is redrawn. */
+  ppu_lineCacheInvalidate();
+#endif
 }
 
 void PpuBeginDrawing(Ppu *ppu, uint8_t *pixels, size_t pitch, uint32_t render_flags) {
@@ -367,13 +375,438 @@ _Static_assert(_Alignof(PpuPixelPrioBufs) >= 8,
                "ClearBackdrop writes 64 bits at a time; on ARM that is STRD, which "
                "faults on an unaligned address. Keep the aligned(8) on the struct.");
 
+#if defined(SNES_LINE_REUSE_PROBE) || defined(SNES_LINE_CACHE)
+enum { kLineHistoryLines = 240, kLineHistoryVramPages = 512 };
+#endif
+
 static inline void ClearBackdrop(PpuPixelPrioBufs *buf) {
   for (size_t i = 0; i != arraysize(buf->data); i += 4)
     *(uint64*)&buf->data[i] = 0x0500050005000500;
 }
 
+#ifdef SNES_LINE_REUSE_PROBE
+/* Observation only: predict from inputs, still render, then compare the exact
+ * RGB565 line against the previous frame. None of this state is emulated. */
+typedef struct PpuLineProbeState {
+  BgLayer bgLayer[4];
+  int16_t m7matrix[8];
+  uint32_t windowsel;
+  uint16_t objTileAdr1, objTileAdr2;
+  uint8_t objPriority, objSize, objInterlace, oamAdr;
+  uint8_t mosaicSize, mosaicStartLine, mosaicEnabled;
+  uint8_t window1left, window1right, window2left, window2right;
+  uint8_t clipMode, preventMathMode, addSubscreen, subtractColor, halfColor;
+  uint8_t mathEnabled[6];
+  uint8_t fixedColorR, fixedColorG, fixedColorB;
+  uint8_t forcedBlank, brightness, mode, bg3priority;
+  uint8_t pseudoHires, directColor, m7largeField, m7charFill, m7xFlip, m7yFlip, m7extBg;
+  uint8_t screenEnabled[2], screenWindowed[2];
+  uint8_t extraLeftCur, extraRightCur, extraLeftRight;
+  uint8_t lineHasSprites, evenFrameWhenObjInterlace;
+} PpuLineProbeState;
+
+typedef struct PpuLineProbeStats {
+  uint64_t total, actualSame, predicted, falsePositive, falseNegative;
+} PpuLineProbeStats;
+
+enum { kProbeLines = kLineHistoryLines, kProbeBuckets = 4, kProbeVariants = 9,
+       kProbeVramPages = kLineHistoryVramPages };
+static PpuLineProbeState g_probe_prev_state[kProbeLines];
+static uint32_t g_probe_prev_vram[kProbeLines], g_probe_prev_cgram[kProbeLines], g_probe_prev_oam[kProbeLines];
+static uint8_t g_probe_prev_line[kProbeLines][kPpuXPixels * sizeof(uint16_t)];
+static uint8_t g_probe_valid[kProbeLines];
+static uint8_t g_probe_pending[kProbeVariants];
+static uint32_t g_probe_vram_gen, g_probe_cgram_gen, g_probe_oam_gen;
+static uint32_t g_probe_vram_page_gen[kProbeVramPages], g_probe_oam_entry_gen[128];
+static uint32_t g_probe_cgram_entry_gen[256];
+static uint32_t g_probe_prev_vram_page_gen[kProbeLines][kProbeVramPages];
+static uint32_t g_probe_prev_oam_entry_gen[kProbeLines][128];
+static uint32_t g_probe_prev_cgram_entry_gen[kProbeLines][256];
+static uint32_t g_probe_prev_vram_mask[kProbeLines][16], g_probe_cur_vram_mask[16];
+static uint32_t g_probe_prev_oam_mask[kProbeLines][4];
+static uint32_t g_probe_prev_cgram_mask[kProbeLines][8];
+static uint32_t g_probe_frame;
+static PpuLineProbeStats g_probe_stats[kProbeBuckets + 1][kProbeVariants];
+
+static inline void PpuLineProbeVram(uint32_t adr) {
+  g_probe_cur_vram_mask[(adr >> 11) & 15] |= 1u << ((adr >> 6) & 31);
+}
+
+static inline uint16_t PpuLineProbeVramPtr(Ppu *ppu, const uint16_t *ptr) {
+  PpuLineProbeVram((uint32_t)(ptr - ppu->vram) & 0x7fff);
+  return *ptr;
+}
+
+static void PpuLineProbeCapture(PpuLineProbeState *s, const Ppu *ppu) {
+  memset(s, 0, sizeof(*s));
+  memcpy(s->bgLayer, ppu->bgLayer, sizeof(s->bgLayer));
+  memcpy(s->m7matrix, ppu->m7matrix, sizeof(s->m7matrix));
+  memcpy(s->mathEnabled, ppu->mathEnabled, sizeof(s->mathEnabled));
+  memcpy(s->screenEnabled, ppu->screenEnabled, sizeof(s->screenEnabled));
+  memcpy(s->screenWindowed, ppu->screenWindowed, sizeof(s->screenWindowed));
+  s->windowsel = ppu->windowsel;
+  s->objTileAdr1 = ppu->objTileAdr1; s->objTileAdr2 = ppu->objTileAdr2;
+  s->objPriority = ppu->objPriority; s->objSize = ppu->objSize;
+  s->objInterlace = ppu->objInterlace; s->oamAdr = ppu->oamAdr;
+  s->mosaicSize = ppu->mosaicSize; s->mosaicStartLine = ppu->mosaicStartLine;
+  s->mosaicEnabled = ppu->mosaicEnabled;
+  s->window1left = ppu->window1left; s->window1right = ppu->window1right;
+  s->window2left = ppu->window2left; s->window2right = ppu->window2right;
+  s->clipMode = ppu->clipMode; s->preventMathMode = ppu->preventMathMode;
+  s->addSubscreen = ppu->addSubscreen; s->subtractColor = ppu->subtractColor;
+  s->halfColor = ppu->halfColor;
+  s->fixedColorR = ppu->fixedColorR; s->fixedColorG = ppu->fixedColorG;
+  s->fixedColorB = ppu->fixedColorB;
+  s->forcedBlank = ppu->forcedBlank; s->brightness = ppu->brightness;
+  s->mode = ppu->mode; s->bg3priority = ppu->bg3priority;
+  s->pseudoHires = ppu->pseudoHires; s->directColor = ppu->directColor;
+  s->m7largeField = ppu->m7largeField; s->m7charFill = ppu->m7charFill;
+  s->m7xFlip = ppu->m7xFlip; s->m7yFlip = ppu->m7yFlip; s->m7extBg = ppu->m7extBg;
+  s->extraLeftCur = ppu->extraLeftCur; s->extraRightCur = ppu->extraRightCur;
+  s->extraLeftRight = ppu->extraLeftRight; s->lineHasSprites = ppu->lineHasSprites;
+  s->evenFrameWhenObjInterlace = ppu->objInterlace ? ppu->evenFrame : 0;
+}
+
+static void PpuLineProbeBefore(Ppu *ppu, int line) {
+  PpuLineProbeState cur;
+  PpuLineProbeCapture(&cur, ppu);
+  int y = line - 1;
+  bool regs = g_probe_valid[y] && memcmp(&cur, &g_probe_prev_state[y], sizeof(cur)) == 0;
+  bool vr = g_probe_vram_gen == g_probe_prev_vram[y];
+  bool cg = g_probe_cgram_gen == g_probe_prev_cgram[y];
+  bool oa = g_probe_oam_gen == g_probe_prev_oam[y];
+  bool vr_pages = g_probe_valid[y];
+  for (int page = 0; page < kProbeVramPages && vr_pages; page++)
+    if ((g_probe_prev_vram_mask[y][page >> 5] & (1u << (page & 31))) &&
+        g_probe_vram_page_gen[page] != g_probe_prev_vram_page_gen[y][page])
+      vr_pages = false;
+  const uint32_t *cur_oam_mask = ppu->objLineCand[y];
+  bool oa_line = g_probe_valid[y];
+  for (int s = 0; s < 128 && oa_line; s++)
+    if (((cur_oam_mask[s >> 5] | g_probe_prev_oam_mask[y][s >> 5]) & (1u << (s & 31))) &&
+        g_probe_oam_entry_gen[s] != g_probe_prev_oam_entry_gen[y][s])
+      oa_line = false;
+  bool cg_line = g_probe_valid[y];
+  for (int index = 0; index < 256 && cg_line; index++)
+    if ((g_probe_prev_cgram_mask[y][index >> 5] & (1u << (index & 31))) &&
+        g_probe_cgram_entry_gen[index] != g_probe_prev_cgram_entry_gen[y][index])
+      cg_line = false;
+  g_probe_pending[0] = regs && vr && cg && oa; /* conservative */
+  g_probe_pending[1] = regs && vr && cg;       /* omit OAM */
+  g_probe_pending[2] = regs && cg && oa;       /* omit VRAM */
+  g_probe_pending[3] = regs && vr && oa;       /* omit CGRAM */
+  g_probe_pending[4] = regs;                   /* registers only */
+  g_probe_pending[5] = regs && vr_pages && cg && oa;
+  g_probe_pending[6] = regs && vr_pages && cg && oa_line;
+  g_probe_pending[7] = regs && vr_pages && cg_line && oa_line;
+  g_probe_pending[8] = regs && vr_pages && cg_line && (!ppu->lineHasSprites || oa_line);
+  g_probe_prev_state[y] = cur;
+  g_probe_prev_vram[y] = g_probe_vram_gen;
+  g_probe_prev_cgram[y] = g_probe_cgram_gen;
+  g_probe_prev_oam[y] = g_probe_oam_gen;
+  memcpy(g_probe_prev_vram_page_gen[y], g_probe_vram_page_gen, sizeof(g_probe_vram_page_gen));
+  memcpy(g_probe_prev_oam_entry_gen[y], g_probe_oam_entry_gen, sizeof(g_probe_oam_entry_gen));
+  memcpy(g_probe_prev_cgram_entry_gen[y], g_probe_cgram_entry_gen, sizeof(g_probe_cgram_entry_gen));
+  memcpy(g_probe_prev_oam_mask[y], cur_oam_mask, sizeof(g_probe_prev_oam_mask[y]));
+}
+
+static void PpuLineProbeAfter(Ppu *ppu, int line) {
+  int y = line - 1;
+  const uint8_t *cur = ppu->renderBuffer + y * ppu->renderPitch;
+  bool same = g_probe_valid[y] && memcmp(cur, g_probe_prev_line[y], sizeof(g_probe_prev_line[y])) == 0;
+  if (g_probe_valid[y]) {
+    uint32_t bucket = (g_probe_frame - 1) / 300;
+    if (bucket >= kProbeBuckets) bucket = kProbeBuckets - 1;
+    for (int v = 0; v < kProbeVariants; v++) {
+      PpuLineProbeStats *all = &g_probe_stats[kProbeBuckets][v];
+      PpuLineProbeStats *part = &g_probe_stats[bucket][v];
+#define ADD_STAT(field, value) do { all->field += (value); part->field += (value); } while (0)
+      ADD_STAT(total, 1);
+      ADD_STAT(actualSame, same);
+      ADD_STAT(predicted, g_probe_pending[v]);
+      ADD_STAT(falsePositive, g_probe_pending[v] && !same);
+      ADD_STAT(falseNegative, !g_probe_pending[v] && same);
+#undef ADD_STAT
+    }
+  }
+  memcpy(g_probe_prev_line[y], cur, sizeof(g_probe_prev_line[y]));
+  memset(g_probe_prev_cgram_mask[y], 0, sizeof(g_probe_prev_cgram_mask[y]));
+  uint32_t math_enabled = 0;
+  for (int layer = 0; layer < 6; layer++) math_enabled |= ppu->mathEnabled[layer] << layer;
+  bool uses_subscreen = ppu->preventMathMode != 3 && ppu->addSubscreen &&
+      math_enabled && ppu->screenEnabled[1] != 0;
+  for (int x = 0; x < kPpuXPixels; x++) {
+    uint8_t main_index = ppu->bgBuffers[0].data[x] & 0xff;
+    g_probe_prev_cgram_mask[y][main_index >> 5] |= 1u << (main_index & 31);
+    if (uses_subscreen) {
+      uint8_t sub_index = ppu->bgBuffers[1].data[x] & 0xff;
+      g_probe_prev_cgram_mask[y][sub_index >> 5] |= 1u << (sub_index & 31);
+    }
+  }
+  memcpy(g_probe_prev_vram_mask[y], g_probe_cur_vram_mask, sizeof(g_probe_cur_vram_mask));
+  g_probe_valid[y] = 1;
+}
+
+void ppu_lineReuseProbeReport(void) {
+  static const char *const names[kProbeVariants] = {
+    "full", "no_oam", "no_vram", "no_cgram", "regs", "vram_pages", "vram_pages_oam_line",
+    "pages_oam_cgram_line", "pages_cgram_no_sprite"
+  };
+  for (int b = 0; b <= kProbeBuckets; b++) {
+    for (int v = 0; v < kProbeVariants; v++) {
+      const PpuLineProbeStats *s = &g_probe_stats[b][v];
+      printf("[line-reuse] bucket=%s variant=%s total=%llu actual=%llu predicted=%llu fp=%llu fn=%llu pred_x10000=%llu fn_x10000=%llu\n",
+          b == kProbeBuckets ? "all" : (b == 0 ? "0-299" : b == 1 ? "300-599" : b == 2 ? "600-899" : "900-1199"), names[v],
+          (unsigned long long)s->total, (unsigned long long)s->actualSame,
+          (unsigned long long)s->predicted, (unsigned long long)s->falsePositive,
+          (unsigned long long)s->falseNegative,
+          (unsigned long long)(s->total ? s->predicted * 10000 / s->total : 0),
+          (unsigned long long)(s->actualSame ? s->falseNegative * 10000 / s->actualSame : 0));
+    }
+  }
+}
+#endif
+
+#ifdef SNES_LINE_CACHE
+typedef struct PpuLineCacheState {
+  BgLayer bgLayer[4];
+  int16_t m7matrix[8];
+  uint32_t windowsel;
+  uint16_t objTileAdr1, objTileAdr2;
+  uint8_t objPriority, objSize, objInterlace, oamAdr;
+  uint8_t mosaicSize, mosaicStartLine, mosaicEnabled;
+  uint8_t window1left, window1right, window2left, window2right;
+  uint8_t clipMode, preventMathMode, addSubscreen, subtractColor, halfColor;
+  uint8_t mathEnabled[6];
+  uint8_t fixedColorR, fixedColorG, fixedColorB;
+  uint8_t forcedBlank, brightness, mode, bg3priority;
+  uint8_t pseudoHires, directColor, m7largeField, m7charFill, m7xFlip, m7yFlip, m7extBg;
+  uint8_t screenEnabled[2], screenWindowed[2];
+  uint8_t extraLeftCur, extraRightCur, extraLeftRight;
+  uint8_t lineHasSprites, evenFrameWhenObjInterlace;
+} PpuLineCacheState;
+
+enum { kLineCacheBuckets = 4, kLineCacheVramShift = 8,
+       kLineCacheVramPages = 0x8000 >> kLineCacheVramShift,
+       kLineCacheVramWords = kLineCacheVramPages / 32 };
+typedef struct PpuLineCacheStats {
+  uint32_t total, hits;
+} PpuLineCacheStats;
+
+static PpuLineCacheState g_line_cache_state[kLineHistoryLines], g_line_cache_current;
+static uint32_t g_line_cache_vram_dep[kLineHistoryLines][kLineCacheVramWords], g_line_cache_cgram_dep[kLineHistoryLines][8];
+static uint32_t g_line_cache_oam_dep[kLineHistoryLines][4], g_line_cache_cur_vram[kLineCacheVramWords];
+static uint32_t g_line_cache_vram_last[kLineCacheVramPages], g_line_cache_cgram_last[256];
+static uint32_t g_line_cache_oam_last[128];
+static uint32_t g_line_cache_vram_serial, g_line_cache_cgram_serial, g_line_cache_oam_serial;
+static uint32_t g_line_cache_vram_at[kLineHistoryLines], g_line_cache_cgram_at[kLineHistoryLines];
+static uint32_t g_line_cache_oam_at[kLineHistoryLines], g_line_cache_frame;
+static uint8_t g_line_cache_valid[kLineHistoryLines];
+static uint8_t g_line_cache_cooldown[kLineHistoryLines];
+static bool g_line_cache_tracking;
+static PpuLineCacheStats g_line_cache_stats[kLineCacheBuckets + 1];
+
+static inline bool PpuLineCacheBeginLine(int y) {
+  if (g_line_cache_cooldown[y]) {
+    g_line_cache_cooldown[y]--;
+    return false;
+  }
+  return true;
+}
+
+static inline void PpuLineCacheMiss(int y) {
+  /* Relearn periodically: one render captures a new dependency set, the next
+   * frame tests it.  Persistently moving lines then pay this cost only 1/18 as
+   * often, while a line that becomes static immediately resumes hitting. */
+  g_line_cache_cooldown[y] = 16;
+  g_line_cache_valid[y] = 0;
+}
+
+static void PpuLineCacheCapture(PpuLineCacheState *s, const Ppu *ppu) {
+  memset(s, 0, sizeof(*s));
+  memcpy(s->bgLayer, ppu->bgLayer, sizeof(s->bgLayer));
+  memcpy(s->m7matrix, ppu->m7matrix, sizeof(s->m7matrix));
+  memcpy(s->mathEnabled, ppu->mathEnabled, sizeof(s->mathEnabled));
+  memcpy(s->screenEnabled, ppu->screenEnabled, sizeof(s->screenEnabled));
+  memcpy(s->screenWindowed, ppu->screenWindowed, sizeof(s->screenWindowed));
+  s->windowsel = ppu->windowsel;
+  s->objTileAdr1 = ppu->objTileAdr1; s->objTileAdr2 = ppu->objTileAdr2;
+  s->objPriority = ppu->objPriority; s->objSize = ppu->objSize;
+  s->objInterlace = ppu->objInterlace; s->oamAdr = ppu->oamAdr;
+  s->mosaicSize = ppu->mosaicSize; s->mosaicStartLine = ppu->mosaicStartLine;
+  s->mosaicEnabled = ppu->mosaicEnabled;
+  s->window1left = ppu->window1left; s->window1right = ppu->window1right;
+  s->window2left = ppu->window2left; s->window2right = ppu->window2right;
+  s->clipMode = ppu->clipMode; s->preventMathMode = ppu->preventMathMode;
+  s->addSubscreen = ppu->addSubscreen; s->subtractColor = ppu->subtractColor;
+  s->halfColor = ppu->halfColor;
+  s->fixedColorR = ppu->fixedColorR; s->fixedColorG = ppu->fixedColorG;
+  s->fixedColorB = ppu->fixedColorB;
+  s->forcedBlank = ppu->forcedBlank; s->brightness = ppu->brightness;
+  s->mode = ppu->mode; s->bg3priority = ppu->bg3priority;
+  s->pseudoHires = ppu->pseudoHires; s->directColor = ppu->directColor;
+  s->m7largeField = ppu->m7largeField; s->m7charFill = ppu->m7charFill;
+  s->m7xFlip = ppu->m7xFlip; s->m7yFlip = ppu->m7yFlip; s->m7extBg = ppu->m7extBg;
+  s->extraLeftCur = ppu->extraLeftCur; s->extraRightCur = ppu->extraRightCur;
+  s->extraLeftRight = ppu->extraLeftRight; s->lineHasSprites = ppu->lineHasSprites;
+  s->evenFrameWhenObjInterlace = ppu->objInterlace ? ppu->evenFrame : 0;
+}
+
+static inline void PpuLineCacheBump(uint32_t *serial, uint32_t *last) {
+  uint32_t next = *serial + 1;
+  if (next == 0) {
+    memset(g_line_cache_valid, 0, sizeof(g_line_cache_valid));
+    memset(g_line_cache_vram_last, 0, sizeof(g_line_cache_vram_last));
+    memset(g_line_cache_cgram_last, 0, sizeof(g_line_cache_cgram_last));
+    memset(g_line_cache_oam_last, 0, sizeof(g_line_cache_oam_last));
+    next = 1;
+  }
+  *serial = *last = next;
+}
+
+static inline void PpuLineCacheVram(uint32_t adr) {
+  if (g_line_cache_tracking)
+    g_line_cache_cur_vram[(adr >> (kLineCacheVramShift + 5)) & (kLineCacheVramWords - 1)] |=
+        1u << ((adr >> kLineCacheVramShift) & 31);
+}
+
+static bool PpuLineCacheChanged(const uint32_t *dep, int words,
+                                const uint32_t *last, uint32_t at) {
+  for (int w = 0; w < words; w++) {
+    uint32_t bits = dep[w];
+    while (bits) {
+      int bit = __builtin_ctz(bits);
+      if (last[w * 32 + bit] > at) return true;
+      bits &= bits - 1;
+    }
+  }
+  return false;
+}
+
+static bool PpuLineCacheCanReuse(Ppu *ppu, int line, bool eligible) {
+  int y = line - 1;
+  uint32_t bucket = (g_line_cache_frame - 1) / 300;
+  if (bucket >= kLineCacheBuckets) bucket = kLineCacheBuckets - 1;
+  g_line_cache_stats[bucket].total++;
+  g_line_cache_stats[kLineCacheBuckets].total++;
+  if (!eligible)
+    return false;
+  PpuLineCacheCapture(&g_line_cache_current, ppu);
+  if (!g_line_cache_valid[y])
+    return false;
+  if (ppu->renderPitch == 0
+#ifdef TARGET_GNW
+      || g_ppu_line_cb != NULL
+#endif
+      ||
+      memcmp(&g_line_cache_current, &g_line_cache_state[y], sizeof(g_line_cache_current)) != 0) {
+    PpuLineCacheMiss(y);
+    return false;
+  }
+  if (PpuLineCacheChanged(g_line_cache_vram_dep[y], kLineCacheVramWords,
+                          g_line_cache_vram_last,
+                          g_line_cache_vram_at[y])) {
+    PpuLineCacheMiss(y);
+    return false;
+  }
+  if (PpuLineCacheChanged(g_line_cache_cgram_dep[y], 8, g_line_cache_cgram_last,
+                          g_line_cache_cgram_at[y])) {
+    PpuLineCacheMiss(y);
+    return false;
+  }
+  uint32_t oam_union[4];
+  for (int w = 0; w < 4; w++) oam_union[w] = g_line_cache_oam_dep[y][w] | ppu->objLineCand[y][w];
+  if (PpuLineCacheChanged(oam_union, 4, g_line_cache_oam_last,
+                          g_line_cache_oam_at[y])) {
+    PpuLineCacheMiss(y);
+    return false;
+  }
+  g_line_cache_stats[bucket].hits++;
+  g_line_cache_stats[kLineCacheBuckets].hits++;
+  return true;
+}
+
+static void PpuLineCacheCommit(Ppu *ppu, int line) {
+  int y = line - 1;
+  g_line_cache_state[y] = g_line_cache_current;
+  memcpy(g_line_cache_vram_dep[y], g_line_cache_cur_vram, sizeof(g_line_cache_cur_vram));
+  memcpy(g_line_cache_oam_dep[y], ppu->objLineCand[y], sizeof(g_line_cache_oam_dep[y]));
+  memset(g_line_cache_cgram_dep[y], 0, sizeof(g_line_cache_cgram_dep[y]));
+  uint32_t math_enabled = 0;
+  for (int layer = 0; layer < 6; layer++) math_enabled |= ppu->mathEnabled[layer] << layer;
+  bool uses_subscreen = ppu->preventMathMode != 3 && ppu->addSubscreen &&
+      math_enabled && ppu->screenEnabled[1] != 0;
+  for (int x = 0; x < kPpuXPixels; x++) {
+    uint8_t index = ppu->bgBuffers[0].data[x] & 0xff;
+    g_line_cache_cgram_dep[y][index >> 5] |= 1u << (index & 31);
+    if (uses_subscreen) {
+      index = ppu->bgBuffers[1].data[x] & 0xff;
+      g_line_cache_cgram_dep[y][index >> 5] |= 1u << (index & 31);
+    }
+  }
+  g_line_cache_vram_at[y] = g_line_cache_vram_serial;
+  g_line_cache_cgram_at[y] = g_line_cache_cgram_serial;
+  g_line_cache_oam_at[y] = g_line_cache_oam_serial;
+  g_line_cache_valid[y] = 1;
+}
+
+void ppu_lineCacheReport(void) {
+  static const char *const names[kLineCacheBuckets + 1] = {
+    "0-299", "300-599", "600-899", "900-1199", "all"
+  };
+  for (int b = 0; b <= kLineCacheBuckets; b++) {
+    const PpuLineCacheStats *s = &g_line_cache_stats[b];
+    printf("[line-cache] bucket=%s total=%llu hits=%llu hit_x10000=%llu metadata=%u\n",
+      names[b], (unsigned long long)s->total, (unsigned long long)s->hits,
+      (unsigned long long)(s->total ? (uint64_t)s->hits * 10000 / s->total : 0),
+      (unsigned)(sizeof(g_line_cache_state) + sizeof(g_line_cache_current) +
+                 sizeof(g_line_cache_vram_dep) +
+                 sizeof(g_line_cache_cgram_dep) + sizeof(g_line_cache_oam_dep) +
+                 sizeof(g_line_cache_cur_vram) +
+                 sizeof(g_line_cache_vram_last) + sizeof(g_line_cache_cgram_last) +
+                 sizeof(g_line_cache_oam_last) + sizeof(g_line_cache_vram_at) +
+                 sizeof(g_line_cache_cgram_at) + sizeof(g_line_cache_oam_at) +
+                 sizeof(g_line_cache_valid) + sizeof(g_line_cache_cooldown) +
+                 sizeof(g_line_cache_vram_serial) + sizeof(g_line_cache_cgram_serial) +
+                 sizeof(g_line_cache_oam_serial) + sizeof(g_line_cache_frame) +
+                 sizeof(g_line_cache_tracking) + sizeof(g_line_cache_stats)));
+  }
+}
+
+void ppu_lineCacheInvalidate(void) {
+  memset(g_line_cache_valid, 0, sizeof(g_line_cache_valid));
+  memset(g_line_cache_cooldown, 0, sizeof(g_line_cache_cooldown));
+}
+#endif
+
+#if defined(SNES_LINE_REUSE_PROBE) || defined(SNES_LINE_CACHE)
+static inline void PpuTrackVramAdr(uint32_t adr) {
+#ifdef SNES_LINE_REUSE_PROBE
+  PpuLineProbeVram(adr);
+#endif
+#ifdef SNES_LINE_CACHE
+  PpuLineCacheVram(adr);
+#endif
+}
+static inline uint16_t PpuTrackVramPtr(Ppu *ppu, const uint16_t *ptr) {
+  PpuTrackVramAdr((uint32_t)(ptr - ppu->vram) & 0x7fff);
+  return *ptr;
+}
+#define PPU_PROBE_VRAM_ADR(adr) PpuTrackVramAdr((adr) & 0x7fff)
+#define PPU_PROBE_VRAM_PTR(ppu, ptr) PpuTrackVramPtr((ppu), (ptr))
+#else
+#define PPU_PROBE_VRAM_ADR(adr) ((void)0)
+#define PPU_PROBE_VRAM_PTR(ppu, ptr) (*(ptr))
+#endif
+
 void ppu_runLine(Ppu* ppu, int line) {
   if(line == 0) {
+#ifdef SNES_LINE_REUSE_PROBE
+    g_probe_frame++;
+#endif
+#ifdef SNES_LINE_CACHE
+    g_line_cache_frame++;
+#endif
     // pre-render line
     // TODO: this now happens halfway into the first line
     ppu->mosaicStartLine = 1;
@@ -397,6 +830,15 @@ void ppu_runLine(Ppu* ppu, int line) {
 
     // evaluate sprites. The buffer only needs wiping if the previous line put
     // something in it — most lines of most frames have no sprites at all.
+#ifdef SNES_LINE_REUSE_PROBE
+    memset(g_probe_cur_vram_mask, 0, sizeof(g_probe_cur_vram_mask));
+#endif
+#ifdef SNES_LINE_CACHE
+    bool cache_eligible = PpuLineCacheBeginLine(line - 1);
+    g_line_cache_tracking = cache_eligible;
+    if (cache_eligible)
+      memset(g_line_cache_cur_vram, 0, sizeof(g_line_cache_cur_vram));
+#endif
     if (!ppu->objBufferClean)
       ClearBackdrop(&ppu->objBuffer);
     ppu->lineHasSprites = !ppu->forcedBlank && ppu_evaluateSprites(ppu, line - 1);
@@ -406,7 +848,23 @@ void ppu_runLine(Ppu* ppu, int line) {
       return;   /* frameskip: the flags above still matter, the pixels below do not */
 
     if (g_new_ppu) {
-      PpuDrawWholeLine(ppu, line);
+#ifdef SNES_LINE_CACHE
+      bool reused = PpuLineCacheCanReuse(ppu, line, cache_eligible);
+      if (!reused) {
+#endif
+#ifdef SNES_LINE_REUSE_PROBE
+        PpuLineProbeBefore(ppu, line);
+#endif
+        PpuDrawWholeLine(ppu, line);
+#ifdef SNES_LINE_REUSE_PROBE
+        PpuLineProbeAfter(ppu, line);
+#endif
+#ifdef SNES_LINE_CACHE
+        if (cache_eligible && !g_line_cache_cooldown[line - 1])
+          PpuLineCacheCommit(ppu, line);
+      }
+      g_line_cache_tracking = false;
+#endif
     } else {
       // actual line
       if (ppu->mode == 7) ppu_calculateMode7Starts(ppu, line);
@@ -525,7 +983,7 @@ static void PpuDrawBackground_4bpp(Ppu *ppu, uint y, bool sub, uint layer, PpuZb
 #define DO_CHUNKY_PIXEL_HFLIP(i) do { \
   pixel = (chunky >> (4 * (7 - i))) & 0xf; \
   if (pixel && z > dstz[i]) dstz[i] = z + pixel; } while (0)
-#define READ_BITS(ta, tile) (addr = &ppu->vram[((ta) + (tile) * 16) & 0x7fff], addr[0] | addr[8] << 16)
+#define READ_BITS(ta, tile) (PPU_PROBE_VRAM_ADR((ta) + (tile) * 16), addr = &ppu->vram[((ta) + (tile) * 16) & 0x7fff], addr[0] | addr[8] << 16)
   enum { kPaletteShift = 6 };
   if (!IS_SCREEN_ENABLED(ppu, sub, layer))
     return;  // layer is completely hidden
@@ -557,7 +1015,7 @@ static void PpuDrawBackground_4bpp(Ppu *ppu, uint y, bool sub, uint layer, PpuZb
     if (x & 7) {
       int curw = IntMin(8 - (x & 7), w);
       w -= curw;
-      uint32 tile = *tp;
+      uint32 tile = PPU_PROBE_VRAM_PTR(ppu, tp);
       NEXT_TP();
       int ta = (tile & 0x8000) ? tileadr1 : tileadr0;
       PpuZbufType z = (tile & 0x2000) ? zhi : zlo;
@@ -577,7 +1035,7 @@ static void PpuDrawBackground_4bpp(Ppu *ppu, uint y, bool sub, uint layer, PpuZb
     }
     // Handle full tiles in the middle
     while (w >= 8) {
-      uint32 tile = *tp;
+      uint32 tile = PPU_PROBE_VRAM_PTR(ppu, tp);
       NEXT_TP();
       int ta = (tile & 0x8000) ? tileadr1 : tileadr0;
       PpuZbufType z = (tile & 0x2000) ? zhi : zlo;
@@ -597,7 +1055,7 @@ static void PpuDrawBackground_4bpp(Ppu *ppu, uint y, bool sub, uint layer, PpuZb
     }
     // Handle remaining clipped part
     if (w) {
-      uint32 tile = *tp;
+      uint32 tile = PPU_PROBE_VRAM_PTR(ppu, tp);
       int ta = (tile & 0x8000) ? tileadr1 : tileadr0;
       PpuZbufType z = (tile & 0x2000) ? zhi : zlo;
       uint32 bits = READ_BITS(ta, tile & 0x3ff);
@@ -638,7 +1096,7 @@ static void PpuDrawBackground_2bpp(Ppu *ppu, uint y, bool sub, uint layer, PpuZb
 #define DO_TOP_CHUNKY_PIXEL_HFLIP(i) do { \
   pixel = (chunky >> (4 * (7 - i))) & 3; \
   if (pixel) dstz[i] = z + pixel; } while (0)
-#define READ_BITS(ta, tile) (addr = &ppu->vram[(ta) + (tile) * 8 & 0x7fff], addr[0])
+#define READ_BITS(ta, tile) (PPU_PROBE_VRAM_ADR((ta) + (tile) * 8), addr = &ppu->vram[(ta) + (tile) * 8 & 0x7fff], addr[0])
   enum { kPaletteShift = 8 };
   if (!IS_SCREEN_ENABLED(ppu, sub, layer))
     return;  // layer is completely hidden
@@ -672,7 +1130,7 @@ static void PpuDrawBackground_2bpp(Ppu *ppu, uint y, bool sub, uint layer, PpuZb
     if (x & 7) {
       int curw = IntMin(8 - (x & 7), w);
       w -= curw;
-      uint32 tile = *tp;
+      uint32 tile = PPU_PROBE_VRAM_PTR(ppu, tp);
       NEXT_TP();
       int ta = (tile & 0x8000) ? tileadr1 : tileadr0;
       PpuZbufType z = (tile & 0x2000) ? zhi : zlo;
@@ -692,7 +1150,7 @@ static void PpuDrawBackground_2bpp(Ppu *ppu, uint y, bool sub, uint layer, PpuZb
     }
     // Handle full tiles in the middle
     while (w >= 8) {
-      uint32 tile = *tp;
+      uint32 tile = PPU_PROBE_VRAM_PTR(ppu, tp);
       NEXT_TP();
       int ta = (tile & 0x8000) ? tileadr1 : tileadr0;
       PpuZbufType z = (tile & 0x2000) ? zhi : zlo;
@@ -724,7 +1182,7 @@ static void PpuDrawBackground_2bpp(Ppu *ppu, uint y, bool sub, uint layer, PpuZb
     }
     // Handle remaining clipped part
     if (w) {
-      uint32 tile = *tp;
+      uint32 tile = PPU_PROBE_VRAM_PTR(ppu, tp);
       int ta = (tile & 0x8000) ? tileadr1 : tileadr0;
       PpuZbufType z = (tile & 0x2000) ? zhi : zlo;
       uint32 bits = READ_BITS(ta, tile & 0x3ff);
@@ -795,9 +1253,10 @@ static void PpuDrawBackground_mode7(Ppu *ppu, uint y, bool sub, PpuZbufType z) {
             continue;
           tile = 0;
         } else {
-          tile = ppu->vram[(ypos >> 11 & 0x7f) * 128 + (xpos >> 11 & 0x7f)] & 0xff;
+          uint32_t map_adr = (ypos >> 11 & 0x7f) * 128 + (xpos >> 11 & 0x7f);
+          tile = PPU_PROBE_VRAM_PTR(ppu, &ppu->vram[map_adr]) & 0xff;
         }
-        uint8 pixel = ppu->vram[tile * 64 + (ypos >> 8 & 7) * 8 + (xpos >> 8 & 7)] >> 8;
+        uint8 pixel = PPU_PROBE_VRAM_PTR(ppu, &ppu->vram[tile * 64 + (ypos >> 8 & 7) * 8 + (xpos >> 8 & 7)]) >> 8;
         if (pixel) {
           int i = 0;
           do dstz[i] = pixel + z; while (++i != w);
@@ -810,9 +1269,10 @@ static void PpuDrawBackground_mode7(Ppu *ppu, uint y, bool sub, PpuZbufType z) {
             continue;
           tile = 0;
         } else {
-          tile = ppu->vram[(ypos >> 11 & 0x7f) * 128 + (xpos >> 11 & 0x7f)] & 0xff;
+          uint32_t map_adr = (ypos >> 11 & 0x7f) * 128 + (xpos >> 11 & 0x7f);
+          tile = PPU_PROBE_VRAM_PTR(ppu, &ppu->vram[map_adr]) & 0xff;
         }
-        uint8 pixel = ppu->vram[tile * 64 + (ypos >> 8 & 7) * 8 + (xpos >> 8 & 7)] >> 8;
+        uint8 pixel = PPU_PROBE_VRAM_PTR(ppu, &ppu->vram[tile * 64 + (ypos >> 8 & 7) * 8 + (xpos >> 8 & 7)]) >> 8;
         if (pixel)
           dstz[0] = pixel + z;
       } while (xpos += dx, ypos += dy, ++dstz != dstz_end);
@@ -1507,8 +1967,7 @@ static bool ppu_evaluateSprites(Ppu* ppu, int line) {
         // check if the sprite is on this line and get the sprite size
         uint8_t row = line - y;
         int spriteSize = spriteSizes[ppu->objSize][(ppu->highOam[index >> 3] >> ((index & 7) + 1)) & 1];
-        int spriteHeight = ppu->objInterlace ? spriteSize / 2 : spriteSize;
-        if(row < spriteHeight) {
+        {
           // in y-range, get the x location, using the high bit as well
           int x = ppu->oam[index] & 0xff;
           x |= ((ppu->highOam[index >> 3] >> (index & 7)) & 1) << 8;
@@ -1544,19 +2003,28 @@ static bool ppu_evaluateSprites(Ppu* ppu, int line) {
                 int usedCol = oam1 & 0x4000 ? spriteSize - 1 - col : col;
                 int usedTile = ((((oam1 & 0xff) >> 4) + (row >> 3)) << 4) | (((oam1 & 0xf) + (usedCol >> 3)) & 0xf);
                 uint16 *addr = &ppu->vram[(objAdr + usedTile * 16 + (row & 0x7)) & 0x7fff];
+                PPU_PROBE_VRAM_ADR(objAdr + usedTile * 16 + (row & 0x7));
                 uint32 plane = addr[0] | addr[8] << 16;
+                uint32 chunky = PpuDecode4bpp(plane);
                 // go over each pixel
                 int px_left = IntMax(-(col + x + kPpuExtraLeftRight), 0);
                 int px_right = IntMin(256 + kPpuExtraLeftRight - (col + x), 8);
                 PpuZbufType *dst = ppu->objBuffer.data + col + x + px_left + kPpuExtraLeftRight;
 
-                for (int px = px_left; px < px_right; px++, dst++) {
-                  int shift = oam1 & 0x4000 ? px : 7 - px;
-                  uint32 bits2 = plane >> shift;
-                  int pixel = (bits2 >> 0) & 1 | (bits2 >> 7) & 2 | (bits2 >> 14) & 4 | (bits2 >> 21) & 8;
-                  // draw it in the buffer if there is a pixel here, and the buffer there is still empty
-                  if (pixel != 0 && (dst[0] & 0xff) == 0)
-                    dst[0] = z + pixel;
+                if (oam1 & 0x4000) {
+                  chunky >>= px_left * 4;
+                  for (int px = px_left; px < px_right; px++, dst++, chunky >>= 4) {
+                    int pixel = chunky & 0xf;
+                    if (pixel != 0 && (dst[0] & 0xff) == 0)
+                      dst[0] = z + pixel;
+                  }
+                } else {
+                  chunky <<= px_left * 4;
+                  for (int px = px_left; px < px_right; px++, dst++, chunky <<= 4) {
+                    int pixel = chunky >> 28;
+                    if (pixel != 0 && (dst[0] & 0xff) == 0)
+                      dst[0] = z + pixel;
+                  }
                 }
 
               }
@@ -1735,7 +2203,24 @@ void ppu_write(Ppu* ppu, uint8_t adr, uint8_t val) {
     }
     case 0x04: {
       if(ppu->oamInHigh) {
-        ppu->highOam[((ppu->oamAdr & 0xf) << 1) | ppu->oamSecondWrite] = val;
+        uint32_t high_index = ((ppu->oamAdr & 0xf) << 1) | ppu->oamSecondWrite;
+        uint8_t *dst = &ppu->highOam[high_index];
+#ifdef SNES_LINE_REUSE_PROBE
+        if (*dst != val) {
+          g_probe_oam_gen++;
+          for (int s = high_index * 4; s < high_index * 4 + 4; s++)
+            g_probe_oam_entry_gen[s]++;
+        }
+#endif
+#ifdef SNES_LINE_CACHE
+        if (*dst != val) {
+          int first = high_index * 4;
+          PpuLineCacheBump(&g_line_cache_oam_serial, &g_line_cache_oam_last[first]);
+          for (int s = first + 1; s < first + 4; s++)
+            g_line_cache_oam_last[s] = g_line_cache_oam_serial;
+        }
+#endif
+        *dst = val;
         ppu->objCacheValid = 0;   /* size / x-high bits moved */
         if(ppu->oamSecondWrite) {
           ppu->oamAdr++;
@@ -1745,7 +2230,19 @@ void ppu_write(Ppu* ppu, uint8_t adr, uint8_t val) {
         if(!ppu->oamSecondWrite) {
           ppu->oamBuffer = val;
         } else {
-          ppu->oam[ppu->oamAdr++] = (val << 8) | ppu->oamBuffer;
+          uint16_t value = (val << 8) | ppu->oamBuffer;
+#ifdef SNES_LINE_REUSE_PROBE
+          if (ppu->oam[ppu->oamAdr] != value) {
+            g_probe_oam_gen++;
+            g_probe_oam_entry_gen[ppu->oamAdr >> 1]++;
+          }
+#endif
+#ifdef SNES_LINE_CACHE
+          if (ppu->oam[ppu->oamAdr] != value)
+            PpuLineCacheBump(&g_line_cache_oam_serial,
+                             &g_line_cache_oam_last[ppu->oamAdr >> 1]);
+#endif
+          ppu->oam[ppu->oamAdr++] = value;
           ppu->objCacheValid = 0;   /* a sprite may have moved vertically */
           if(ppu->oamAdr == 0) ppu->oamInHigh = true;
         }
@@ -1841,13 +2338,39 @@ void ppu_write(Ppu* ppu, uint8_t adr, uint8_t val) {
     case 0x18: {
       // TODO: vram access during rendering (also cgram and oam)
       uint16_t vramAdr = ppu_getVramRemap(ppu);
-      ppu->vram[vramAdr & 0x7fff] = (ppu->vram[vramAdr & 0x7fff] & 0xff00) | val;
+      uint16_t *dst = &ppu->vram[vramAdr & 0x7fff];
+      uint16_t value = (*dst & 0xff00) | val;
+#ifdef SNES_LINE_REUSE_PROBE
+      if (*dst != value) {
+        g_probe_vram_gen++;
+        g_probe_vram_page_gen[(vramAdr & 0x7fff) >> 6]++;
+      }
+#endif
+#ifdef SNES_LINE_CACHE
+      if (*dst != value)
+        PpuLineCacheBump(&g_line_cache_vram_serial,
+                         &g_line_cache_vram_last[(vramAdr & 0x7fff) >> kLineCacheVramShift]);
+#endif
+      *dst = value;
       if(!ppu->vramIncrementOnHigh) ppu->vramPointer += ppu->vramIncrement;
       break;
     }
     case 0x19: {
       uint16_t vramAdr = ppu_getVramRemap(ppu);
-      ppu->vram[vramAdr & 0x7fff] = (ppu->vram[vramAdr & 0x7fff] & 0x00ff) | (val << 8);
+      uint16_t *dst = &ppu->vram[vramAdr & 0x7fff];
+      uint16_t value = (*dst & 0x00ff) | (val << 8);
+#ifdef SNES_LINE_REUSE_PROBE
+      if (*dst != value) {
+        g_probe_vram_gen++;
+        g_probe_vram_page_gen[(vramAdr & 0x7fff) >> 6]++;
+      }
+#endif
+#ifdef SNES_LINE_CACHE
+      if (*dst != value)
+        PpuLineCacheBump(&g_line_cache_vram_serial,
+                         &g_line_cache_vram_last[(vramAdr & 0x7fff) >> kLineCacheVramShift]);
+#endif
+      *dst = value;
       if(ppu->vramIncrementOnHigh) ppu->vramPointer += ppu->vramIncrement;
       break;
     }
@@ -1881,7 +2404,19 @@ void ppu_write(Ppu* ppu, uint8_t adr, uint8_t val) {
       if(!ppu->cgramSecondWrite) {
         ppu->cgramBuffer = val;
       } else {
-        ppu->cgram[ppu->cgramPointer++] = (val << 8) | ppu->cgramBuffer;
+        uint16_t value = (val << 8) | ppu->cgramBuffer;
+#ifdef SNES_LINE_REUSE_PROBE
+        if (ppu->cgram[ppu->cgramPointer] != value) {
+          g_probe_cgram_gen++;
+          g_probe_cgram_entry_gen[ppu->cgramPointer]++;
+        }
+#endif
+#ifdef SNES_LINE_CACHE
+        if (ppu->cgram[ppu->cgramPointer] != value)
+          PpuLineCacheBump(&g_line_cache_cgram_serial,
+                           &g_line_cache_cgram_last[ppu->cgramPointer]);
+#endif
+        ppu->cgram[ppu->cgramPointer++] = value;
 #ifdef PPU_RGB565
         ppu->paletteDirty = true;
 #endif
