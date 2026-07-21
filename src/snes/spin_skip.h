@@ -76,11 +76,15 @@ typedef struct {
 
 extern SpinSkip g_spin;
 
-/* ROM whitelist: set by main_snes.c at ROM load from a pre-analyzed title-hash
- * table.  When false (default), spin_reset() parks the learner — the per-access
- * hook overhead hurts low-spin carts more than the replay saves (Zelda: +16%
- * rig insn).  Only ROMs with measured gameplay skip% above the ~50% breakeven
- * (SMW: 57%) are whitelisted. */
+/* ROM gate: set by main_snes.c at ROM load. Default true (0721 whitelist-gap
+ * fix) -- an unregistered ROM is handed to spin_frame_tick()'s auto-gate,
+ * which observes 600 frames and parks itself for 1800 (cheap) if the ROM
+ * isn't actually spin-heavy, retrying later; this is address-agnostic and
+ * doesn't need a per-ROM entry to work. The title-hash table in
+ * spin_skip.c is now only for forcing a known-bad case OFF outright (a ROM
+ * whose measured skip% falls below the ~50% breakeven, so even the auto-gate's
+ * brief probe overhead isn't worth paying -- Zelda: 25% skip%, +16% rig insn
+ * if left on). */
 extern bool g_spin_whitelist;
 
 /* cpu.c hooks. Deliberately tiny outside VERIFY: one predictable branch. */

@@ -8,7 +8,10 @@
 #include "cpu.h"
 
 SpinSkip g_spin;
-bool g_spin_whitelist = false;
+/* Default true: an unregistered ROM is handed to the auto-gate (spin_frame_tick)
+ * to decide at runtime, rather than sitting permanently off. See
+ * spin_whitelist_set()'s comment for why (0721 whitelist-gap fix). */
+bool g_spin_whitelist = true;
 
 /* Reads within +-6 bytes of the PC are the opcode/operand fetch; WRAM and ROM
  * reads are side-effect-free. Anything else ($21xx APU ports, $42xx HVBJOY/joy,
@@ -142,24 +145,37 @@ void spin_reset(void) {
   s->gate_on = g_spin_whitelist;
 }
 
-/* ROM spin-skip table: pre-analyzed per-ROM via the M7 rig
- * (tools/m7_qemu_rig/run_snes_spin.sh <rom> 1200).  Each entry records the
- * measured gameplay skip% and whether spin-skip is beneficial (skip% above
- * the ~50% breakeven).  Unregistered ROMs default OFF — the per-access hook
- * overhead hurts low-spin carts more than replay saves.
+/* ROM exceptions table (0721 whitelist-gap fix): an unregistered ROM now
+ * defaults to true (g_spin_whitelist init above) and is handed to
+ * spin_frame_tick()'s auto-gate, which is address-agnostic and already
+ * proven -- it observes 600 frames, and parks itself for 1800 if replayed
+ * ops stay under ~3/frame (i.e. this ROM isn't actually spin-heavy), retrying
+ * later. A 2281-ROM sweep (/tmp/snes_2k_spin.tsv, 1792 ROMs measured) found
+ * 941 (52.5%) clear the ~50% skip-rate breakeven where the mechanism nets a
+ * host-cycle win purely from letting the auto-gate run -- they were never
+ * getting the chance before, because this table's old "unregistered = OFF,
+ * permanently" default vetoed the auto-gate outright.
+ *
+ * This table is now ONLY for forcing a known-bad case OFF outright (skip%
+ * measured below breakeven, so even paying for the auto-gate's own brief
+ * WATCH/VERIFY overhead before it parks isn't worth it -- Zelda at 25%).
+ * A `true` entry is redundant with the new default but harmless to keep as a
+ * documented, pre-measured case (SMW at 56.6%).
  *
  * Key = FNV-1a 32-bit hash of the 21-byte internal title at the LoROM
- * (0x7fc0) or HiROM (0xffc0) header offset.  To add a ROM: measure its
- * 1200-frame skip% in the spin rig, compute its title hash, add an entry. */
+ * (0x7fc0) or HiROM (0xffc0) header offset. To force a ROM off: measure its
+ * 1200-frame skip% in the spin rig (tools/m7_qemu_rig/run_snes_spin.sh <rom>
+ * 1200), confirm it's below the ~50% breakeven, compute its title hash, add
+ * a `false` entry. */
 typedef struct { uint32_t hash; bool enable; const char *name; } spin_entry_t;
 static const spin_entry_t spin_table[] = {
-  { 0xFB0BD0ECu, true,  "SUPER MARIOWORLD  (skip% 56.6% — ON)"  },
-  { 0x9C75F6EEu, false, "THE LEGEND OF ZELDA  (skip% 25.0% — OFF)" },
+  { 0xFB0BD0ECu, true,  "SUPER MARIOWORLD  (skip% 56.6% — ON, matches new default)"  },
+  { 0x9C75F6EEu, false, "THE LEGEND OF ZELDA  (skip% 25.0% — forced OFF, below breakeven)" },
 };
 #define SPIN_TABLE_LEN (int)(sizeof(spin_table) / sizeof(spin_table[0]))
 
 void spin_whitelist_set(const uint8_t *rom, uint32_t len) {
-  g_spin_whitelist = false;
+  g_spin_whitelist = true;   /* unregistered default: let the auto-gate decide */
   static const uint32_t offs[2] = { 0x7fc0, 0xffc0 };
   for (int i = 0; i < 2; i++) {
     if (offs[i] + 21 > len) continue;
