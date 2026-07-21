@@ -126,6 +126,9 @@ bool snes_loadRom(Snes* snes, const uint8_t* data, int length) {
 void snes_setSamples(Snes* snes, int16_t* sampleData, int samplesPerFrame) {
   // size is 2 (int16) * 2 (stereo) * samplesPerFrame
   // sets samples in the sampleData
+#ifdef SNES_DSP_BLOCK_MIXER
+  apu_catchupDsp(snes->apu);
+#endif
   dsp_getSamples(snes->apu->dsp, sampleData, samplesPerFrame, 2);
 }
 

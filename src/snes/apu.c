@@ -58,9 +58,17 @@ void apu_reset(Apu* apu) {
   }
   apu->cpuCyclesLeft = 7;
   apu->hist.count = 0;
+#ifdef SNES_DSP_BLOCK_MIXER
+  apu->dspPending = 0;
+#endif
 }
 
 void apu_saveload(Apu *apu, SaveLoadFunc *func, void *ctx) {
+#ifdef SNES_DSP_BLOCK_MIXER
+  /* Pending samples are derived, not serialized. Materialize them before both
+   * save and load; a load then overwrites the materialized old state. */
+  apu_catchupDsp(apu);
+#endif
   func(ctx, apu->ram, offsetof(Apu, pad) + 6 - offsetof(Apu, ram));
   dsp_saveload(apu->dsp, func, ctx);
   spc_saveload(apu->spc, func, ctx);
@@ -68,7 +76,40 @@ void apu_saveload(Apu *apu, SaveLoadFunc *func, void *ctx) {
 
 bool g_debug_apu_cycles;
 
+#ifdef SNES_DSP_BLOCK_MIXER
+#ifdef DSP_MIXER_DIAG
+uint64_t dspb_diag_flushes, dspb_diag_flush_samples;
+uint64_t dspb_diag_flush_reg, dspb_diag_flush_read, dspb_diag_flush_write;
+uint64_t dspb_diag_flush_cap, dspb_diag_flush_audio;
+#endif
+static inline void apu_flushDsp(Apu *apu) {
+  if (apu->dspPending != 0) {
+#ifdef DSP_MIXER_DIAG
+    dspb_diag_flushes++;
+    dspb_diag_flush_samples += apu->dspPending;
+#endif
+    dsp_runBlock(apu->dsp, apu->dspPending);
+    apu->dspPending = 0;
+  }
+}
+
+void apu_catchupDsp(Apu *apu) {
+#ifdef DSP_MIXER_DIAG
+  if (apu->dspPending) dspb_diag_flush_audio++;
+#endif
+  apu_flushDsp(apu);
+}
+
+static inline bool apu_dspReadIsLive(uint8_t adr) {
+  return adr == 0x7c || (adr & 0x0f) == 8 || (adr & 0x0f) == 9;
+}
+#endif
+
 void apu_cycle(Apu* apu) {
+#ifdef SNES_DSP_BLOCK_MIXER
+  /* This legacy one-cycle entry point promises an immediately current DSP. */
+  apu_flushDsp(apu);
+#endif
   if(apu->cpuCyclesLeft == 0) {
     if (g_debug_apu_cycles) {
       char line[80];
@@ -121,8 +162,24 @@ void apu_run(Apu* apu, int cyclesToRun) {
     /* DSP fires when (cycles & 0x1f)==0, tested before the increment — so once for
      * every multiple of 32 in [cycles, cycles+step). */
     uint32_t start = apu->cycles, end = start + (uint32_t)step;
+#ifdef SNES_DSP_BLOCK_MIXER
+    uint32_t firstDsp = (start + 31u) & ~31u;
+    int dspTicks = firstDsp < end ? (int)((end - 1u - firstDsp) / 32u + 1u) : 0;
+    if (apu->dspPending + dspTicks > DSP_BLOCK_MAX_SAMPLES) {
+#ifdef DSP_MIXER_DIAG
+      dspb_diag_flush_cap++;
+#endif
+      apu_flushDsp(apu);
+    }
+    if (dspTicks != 0 && apu->dspPending == 0)
+      dsp_blockBuildSpcHazards(apu->dsp, DSP_BLOCK_MAX_SAMPLES,
+                               apu->dspAccessPages,
+                               &apu->dspAllWriteHazard);
+    apu->dspPending += (uint16_t)dspTicks;
+#else
     for (uint32_t m = (start + 31u) & ~31u; m < end; m += 32u)
       dsp_cycle(apu->dsp);
+#endif
 
     /* Each timer counts down; when it passes 0 it reloads to R and, if enabled,
      * advances divider->counter. Over `step` cycles the zero-crossings land at
@@ -173,6 +230,15 @@ uint8_t apu_cpuRead(Apu* apu, uint16_t adr) {
       return apu->dspAdr;
     }
     case 0xf3: {
+#ifdef SNES_DSP_BLOCK_MIXER
+      uint8_t dspAdr = apu->dspAdr & 0x7f;
+      if (apu_dspReadIsLive(dspAdr)) {
+#ifdef DSP_MIXER_DIAG
+        if (apu->dspPending) dspb_diag_flush_read++;
+#endif
+        apu_flushDsp(apu);
+      }
+#endif
       return dsp_read(apu->dsp, apu->dspAdr & 0x7f);
     }
     case 0xf4:
@@ -194,6 +260,15 @@ uint8_t apu_cpuRead(Apu* apu, uint16_t adr) {
   if(apu->romReadable && adr >= 0xffc0) {
     return bootRom[adr - 0xffc0];
   }
+#ifdef SNES_DSP_BLOCK_MIXER
+  if (apu->dspPending &&
+      dsp_blockSpcReadHazard(apu->dsp, apu->dspPending, adr)) {
+#ifdef DSP_MIXER_DIAG
+    dspb_diag_flush_read++;
+#endif
+    apu_flushDsp(apu);
+  }
+#endif
   return apu->ram[adr];
 }
 
@@ -226,6 +301,13 @@ void apu_cpuWrite(Apu* apu, uint16_t adr, uint8_t val) {
       break;
     }
     case 0xf3: {
+#ifdef SNES_DSP_BLOCK_MIXER
+      /* Register writes split blocks: all earlier samples see the old value. */
+#ifdef DSP_MIXER_DIAG
+      if (apu->dspPending) dspb_diag_flush_reg++;
+#endif
+      apu_flushDsp(apu);
+#endif
       int i = apu->hist.count;
       if (i != 256) {
         apu->hist.count = i + 1;
@@ -254,5 +336,17 @@ void apu_cpuWrite(Apu* apu, uint16_t adr, uint8_t val) {
       break;
     }
   }
+#ifdef SNES_DSP_BLOCK_MIXER
+  if (apu->dspPending &&
+      (dsp_blockSpcEchoHazard(apu->dsp, apu->dspPending, adr) ||
+       (apu->dspAllWriteHazard &&
+        dsp_blockSpcAllWriteHazard(apu->dsp, apu->dspPending)) ||
+       (apu->dspAccessPages[adr >> 11] & (1u << ((adr >> 8) & 7))))) {
+#ifdef DSP_MIXER_DIAG
+    dspb_diag_flush_write++;
+#endif
+    apu_flushDsp(apu);
+  }
+#endif
   apu->ram[adr] = val;
 }

@@ -40,6 +40,14 @@ struct Apu {
     struct DspRegWriteHistory hist;
     void *padpad;
   };
+#ifdef SNES_DSP_BLOCK_MIXER
+  /* DSP samples due since the last SPC-visible dependency. The BRR/DIR page
+   * map is a conservative O(1) test for ARAM ordering hazards over the whole
+   * pending block. All are derived state and deliberately outside save data. */
+  uint16_t dspPending;
+  uint8_t dspAccessPages[32];
+  bool dspAllWriteHazard;
+#endif
 };
 
 Apu* apu_init();
@@ -47,6 +55,9 @@ void apu_free(Apu* apu);
 void apu_reset(Apu* apu);
 void apu_cycle(Apu* apu);
 void apu_run(Apu* apu, int cyclesToRun);
+#ifdef SNES_DSP_BLOCK_MIXER
+void apu_catchupDsp(Apu* apu);
+#endif
 uint8_t apu_cpuRead(Apu* apu, uint16_t adr);
 void apu_cpuWrite(Apu* apu, uint16_t adr, uint8_t val);
 void apu_saveload(Apu *apu, SaveLoadFunc *func, void *ctx);

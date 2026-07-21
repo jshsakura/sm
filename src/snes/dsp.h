@@ -94,6 +94,15 @@ void dsp_cycle(Dsp* dsp);
 uint8_t dsp_read(Dsp* dsp, uint8_t adr);
 void dsp_write(Dsp* dsp, uint8_t adr, uint8_t val);
 void dsp_getSamples(Dsp* dsp, int16_t* sampleData, int samplesPerFrame, int numChannels);
+#ifdef SNES_DSP_BLOCK_MIXER
+#define DSP_BLOCK_MAX_SAMPLES 256
+void dsp_runBlock(Dsp* dsp, int samples);
+void dsp_blockBuildSpcHazards(const Dsp* dsp, int samples,
+                              uint8_t accessPages[32], bool* allWrites);
+bool dsp_blockSpcReadHazard(const Dsp* dsp, int samples, uint16_t adr);
+bool dsp_blockSpcEchoHazard(const Dsp* dsp, int samples, uint16_t adr);
+bool dsp_blockSpcAllWriteHazard(const Dsp* dsp, int samples);
+#endif
 void dsp_saveload(Dsp *dsp, SaveLoadFunc *func, void *ctx);
 
 #endif
