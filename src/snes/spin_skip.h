@@ -28,7 +28,8 @@
  *
  * Runtime auto-gate (address-agnostic, NO per-game list — Korean-patched and
  * rom-hacked carts behave identically): a cart that ends an observation window
- * with (almost) no replayed ops parks the learner and retries later. */
+ * with (almost) no replayed ops parks the learner, drops whatever pattern it
+ * had adopted (see spin_frame_tick) and retries later. */
 #ifndef SNES_SPIN_SKIP_H
 #define SNES_SPIN_SKIP_H
 
@@ -109,7 +110,11 @@ void spin_note(Cpu *cpu, uint32_t pc24, uint8_t charge, int dispatched);
  *
  * Sampled ONCE per opcode, before the interpreter call: neither field can
  * change inside an opcode — spin_note() (between opcodes) is the only writer of
- * `on`, spin_frame_tick() (between frames) the only writer of `gate_on`. */
+ * `on`, spin_frame_tick() (between frames) the only writer of `gate_on`.
+ *
+ * `on` is in the test because a pattern must stay honest against real execution
+ * even after the gate parks; spin_frame_tick() drops the pattern when it parks,
+ * so that does not leave the tax running forever. */
 static inline bool spin_engaged(void) {
   return g_spin.gate_on || g_spin.on;
 }

@@ -50,14 +50,20 @@ extern Snes *g_snes; // for debugging
 
 // addressing modes and opcode functions not declared, only used after defintions
 
-/* The unhooked path. Opcode and operand FETCHES take it even under
- * SNES_SPIN_SKIP: spin_hook_read() discards any address within ±6 bytes of the
- * PC as the fetch it is (`if (adr - (pcb - 6) <= 12) return;`), and a fetch is
- * always inside that window, so classifying one was guaranteed to be a no-op.
- * The branch was not free — a device 3-arm A/B (0722, Zelda, gate OFF) put the
- * whole read/write hook tax at 240,186 cycles/frame, 3.61% of wall, and fetches
- * are the majority of all reads. Only DATA accesses can end an iteration's
- * purity, so only they are classified. */
+/* The unhooked path, taken by every read that goes through cpu_readOpcode():
+ * the opcode byte itself and the operand bytes each addressing mode consumes to
+ * build its address. spin_hook_read() discards any address within ±6 bytes of
+ * the PC as the fetch it is (`if (adr - (pcb - 6) <= 12) return;`), and those
+ * are always inside that window, so classifying one was guaranteed to be a
+ * no-op. The branch was not free — a device 3-arm A/B (0722, Zelda, gate OFF)
+ * put the whole read/write hook tax at 240,186 cycles/frame, 3.61% of wall.
+ *
+ * NOT every fetch, to be exact: cpu_adrImm() only advances the pc and hands the
+ * address to the ordinary cpu_read()/cpu_readWord() the data modes use, so an
+ * immediate operand's bytes still take the hooked path. They still classify to
+ * nothing (same ±6 window), they just still pay the branch. Splitting them out
+ * would mean threading "this operand is immediate" through every cpu_xxx(low,
+ * high) consumer, which is not worth it for the branch. */
 static uint8_t cpu_read_raw(Cpu* cpu, uint32_t adr) {
   // assume mem is a pointer to a Snes
   return snes_cpuRead((Snes*) cpu->mem, adr);

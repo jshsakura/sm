@@ -134,6 +134,18 @@ void spin_frame_tick(void) {
   if (replayed < SPIN_WIN_FRAMES * 3u) {   /* < ~3 replayed ops/frame: not a spinner */
     s->gate_on = false;
     s->phase = 0;
+    /* Drop the adopted pattern too, or the park is not actually free. An
+     * adversarial review (0722) found the reachable case: with H-IRQ armed,
+     * run_dots' replay branch is blocked outright (`!s->hIrqEnabled`) while
+     * spin_note()'s own checks don't look at it -- so `on` stays true, replay
+     * stays zero, the window parks the gate, and every real opcode goes on
+     * paying for a pattern that cannot fire. `gate_on || on` is what keeps the
+     * caller's bookkeeping alive, so clearing `on` here is what makes a parked
+     * learner cost nothing.
+     * We are giving up at most the ~3 replayed ops/frame that failed this very
+     * window, and dropping a pattern is safe by construction: it only means the
+     * interpreter runs, which is the reference behaviour. */
+    s->on = false;
     s->park_frames = SPIN_PARK_FRAMES;
     return;
   }
