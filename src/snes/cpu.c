@@ -50,11 +50,24 @@ extern Snes *g_snes; // for debugging
 
 // addressing modes and opcode functions not declared, only used after defintions
 
+/* The unhooked path. Opcode and operand FETCHES take it even under
+ * SNES_SPIN_SKIP: spin_hook_read() discards any address within ±6 bytes of the
+ * PC as the fetch it is (`if (adr - (pcb - 6) <= 12) return;`), and a fetch is
+ * always inside that window, so classifying one was guaranteed to be a no-op.
+ * The branch was not free — a device 3-arm A/B (0722, Zelda, gate OFF) put the
+ * whole read/write hook tax at 240,186 cycles/frame, 3.61% of wall, and fetches
+ * are the majority of all reads. Only DATA accesses can end an iteration's
+ * purity, so only they are classified. */
+static uint8_t cpu_read_raw(Cpu* cpu, uint32_t adr) {
+  // assume mem is a pointer to a Snes
+  return snes_cpuRead((Snes*) cpu->mem, adr);
+}
+
 #ifdef SNES_SPIN_SKIP
-/* Spin-skip purity hooks (spin_skip.h): every read is classified (IO reads break
- * an iteration's purity), every write bumps the write sequence. The SAME hooks
- * feed the host gate harness (tools/snes_spin) — one implementation, proven
- * bit-identical there, running here. */
+/* Spin-skip purity hooks (spin_skip.h): every data read is classified (IO reads
+ * break an iteration's purity), every write bumps the write sequence. The SAME
+ * hooks feed the host gate harness (tools/snes_spin) — one implementation,
+ * proven bit-identical there, running here. */
 #include "spin_skip.h"
 static uint8_t cpu_read(Cpu* cpu, uint32_t adr) {
   if (g_spin.phase) spin_hook_read(cpu, adr);
@@ -67,8 +80,7 @@ static void cpu_write(Cpu* cpu, uint32_t adr, uint8_t val) {
 }
 #else
 static uint8_t cpu_read(Cpu* cpu, uint32_t adr) {
-  // assume mem is a pointer to a Snes
-  return snes_cpuRead((Snes*) cpu->mem, adr);
+  return cpu_read_raw(cpu, adr);
 }
 
 static void cpu_write(Cpu* cpu, uint32_t adr, uint8_t val) {
@@ -154,7 +166,7 @@ int cpu_runOpcode(Cpu* cpu) {
 }
 
 static uint8_t cpu_readOpcode(Cpu* cpu) {
-  return cpu_read(cpu, (cpu->k << 16) | cpu->pc++);
+  return cpu_read_raw(cpu, (cpu->k << 16) | cpu->pc++);
 }
 
 static uint16_t cpu_readOpcodeWord(Cpu* cpu) {

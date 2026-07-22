@@ -87,7 +87,10 @@ extern SpinSkip g_spin;
  * if left on). */
 extern bool g_spin_whitelist;
 
-/* cpu.c hooks. Deliberately tiny outside VERIFY: one predictable branch. */
+/* cpu.c hooks. Deliberately tiny outside VERIFY: one predictable branch.
+ * cpu.c routes opcode/operand FETCHES around them entirely — spin_hook_read()'s
+ * first test discards every address within ±6 bytes of the PC, which a fetch is
+ * by construction, so hooking them only ever bought the branch. */
 static inline void spin_hook_write(void) {
   if (g_spin.phase) g_spin.write_seq++;
 }
@@ -97,6 +100,27 @@ void spin_hook_read(Cpu *cpu, uint32_t adr);   /* classifies only in VERIFY */
  * read from `cpu` INSIDE the learner, and only in VERIFY — the always-on
  * 64-bit packing was a measured chunk of the old version's overhead. */
 void spin_note(Cpu *cpu, uint32_t pc24, uint8_t charge, int dispatched);
+
+/* Is the learner doing anything at all? `gate_on` false and no adopted pattern
+ * means spin_note() returns after two branch checks and every byte of the
+ * caller's bookkeeping (the pc24/dispatch pack, the 64-bit ops_real increment,
+ * the call itself) is dead work — a tax paid in full by any cart the table or
+ * the auto-gate turns OFF, which currently includes Zelda 3.
+ *
+ * Sampled ONCE per opcode, before the interpreter call: neither field can
+ * change inside an opcode — spin_note() (between opcodes) is the only writer of
+ * `on`, spin_frame_tick() (between frames) the only writer of `gate_on`. */
+static inline bool spin_engaged(void) {
+  return g_spin.gate_on || g_spin.on;
+}
+
+/* The post-opcode half, so main_snes.c and all three rigs share one body
+ * instead of four copies that can drift. */
+static inline void spin_note_real(Cpu *cpu, uint32_t pc24, uint8_t charge,
+                                  int dispatched) {
+  g_spin.ops_real++;
+  spin_note(cpu, pc24, charge, dispatched);
+}
 
 void spin_frame_tick(void);   /* once per emulated frame: auto-gate */
 void spin_reset(void);
