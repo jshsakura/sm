@@ -10,6 +10,7 @@
 @   CLC SEC CLI SEI CLV CLD SED NOP
 @   TAX TAY TXA TYA TSX TXS TCD TDC TCS TSC TXY TYX
 @   INA INX INY DEA DEX DEY XBA
+@   ASL A LSR A ROL A ROR A
 @ It performs NO bus access, NO extra cycle charge, NO opcode fetch. Every
 @ width-sensitive opcode honours the M/X/E flags exactly as cpu_doOpcode does.
 @ Unsupported opcodes return 0 and leave *cpu untouched, so the C dispatcher
@@ -113,6 +114,14 @@
         .word   .Lop88 + 1
         .elseif \op == 0xeb
         .word   .Lopeb + 1
+        .elseif \op == 0x0a
+        .word   .Lop0a + 1
+        .elseif \op == 0x4a
+        .word   .Lop4a + 1
+        .elseif \op == 0x2a
+        .word   .Lop2a + 1
+        .elseif \op == 0x6a
+        .word   .Lop6a + 1
         .else
         .word   .L_noteb + 1
         .endif
@@ -575,6 +584,115 @@ snes_thumb2_step:
         @ ZN reflects new low byte = old high byte (0xAA here).
         uxtb    r2, r2                 @ r2 = new low byte
         movs    r1, #1                 @ byte mode
+        SETZN
+        b       .L_handled
+
+        @ --- accumulator shifts (implied form: no operand, no bus access) ---
+        @ Gate on M flag exactly as cpu_doOpcode. r1 holds mf (=ZN byte-mode),
+        @ r2 the ZN value, r0/r3 scratch. Carry extracted via ubfx (0/1), so the
+        @ stored _Bool matches the C compiler's normalisation.
+        @ ASL A (0x0a): mf? c=bit7,a=(a&ff00)|((a<<1)&ff) : c=bit15,a=(a<<1)&ffff
+.Lop0a:
+        LDB     r1, CPU_MF
+        ldrh    r3, [r4, #CPU_A]
+        cmp     r1, #0
+        bne     .L0a_m
+        ubfx    r2, r3, #15, #1        @ word carry = bit15
+        strb    r2, [r4, #CPU_C]
+        lsls    r2, r3, #1
+        uxth    r2, r2                 @ a = (a<<1)&0xffff
+        strh    r2, [r4, #CPU_A]
+        b       .L0a_zn
+.L0a_m:
+        ubfx    r2, r3, #7, #1         @ byte carry = bit7
+        strb    r2, [r4, #CPU_C]
+        lsls    r0, r3, #1
+        uxtb    r0, r0                 @ (a<<1)&0xff
+        and     r3, r3, #0xff00
+        orr     r2, r3, r0             @ a = (a&ff00)|newlow
+        strh    r2, [r4, #CPU_A]
+        uxtb    r2, r2                 @ ZN byte value
+.L0a_zn:
+        SETZN
+        b       .L_handled
+
+        @ LSR A (0x4a): c=a&1; mf? a=(a&ff00)|((a>>1)&7f) : a=a>>1
+.Lop4a:
+        LDB     r1, CPU_MF
+        ldrh    r3, [r4, #CPU_A]
+        ubfx    r2, r3, #0, #1         @ carry = bit0 (same both widths)
+        strb    r2, [r4, #CPU_C]
+        cmp     r1, #0
+        bne     .L4a_m
+        lsrs    r2, r3, #1
+        strh    r2, [r4, #CPU_A]
+        b       .L4a_zn
+.L4a_m:
+        uxtb    r0, r3                 @ low byte
+        lsrs    r0, r0, #1
+        and     r3, r3, #0xff00
+        orr     r2, r3, r0
+        strh    r2, [r4, #CPU_A]
+        uxtb    r2, r2
+.L4a_zn:
+        SETZN
+        b       .L_handled
+
+        @ ROL A (0x2a): result=(a<<1)|c; mf? c=bit7,a=(a&ff00)|(result&ff)
+        @                                   : c=bit15,a=result&ffff.  bit7/15 of
+        @ a == bit8/16 of result (c only sets bit0), so carry comes from a.
+.Lop2a:
+        LDB     r1, CPU_MF
+        ldrh    r3, [r4, #CPU_A]
+        ldrb    r0, [r4, #CPU_C]       @ old carry (shift-in)
+        cmp     r1, #0
+        bne     .L2a_m
+        ubfx    r2, r3, #15, #1        @ word carry = bit15 of a
+        strb    r2, [r4, #CPU_C]
+        lsls    r2, r3, #1
+        orr     r2, r2, r0             @ (a<<1)|c
+        uxth    r2, r2                 @ a = result&0xffff
+        strh    r2, [r4, #CPU_A]
+        b       .L2a_zn
+.L2a_m:
+        ubfx    r2, r3, #7, #1         @ byte carry = bit7 of a
+        strb    r2, [r4, #CPU_C]
+        lsls    r2, r3, #1
+        orr     r2, r2, r0
+        uxtb    r2, r2                 @ result&0xff
+        and     r3, r3, #0xff00
+        orr     r2, r3, r2
+        strh    r2, [r4, #CPU_A]
+        uxtb    r2, r2
+.L2a_zn:
+        SETZN
+        b       .L_handled
+
+        @ ROR A (0x6a): newc=a&1; mf? a=(a&ff00)|((a>>1)&7f)|(c<<7)
+        @                                   : a=(a>>1)|(c<<15).  a uses OLD c.
+.Lop6a:
+        LDB     r1, CPU_MF
+        ldrh    r3, [r4, #CPU_A]
+        ldrb    r0, [r4, #CPU_C]       @ old carry (shift-in)
+        ubfx    r2, r3, #0, #1         @ new carry = bit0
+        strb    r2, [r4, #CPU_C]       @ store now; a below uses r0, not CPU_C
+        cmp     r1, #0
+        bne     .L6a_m
+        lsrs    r2, r3, #1
+        lsls    r0, r0, #15
+        orr     r2, r2, r0            @ a = (a>>1)|(c<<15)
+        strh    r2, [r4, #CPU_A]
+        b       .L6a_zn
+.L6a_m:
+        uxtb    r2, r3                 @ low byte
+        lsrs    r2, r2, #1
+        lsls    r0, r0, #7             @ c<<7
+        orr     r2, r2, r0
+        and     r3, r3, #0xff00
+        orr     r2, r3, r2
+        strh    r2, [r4, #CPU_A]
+        uxtb    r2, r2
+.L6a_zn:
         SETZN
         b       .L_handled
 .L_noteb:
