@@ -137,7 +137,19 @@ void cpu_saveload(Cpu *cpu, SaveLoadFunc *func, void *ctx) {
   cpu->spBreakpoint = 0x0;
 }
 
-int cpu_runOpcode(Cpu* cpu) {
+/* SNES_THUMB2_CPU: split the interpreter into an oracle symbol the Thumb-2
+ * dispatcher can call as a fallback, while keeping flag-off byte-identical to
+ * upstream (the macro collapses to the plain name, so the definition token and
+ * thus the object are unchanged). Stage 0's dispatcher is a pure C passthrough;
+ * Stage 1 routes per-opcode into the assembly engine, falling back here for
+ * anything not yet ported. Never introduce a recursive alias -- the public
+ * contract cpu_runOpcode() always resolves to exactly one implementation. */
+#ifdef SNES_THUMB2_CPU
+#  define SNES_RUNOPCODE_IMPL cpu_runOpcode_c
+#else
+#  define SNES_RUNOPCODE_IMPL cpu_runOpcode
+#endif
+int SNES_RUNOPCODE_IMPL(Cpu* cpu) {
   cpu->cyclesUsed = 0;
   if(cpu->stopped) return 1;
 
@@ -170,6 +182,17 @@ int cpu_runOpcode(Cpu* cpu) {
   cpu_doOpcode(cpu, opcode);
   return cpu->cyclesUsed;
 }
+
+#ifdef SNES_THUMB2_CPU
+/* Public contract. Stage 0: pass straight through to the C oracle, so the
+ * build with the flag on behaves identically to the build with it off (same
+ * opcodes run, same cycles charged). Stage 1 replaces this body with a
+ * per-opcode dispatch into external/sm/src/snes/thumb2/snes_thumb2.S for the
+ * ported family, calling cpu_runOpcode_c only for unsupported opcodes. */
+int cpu_runOpcode(Cpu* cpu) {
+  return cpu_runOpcode_c(cpu);
+}
+#endif
 
 static uint8_t cpu_readOpcode(Cpu* cpu) {
   return cpu_read_raw(cpu, (cpu->k << 16) | cpu->pc++);

@@ -53,6 +53,10 @@ Cpu* cpu_init(void* mem, int memType);
 void cpu_free(Cpu* cpu);
 void cpu_reset(Cpu* cpu);
 int cpu_runOpcode(Cpu* cpu);
+#ifdef SNES_THUMB2_CPU
+/* The C interpreter exposed as oracle/fallback for the Thumb-2 dispatcher. */
+int cpu_runOpcode_c(Cpu* cpu);
+#endif
 uint8_t cpu_getFlags(Cpu *cpu);
 void cpu_setFlags(Cpu *cpu, uint8_t val);
 void cpu_saveload(Cpu *cpu, SaveLoadFunc *func, void *ctx);
