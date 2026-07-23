@@ -16,6 +16,8 @@
 @   accumulator shifts: ASL A LSR A ROL A ROR A
 @   relative branches (one operand byte at pc, taken-cycle per cpu_doBranch):
 @              BPL BMI BVC BVS BRA BCC BCS BNE BEQ
+@   immediate ALU/load: ORA AND EOR LDY LDX LDA
+@   status masks: REP SEP
 @ Every width-sensitive opcode honours the M/X/E flags exactly as cpu_doOpcode
 @ does. Unsupported opcodes return 0 and leave *cpu untouched, so the C
 @ dispatcher falls through to cpu_doOpcode(cpu, opcode) on the fetched byte.
@@ -58,6 +60,23 @@
 @ Load a bool field (0/1) into r3 for width tests. Field offset in \off.
         .macro LDB r, off
         ldrb    \r, [r4, #(\off)]
+        .endm
+
+@ Inline one raw operand fetch.  This deliberately is a macro, not a callable
+@ local helper: the contained BL may overwrite LR because the outer entry saved
+@ its caller LR in the common prologue.  A BL-called helper containing this BL
+@ would instead lose its own return address.  r6 carries all live state across
+@ the C call (AAPCS callee-saved).
+        .macro IMM_FETCH_BYTE
+        ldr     r0, [r4, #CPU_MEM]
+        ldrb    r1, [r4, #CPU_K]
+        ldrh    r2, [r4, #CPU_PC]
+        lsl     r1, r1, #16
+        orr     r1, r1, r2
+        adds    r3, r2, #1
+        strh    r3, [r4, #CPU_PC]       @ uint16 PC wrap; K never carries
+        bl      snes_cpuRead
+        uxtb    r0, r0
         .endm
 
 @ Dense O(1) opcode dispatch.  Table entries carry the Thumb bit because the
@@ -144,6 +163,22 @@
         .word   .Lopd0 + 1
         .elseif \op == 0xf0
         .word   .Lopf0 + 1
+        .elseif \op == 0x09
+        .word   .Lop09 + 1
+        .elseif \op == 0x29
+        .word   .Lop29 + 1
+        .elseif \op == 0x49
+        .word   .Lop49 + 1
+        .elseif \op == 0xa0
+        .word   .Lopa0 + 1
+        .elseif \op == 0xa2
+        .word   .Lopa2 + 1
+        .elseif \op == 0xa9
+        .word   .Lopa9 + 1
+        .elseif \op == 0xc2
+        .word   .Lopc2 + 1
+        .elseif \op == 0xe2
+        .word   .Lope2 + 1
         .else
         .word   .L_noteb + 1
         .endif
@@ -716,6 +751,149 @@ snes_thumb2_step:
         uxtb    r2, r2
 .L6a_zn:
         SETZN
+        b       .L_handled
+
+@ --- immediate ALU/load (Stage 3C) ---------------------------------------
+@ r6 packing survives each BL snes_cpuRead:
+@   bits  7:0  original opcode
+@   bit     8  byte mode (MF for A ops, XF for X/Y ops)
+@   bits 23:16 low operand byte
+@   bits 31:24 high operand byte (word mode only)
+.Lop09:                                 @ ORA #imm(m)
+.Lop29:                                 @ AND #imm(m)
+.Lop49:                                 @ EOR #imm(m)
+.Lopa9:                                 @ LDA #imm(m)
+        ldrb    r0, [r4, #CPU_MF]
+        orr     r6, r6, r0, lsl #8
+        b       .Limm_common
+
+.Lopa0:                                 @ LDY #imm(x)
+.Lopa2:                                 @ LDX #imm(x)
+        ldrb    r0, [r4, #CPU_XF]
+        orr     r6, r6, r0, lsl #8
+
+.Limm_common:
+        IMM_FETCH_BYTE                  @ low operand
+        orr     r6, r6, r0, lsl #16
+        tst     r6, #0x100
+        bne     .Limm_value_ready
+        IMM_FETCH_BYTE                  @ high operand; rebuild K:PC after wrap
+        orr     r6, r6, r0, lsl #24
+        ldrb    r0, [r4, #CPU_CYCLESUSED]
+        adds    r0, r0, #1              @ 16-bit M/X: one dynamic extra cycle
+        strb    r0, [r4, #CPU_CYCLESUSED]
+
+.Limm_value_ready:
+        ubfx    r2, r6, #16, #8
+        ubfx    r3, r6, #24, #8
+        orr     r2, r2, r3, lsl #8      @ operand value (high is zero in byte mode)
+        uxtb    r0, r6                   @ original opcode
+        ubfx    r1, r6, #8, #1          @ SETZN byte-mode flag
+
+        cmp     r0, #0x29               @ AND is the measured hot ALU case
+        beq     .Limm_and
+        cmp     r0, #0xa9
+        beq     .Limm_lda
+        cmp     r0, #0xa0
+        beq     .Limm_ldy
+        cmp     r0, #0xa2
+        beq     .Limm_ldx
+        cmp     r0, #0x09
+        beq     .Limm_ora
+        @ only remaining shared entry is EOR # (0x49)
+        ldrh    r3, [r4, #CPU_A]
+        eor     r0, r3, r2
+        b       .Limm_store_a
+
+.Limm_and:
+        ldrh    r3, [r4, #CPU_A]
+        and     r0, r3, r2
+        b       .Limm_store_a
+.Limm_ora:
+        ldrh    r3, [r4, #CPU_A]
+        orr     r0, r3, r2
+        b       .Limm_store_a
+.Limm_lda:
+        mov     r0, r2
+
+.Limm_store_a:
+        cmp     r1, #0
+        beq     .Limm_store_a_word
+        ldrh    r3, [r4, #CPU_A]
+        bfi     r3, r0, #0, #8          @ byte A ops preserve A[15:8]
+        strh    r3, [r4, #CPU_A]
+        uxtb    r2, r0                  @ SETZN requires width-masked value
+        SETZN
+        b       .L_handled
+.Limm_store_a_word:
+        uxth    r2, r0
+        strh    r2, [r4, #CPU_A]
+        SETZN
+        b       .L_handled
+
+.Limm_ldx:
+        strh    r2, [r4, #CPU_X]        @ byte mode zero-extends; no high preserve
+        SETZN
+        b       .L_handled
+.Limm_ldy:
+        strh    r2, [r4, #CPU_Y]
+        SETZN
+        b       .L_handled
+
+@ REP/SEP update only mask-selected status fields, then reproduce every
+@ cpu_setFlags side effect.  Shifting the mask exposes old bit0 in APSR.C;
+@ field order is P = N V M X D I Z C.
+.Lopc2:                                 @ REP #imm: selected bits become 0
+        movs    r6, #0
+        b       .Lflags_imm
+.Lope2:                                 @ SEP #imm: selected bits become 1
+        movs    r6, #1
+.Lflags_imm:
+        IMM_FETCH_BYTE
+        mov     r2, r6                  @ store value; survives no further BL
+        lsrs    r0, r0, #1
+        it      cs
+        strbcs  r2, [r4, #CPU_C]
+        lsrs    r0, r0, #1
+        it      cs
+        strbcs  r2, [r4, #CPU_Z]
+        lsrs    r0, r0, #1
+        it      cs
+        strbcs  r2, [r4, #CPU_I]
+        lsrs    r0, r0, #1
+        it      cs
+        strbcs  r2, [r4, #CPU_D]
+        lsrs    r0, r0, #1
+        it      cs
+        strbcs  r2, [r4, #CPU_XF]
+        lsrs    r0, r0, #1
+        it      cs
+        strbcs  r2, [r4, #CPU_MF]
+        lsrs    r0, r0, #1
+        it      cs
+        strbcs  r2, [r4, #CPU_V]
+        lsrs    r0, r0, #1
+        it      cs
+        strbcs  r2, [r4, #CPU_N]
+
+        ldrb    r0, [r4, #CPU_E]
+        cbz     r0, .Lflags_xf
+        movs    r0, #1
+        strb    r0, [r4, #CPU_MF]       @ emulation mode pins M=X=1
+        strb    r0, [r4, #CPU_XF]
+        ldrh    r1, [r4, #CPU_SP]
+        uxtb    r1, r1
+        add.w   r1, r1, #0x100
+        strh    r1, [r4, #CPU_SP]
+.Lflags_xf:
+        ldrb    r0, [r4, #CPU_XF]
+        cbz     r0, .L_handled
+        ldrh    r1, [r4, #CPU_X]
+        uxtb    r1, r1
+        strh    r1, [r4, #CPU_X]
+        ldrh    r1, [r4, #CPU_Y]
+        uxtb    r1, r1
+        strh    r1, [r4, #CPU_Y]
         b       .L_handled
 
 @ --- relative branches (Stage 3B): one operand byte at pc, taken-cycle gate ---
