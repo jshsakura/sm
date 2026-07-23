@@ -56,11 +56,14 @@ int cpu_runOpcode(Cpu* cpu);
 #ifdef SNES_THUMB2_CPU
 /* The C interpreter exposed as oracle/fallback for the Thumb-2 dispatcher. */
 int cpu_runOpcode_c(Cpu* cpu);
-/* Thumb-2 fast path for the no-operand, bus-side-effect-free opcode family,
-   including accumulator-form shifts and rotates.
-   Returns 1 if handled (cpu state mutated in place), 0 to fall back to C.
-   The caller has already fetched the opcode and charged cyclesPerOpcode[opcode];
-   this routine performs NO fetch and NO cycle/bus charge. */
+/* Thumb-2 fast path. The caller (try path) has already fetched the opcode and
+   charged cyclesPerOpcode[opcode]; the step path fetches it itself. Either way,
+   on entry pc points just past the opcode byte. Each native handler performs
+   exactly the operand/data fetches and extra cycle charges its opcode semantics
+   require (e.g. a relative branch reads one operand byte at pc and adds the
+   taken-cycle), so a handler is correct on BOTH paths: pc consistently points at
+   the operand. Returns 1 if handled (cpu state mutated in place), 0 to fall back
+   to C, which then runs cpu_doOpcode on the already-fetched byte. */
 int snes_thumb2_try(Cpu* cpu, uint8_t opcode);
 /* Stage 2 fetch-dispatch entry. Fetches EXACTLY ONE opcode by calling the real
    snes_cpuRead(mem, (k<<16)|pc), increments the 16-bit pc once, charges

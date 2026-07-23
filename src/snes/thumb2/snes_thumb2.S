@@ -4,17 +4,21 @@
 @   r0 = Cpu*, r1 = opcode
 @   returns 1 if the opcode was handled (Cpu state updated in place), 0 if not.
 @
-@ Contract (Stage 1): the caller has ALREADY performed the single opcode fetch
-@ and charged cyclesPerOpcode[opcode]. This routine performs the opcode's
-@ register/flag effect for the no-operand, bus-side-effect-free family only:
-@   CLC SEC CLI SEI CLV CLD SED NOP
-@   TAX TAY TXA TYA TSX TXS TCD TDC TCS TSC TXY TYX
-@   INA INX INY DEA DEX DEY XBA
-@   ASL A LSR A ROL A ROR A
-@ It performs NO bus access, NO extra cycle charge, NO opcode fetch. Every
-@ width-sensitive opcode honours the M/X/E flags exactly as cpu_doOpcode does.
-@ Unsupported opcodes return 0 and leave *cpu untouched, so the C dispatcher
-@ falls through to cpu_doOpcode(cpu, opcode) on the already-fetched byte.
+@ Contract: the caller has ALREADY performed the single opcode fetch and charged
+@ cyclesPerOpcode[opcode]; on entry pc points just past the opcode byte. Each
+@ native handler performs exactly the operand/data fetches and extra cycle
+@ charges its opcode semantics require, so a handler is correct on BOTH the
+@ snes_thumb2_try path (caller-owned fetch) and the snes_thumb2_step path
+@ (self-fetch): pc consistently points at the operand. Handled families:
+@   no-operand: CLC SEC CLI SEI CLV CLD SED NOP
+@              TAX TAY TXA TYA TSX TXS TCD TDC TCS TSC TXY TYX
+@              INA INX INY DEA DEX DEY XBA
+@   accumulator shifts: ASL A LSR A ROL A ROR A
+@   relative branches (one operand byte at pc, taken-cycle per cpu_doBranch):
+@              BPL BMI BVC BVS BRA BCC BCS BNE BEQ
+@ Every width-sensitive opcode honours the M/X/E flags exactly as cpu_doOpcode
+@ does. Unsupported opcodes return 0 and leave *cpu untouched, so the C
+@ dispatcher falls through to cpu_doOpcode(cpu, opcode) on the fetched byte.
 @
 @ Build path: Makefile.common snes_asm_obj_prereq_gen runs this file through
 @ the C preprocessor (capital .S), so #include "cpu_thumb2_offsets.h" resolves
@@ -122,6 +126,24 @@
         .word   .Lop2a + 1
         .elseif \op == 0x6a
         .word   .Lop6a + 1
+        .elseif \op == 0x10
+        .word   .Lop10 + 1
+        .elseif \op == 0x30
+        .word   .Lop30 + 1
+        .elseif \op == 0x50
+        .word   .Lop50 + 1
+        .elseif \op == 0x70
+        .word   .Lop70 + 1
+        .elseif \op == 0x80
+        .word   .Lop80 + 1
+        .elseif \op == 0x90
+        .word   .Lop90 + 1
+        .elseif \op == 0xb0
+        .word   .Lopb0 + 1
+        .elseif \op == 0xd0
+        .word   .Lopd0 + 1
+        .elseif \op == 0xf0
+        .word   .Lopf0 + 1
         .else
         .word   .L_noteb + 1
         .endif
@@ -694,6 +716,63 @@ snes_thumb2_step:
         uxtb    r2, r2
 .L6a_zn:
         SETZN
+        b       .L_handled
+
+@ --- relative branches (Stage 3B): one operand byte at pc, taken-cycle gate ---
+@ r6 = 0 (not taken) / 1 (taken, +1 cycle) / 2 (BRA, taken, no cycle).
+@ r6 is callee-saved (pushed in prologue), so it survives bl snes_cpuRead.
+.Lop10:                                 @ BPL  taken if n==0
+        ldrb    r6, [r4, #CPU_N]
+        eors    r6, r6, #1
+        b       .Lbr_common
+.Lop50:                                 @ BVC  taken if v==0
+        ldrb    r6, [r4, #CPU_V]
+        eors    r6, r6, #1
+        b       .Lbr_common
+.Lop90:                                 @ BCC  taken if c==0
+        ldrb    r6, [r4, #CPU_C]
+        eors    r6, r6, #1
+        b       .Lbr_common
+.Lopd0:                                 @ BNE  taken if z==0
+        ldrb    r6, [r4, #CPU_Z]
+        eors    r6, r6, #1
+        b       .Lbr_common
+.Lop30:                                 @ BMI  taken if n==1
+        ldrb    r6, [r4, #CPU_N]
+        b       .Lbr_common
+.Lop70:                                 @ BVS  taken if v==1
+        ldrb    r6, [r4, #CPU_V]
+        b       .Lbr_common
+.Lopb0:                                 @ BCS  taken if c==1
+        ldrb    r6, [r4, #CPU_C]
+        b       .Lbr_common
+.Lopf0:                                 @ BEQ  taken if z==1
+        ldrb    r6, [r4, #CPU_Z]
+        b       .Lbr_common
+.Lop80:                                 @ BRA  always, no taken-cycle
+        movs    r6, #2
+        b       .Lbr_common
+
+.Lbr_common:
+        @ raw operand fetch -- mirrors the step opcode fetch (lines 155-162).
+        ldr     r0, [r4, #CPU_MEM]
+        ldrb    r1, [r4, #CPU_K]
+        ldrh    r2, [r4, #CPU_PC]
+        lsl     r1, r1, #16
+        orr     r1, r1, r2
+        adds    r3, r2, #1
+        strh    r3, [r4, #CPU_PC]       @ pc++ (uint16 wrap)
+        bl      snes_cpuRead            @ r0 = operand byte
+        sxtb    r0, r0                  @ (int8_t)operand
+        cbz     r6, .L_handled          @ not taken: operand consumed, done
+        ldrh    r2, [r4, #CPU_PC]       @ pc (already +1)
+        adds    r2, r2, r0              @ pc += offset (uint16 wrap via strh)
+        strh    r2, [r4, #CPU_PC]
+        cmp     r6, #2
+        beq     .L_handled              @ BRA: no taken-cycle
+        ldrb    r0, [r4, #CPU_CYCLESUSED]
+        adds    r0, r0, #1
+        strb    r0, [r4, #CPU_CYCLESUSED]
         b       .L_handled
 .L_noteb:
 
