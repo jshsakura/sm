@@ -10,8 +10,16 @@
 SpinSkip g_spin;
 /* Default true: an unregistered ROM is handed to the auto-gate (spin_frame_tick)
  * to decide at runtime, rather than sitting permanently off. See
- * spin_whitelist_set()'s comment for why (0721 whitelist-gap fix). */
-bool g_spin_whitelist = true;
+ * spin_whitelist_set()'s comment for why (0721 whitelist-gap fix).
+ *
+ * Compile-time override for a device A/B (0722): the firmware Makefile can
+ * define SNES_SPIN_SKIP_DEFAULT=false to build the OFF arm without touching
+ * this file. Absent any override the behaviour is byte-identical to before
+ * this macro existed -- the ON arm IS the default build. */
+#ifndef SNES_SPIN_SKIP_DEFAULT
+#define SNES_SPIN_SKIP_DEFAULT true
+#endif
+bool g_spin_whitelist = SNES_SPIN_SKIP_DEFAULT;
 
 /* Reads within +-6 bytes of the PC are the opcode/operand fetch; WRAM and ROM
  * reads are side-effect-free. Anything else ($21xx APU ports, $42xx HVBJOY/joy,
@@ -187,7 +195,7 @@ static const spin_entry_t spin_table[] = {
 #define SPIN_TABLE_LEN (int)(sizeof(spin_table) / sizeof(spin_table[0]))
 
 void spin_whitelist_set(const uint8_t *rom, uint32_t len) {
-  g_spin_whitelist = true;   /* unregistered default: let the auto-gate decide */
+  g_spin_whitelist = SNES_SPIN_SKIP_DEFAULT;   /* unregistered default: let the auto-gate decide */
   static const uint32_t offs[2] = { 0x7fc0, 0xffc0 };
   for (int i = 0; i < 2; i++) {
     if (offs[i] + 21 > len) continue;
