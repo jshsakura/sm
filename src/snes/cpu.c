@@ -184,13 +184,40 @@ int SNES_RUNOPCODE_IMPL(Cpu* cpu) {
 }
 
 #ifdef SNES_THUMB2_CPU
-/* Public contract. Stage 0: pass straight through to the C oracle, so the
- * build with the flag on behaves identically to the build with it off (same
- * opcodes run, same cycles charged). Stage 1 replaces this body with a
- * per-opcode dispatch into external/sm/src/snes/thumb2/snes_thumb2.S for the
- * ported family, calling cpu_runOpcode_c only for unsupported opcodes. */
+/* Public contract, Stage 1. Mirrors cpu_runOpcode_c's pre-work (stopped / WAI /
+ * IRQ / NMI / rc) and fetches EXACTLY ONE opcode, charging cyclesPerOpcode once.
+ * snes_thumb2_try handles the no-operand bus-side-effect-free family directly in
+ * Thumb-2; if it returns 0 the opcode was not ported and we fall through to the
+ * C interpreter's cpu_doOpcode on the SAME already-fetched byte. No second
+ * fetch, no double cycle/bus charge. The oracle cpu_runOpcode_c is kept intact
+ * as the differential reference and is the sole code path when the flag is off. */
 int cpu_runOpcode(Cpu* cpu) {
-  return cpu_runOpcode_c(cpu);
+  cpu->cyclesUsed = 0;
+  if(cpu->stopped) return 1;
+
+  if(cpu->waiting) {
+    if(!(cpu->irqWanted || cpu->nmiWanted)) return 1;
+    cpu->waiting = false;
+  }
+
+  if((!cpu->i && cpu->irqWanted) || cpu->nmiWanted) {
+    cpu->cyclesUsed = 7;
+    if(cpu->nmiWanted) {
+      cpu->nmiWanted = false;
+      cpu_doInterrupt(cpu, false);
+    } else {
+      cpu_doInterrupt(cpu, true);
+    }
+  }
+  if (g_rc_active) {
+    uint16_t id = rc_dispatch_lookup(cpu->k, cpu->pc);
+    if (id) { rc_dispatch_call(id, cpu); return cpu->cyclesUsed; }
+  }
+  uint8_t opcode = cpu_readOpcode(cpu);
+  cpu->cyclesUsed = cyclesPerOpcode[opcode];
+  if(!snes_thumb2_try(cpu, opcode))
+    cpu_doOpcode(cpu, opcode);
+  return cpu->cyclesUsed;
 }
 #endif
 
