@@ -12,24 +12,32 @@
 #include "../enemy_types.h"
 #include "../variables.h"
 #include "rc_dispatch.h"
-static const int cyclesPerOpcode[256] = {
-  7, 6, 7, 4, 5, 3, 5, 6, 3, 2, 2, 4, 6, 4, 6, 5,
-  2, 5, 5, 7, 5, 4, 6, 6, 2, 4, 2, 2, 6, 4, 7, 5,
-  6, 6, 8, 4, 3, 3, 5, 6, 4, 2, 2, 5, 4, 4, 6, 5,
-  2, 5, 5, 7, 4, 4, 6, 6, 2, 4, 2, 2, 4, 4, 7, 5,
-  6, 6, 2, 4, 7, 3, 5, 6, 3, 2, 2, 3, 3, 4, 6, 5,
-  2, 5, 5, 7, 7, 4, 6, 6, 2, 4, 3, 2, 4, 4, 7, 5,
-  6, 6, 6, 4, 3, 3, 5, 6, 4, 2, 2, 6, 5, 4, 6, 5,
-  2, 5, 5, 7, 4, 4, 6, 6, 2, 4, 4, 2, 6, 4, 7, 5,
-  3, 6, 4, 4, 3, 3, 3, 6, 2, 2, 2, 3, 4, 4, 4, 5,
-  2, 6, 5, 7, 4, 4, 4, 6, 2, 5, 2, 2, 4, 5, 5, 5,
-  2, 6, 2, 4, 3, 3, 3, 6, 2, 2, 2, 4, 4, 4, 4, 5,
-  2, 5, 5, 7, 4, 4, 4, 6, 2, 4, 2, 2, 4, 4, 4, 5,
-  2, 6, 3, 4, 3, 3, 5, 6, 2, 2, 2, 3, 4, 4, 6, 5,
-  2, 5, 5, 7, 6, 4, 6, 6, 2, 4, 3, 3, 6, 4, 7, 5,
-  2, 6, 3, 4, 3, 3, 5, 6, 2, 2, 2, 3, 4, 4, 6, 5,
+#define SNES_CYCLES_PER_OPCODE \
+  7, 6, 7, 4, 5, 3, 5, 6, 3, 2, 2, 4, 6, 4, 6, 5, \
+  2, 5, 5, 7, 5, 4, 6, 6, 2, 4, 2, 2, 6, 4, 7, 5, \
+  6, 6, 8, 4, 3, 3, 5, 6, 4, 2, 2, 5, 4, 4, 6, 5, \
+  2, 5, 5, 7, 4, 4, 6, 6, 2, 4, 2, 2, 4, 4, 7, 5, \
+  6, 6, 2, 4, 7, 3, 5, 6, 3, 2, 2, 3, 3, 4, 6, 5, \
+  2, 5, 5, 7, 7, 4, 6, 6, 2, 4, 3, 2, 4, 4, 7, 5, \
+  6, 6, 6, 4, 3, 3, 5, 6, 4, 2, 2, 6, 5, 4, 6, 5, \
+  2, 5, 5, 7, 4, 4, 6, 6, 2, 4, 4, 2, 6, 4, 7, 5, \
+  3, 6, 4, 4, 3, 3, 3, 6, 2, 2, 2, 3, 4, 4, 4, 5, \
+  2, 6, 5, 7, 4, 4, 4, 6, 2, 5, 2, 2, 4, 5, 5, 5, \
+  2, 6, 2, 4, 3, 3, 3, 6, 2, 2, 2, 4, 4, 4, 4, 5, \
+  2, 5, 5, 7, 4, 4, 4, 6, 2, 4, 2, 2, 4, 4, 4, 5, \
+  2, 6, 3, 4, 3, 3, 5, 6, 2, 2, 2, 3, 4, 4, 6, 5, \
+  2, 5, 5, 7, 6, 4, 6, 6, 2, 4, 3, 3, 6, 4, 7, 5, \
+  2, 6, 3, 4, 3, 3, 5, 6, 2, 2, 2, 3, 4, 4, 6, 5, \
   2, 5, 5, 7, 5, 4, 6, 6, 2, 4, 4, 2, 8, 4, 7, 5
+static const int cyclesPerOpcode[256] = {
+  SNES_CYCLES_PER_OPCODE
 };
+#ifdef SNES_THUMB2_CPU
+const uint8_t snes_cycles_per_opcode[256] = {
+  SNES_CYCLES_PER_OPCODE
+};
+_Static_assert(sizeof(snes_cycles_per_opcode) == 256, "snes_cycles_per_opcode must be 256 bytes");
+#endif
 
 static uint8_t cpu_read(Cpu* cpu, uint32_t adr);
 static void cpu_write(Cpu* cpu, uint32_t adr, uint8_t val);
@@ -184,13 +192,15 @@ int SNES_RUNOPCODE_IMPL(Cpu* cpu) {
 }
 
 #ifdef SNES_THUMB2_CPU
-/* Public contract, Stage 1. Mirrors cpu_runOpcode_c's pre-work (stopped / WAI /
- * IRQ / NMI / rc) and fetches EXACTLY ONE opcode, charging cyclesPerOpcode once.
- * snes_thumb2_try handles the no-operand bus-side-effect-free family directly in
- * Thumb-2; if it returns 0 the opcode was not ported and we fall through to the
- * C interpreter's cpu_doOpcode on the SAME already-fetched byte. No second
- * fetch, no double cycle/bus charge. The oracle cpu_runOpcode_c is kept intact
- * as the differential reference and is the sole code path when the flag is off. */
+/* Public contract, Stage 2. Mirrors cpu_runOpcode_c's pre-work (stopped / WAI /
+ * IRQ / NMI / rc) and then delegates the single-opcode fetch+dispatch to the
+ * Thumb-2 engine via snes_thumb2_step. The engine fetches EXACTLY ONE opcode by
+ * calling the real snes_cpuRead(mem, (k<<16)|pc), increments the 16-bit pc once,
+ * charges cyclesUsed from the exported byte cycle table, and runs the handler
+ * directly. It returns -1 if handled, or the opcode byte (0..255) if unsupported
+ * -- in which case C calls cpu_doOpcode on the SAME already-fetched byte: no
+ * second fetch, no double cycle/bus charge. The oracle cpu_runOpcode_c is kept
+ * intact as the differential reference and is the sole code path when flag off. */
 int cpu_runOpcode(Cpu* cpu) {
   cpu->cyclesUsed = 0;
   if(cpu->stopped) return 1;
@@ -213,10 +223,9 @@ int cpu_runOpcode(Cpu* cpu) {
     uint16_t id = rc_dispatch_lookup(cpu->k, cpu->pc);
     if (id) { rc_dispatch_call(id, cpu); return cpu->cyclesUsed; }
   }
-  uint8_t opcode = cpu_readOpcode(cpu);
-  cpu->cyclesUsed = cyclesPerOpcode[opcode];
-  if(!snes_thumb2_try(cpu, opcode))
-    cpu_doOpcode(cpu, opcode);
+  int r = snes_thumb2_step(cpu);
+  if(r != -1)
+    cpu_doOpcode(cpu, (uint8_t)r);
   return cpu->cyclesUsed;
 }
 #endif

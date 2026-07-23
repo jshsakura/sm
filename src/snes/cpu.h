@@ -61,6 +61,12 @@ int cpu_runOpcode_c(Cpu* cpu);
    The caller has already fetched the opcode and charged cyclesPerOpcode[opcode];
    this routine performs NO fetch and NO cycle/bus charge. */
 int snes_thumb2_try(Cpu* cpu, uint8_t opcode);
+/* Stage 2 fetch-dispatch entry. Fetches EXACTLY ONE opcode by calling the real
+   snes_cpuRead(mem, (k<<16)|pc), increments the 16-bit pc once, charges
+   cyclesUsed from snes_cycles_per_opcode, and runs the handler. Returns -1 if
+   handled, or the opcode byte (0..255) if unsupported — the caller then calls
+   cpu_doOpcode on that already-fetched byte with no second fetch or cycle charge. */
+int snes_thumb2_step(Cpu* cpu);
 #endif
 uint8_t cpu_getFlags(Cpu *cpu);
 void cpu_setFlags(Cpu *cpu, uint8_t val);

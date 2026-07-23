@@ -1,4 +1,4 @@
-@ Cortex-M7 Thumb-2 65816 engine -- Stage 1 semantic bridge.
+@ Cortex-M7 Thumb-2 65816 engine -- Stage 2 direct fetch/dispatch bridge.
 @
 @ snes_thumb2_try(Cpu *cpu, uint8_t opcode) -> int
 @   r0 = Cpu*, r1 = opcode
@@ -21,8 +21,7 @@
 @ is renamed via snes_redefines (cpu_runOpcode -> gsnes__cpu_runOpcode etc.),
 @ which is exactly what the C side is renamed to as well, so the BLX from the
 @ Thumb dispatcher to the assembly resolves at link. AAPCS-TPCS: caller-saved
-@ r0-r3 may be clobbered; callee-saved r4-r11 are preserved. We touch r4 only,
-@ pushed alongside lr.
+@ r0-r3 may be clobbered; callee-saved r4-r11 are preserved.
 
 #include "cpu_thumb2_offsets.h"
 
@@ -56,72 +55,189 @@
         ldrb    \r, [r4, #(\off)]
         .endm
 
-        .section .text.snes_thumb2_try,"ax",%progbits
+@ Dense O(1) opcode dispatch.  Table entries carry the Thumb bit because the
+@ local handler labels are not function symbols and therefore do not acquire
+@ it automatically.
+        .macro DISPATCH_ENTRY op
+        .if \op == 0x18
+        .word   .Lop18 + 1
+        .elseif \op == 0x38
+        .word   .Lop38 + 1
+        .elseif \op == 0x58
+        .word   .Lop58 + 1
+        .elseif \op == 0x78
+        .word   .Lop78 + 1
+        .elseif \op == 0xb8
+        .word   .Lopb8 + 1
+        .elseif \op == 0xd8
+        .word   .Lopd8 + 1
+        .elseif \op == 0xf8
+        .word   .Lopf8 + 1
+        .elseif \op == 0xea
+        .word   .Lopea + 1
+        .elseif \op == 0x9a
+        .word   .Lop9a + 1
+        .elseif \op == 0x1b
+        .word   .Lop1b + 1
+        .elseif \op == 0x5b
+        .word   .Lop5b + 1
+        .elseif \op == 0x7b
+        .word   .Lop7b + 1
+        .elseif \op == 0x3b
+        .word   .Lop3b + 1
+        .elseif \op == 0x8a
+        .word   .Lop8a + 1
+        .elseif \op == 0x98
+        .word   .Lop98 + 1
+        .elseif \op == 0xaa
+        .word   .Lopaa + 1
+        .elseif \op == 0xa8
+        .word   .Lopa8 + 1
+        .elseif \op == 0xba
+        .word   .Lopba + 1
+        .elseif \op == 0x9b
+        .word   .Lop9b + 1
+        .elseif \op == 0xbb
+        .word   .Lopbb + 1
+        .elseif \op == 0x1a
+        .word   .Lop1a + 1
+        .elseif \op == 0x3a
+        .word   .Lop3a + 1
+        .elseif \op == 0xe8
+        .word   .Lope8 + 1
+        .elseif \op == 0xca
+        .word   .Lopca + 1
+        .elseif \op == 0xc8
+        .word   .Lopc8 + 1
+        .elseif \op == 0x88
+        .word   .Lop88 + 1
+        .elseif \op == 0xeb
+        .word   .Lopeb + 1
+        .else
+        .word   .L_noteb + 1
+        .endif
+        .endm
+
+@ A named placement section lets the linker collect this engine into ITCM only
+@ when SNES_THUMB2_CPU=1 actually supplies the object as a link input.  Do not
+@ name the object explicitly in the linker script: that breaks clean flag-off
+@ links and can pull a stale flag-on object into an incremental flag-off build.
+        .section .itcm_snes_interp.thumb2,"ax",%progbits
         .align  2
         .global snes_thumb2_try
         .type   snes_thumb2_try,%function
         .thumb_func
 snes_thumb2_try:
-        push    {r4, lr}
+        push    {r4, r5, r6, lr}
         mov     r4, r0                  @ r4 = Cpu* (callee-saved across handlers)
+        movs    r5, #0                  @ return contract: try (1/0)
+        uxtb    r6, r1
+        b       .Ldispatch
+
+@ Full single-opcode entry used by cpu_runOpcode().  Keep the public C pre-work
+@ (stop/WAI/IRQ/NMI/RC) outside; this leaf owns exactly one opcode fetch, the
+@ 16-bit PC increment, base-cycle charge, and direct/fallback decision.
+        .global snes_thumb2_step
+        .type   snes_thumb2_step,%function
+        .thumb_func
+snes_thumb2_step:
+        push    {r4, r5, r6, lr}
+        mov     r4, r0
+        ldr     r0, [r4, #CPU_MEM]
+        ldrb    r1, [r4, #CPU_K]
+        ldrh    r2, [r4, #CPU_PC]
+        lsl     r1, r1, #16
+        orr     r1, r1, r2
+        adds    r3, r2, #1
+        strh    r3, [r4, #CPU_PC]       @ uint16_t wrap matches cpu->pc++
+        bl      snes_cpuRead
+        uxtb    r6, r0                  @ preserve opcode across dispatch
+        movw    r2, #:lower16:snes_cycles_per_opcode
+        movt    r2, #:upper16:snes_cycles_per_opcode
+        ldrb    r3, [r2, r6]
+        strb    r3, [r4, #CPU_CYCLESUSED]
+        movs    r5, #1                  @ return contract: step (-1/opcode)
+
+.Ldispatch:
+        adr     r2, .Ldispatch_table
+        ldr     r3, [r2, r6, lsl #2]
+        bx      r3
+
+        .align  2
+.Ldispatch_table:
+        .set    .Ldispatch_op, 0
+        .rept   256
+        DISPATCH_ENTRY .Ldispatch_op
+        .set    .Ldispatch_op, .Ldispatch_op + 1
+        .endr
 
         @ --- flag operations (no width dependence, no ZN update) ---
         cmp     r1, #0x18               @ CLC
         bne     .L_not18
+.Lop18:
         movs    r2, #0
         strb    r2, [r4, #CPU_C]
         b       .L_handled
 .L_not18:
         cmp     r1, #0x38               @ SEC
         bne     .L_not38
+.Lop38:
         movs    r2, #1
         strb    r2, [r4, #CPU_C]
         b       .L_handled
 .L_not38:
         cmp     r1, #0x58               @ CLI
         bne     .L_not58
+.Lop58:
         movs    r2, #0
         strb    r2, [r4, #CPU_I]
         b       .L_handled
 .L_not58:
         cmp     r1, #0x78               @ SEI
         bne     .L_not78
+.Lop78:
         movs    r2, #1
         strb    r2, [r4, #CPU_I]
         b       .L_handled
 .L_not78:
         cmp     r1, #0xb8               @ CLV
         bne     .L_notb8
+.Lopb8:
         movs    r2, #0
         strb    r2, [r4, #CPU_V]
         b       .L_handled
 .L_notb8:
         cmp     r1, #0xd8               @ CLD
         bne     .L_notd8
+.Lopd8:
         movs    r2, #0
         strb    r2, [r4, #CPU_D]
         b       .L_handled
 .L_notd8:
         cmp     r1, #0xf8               @ SED
         bne     .L_notf8
+.Lopf8:
         movs    r2, #1
         strb    r2, [r4, #CPU_D]
         b       .L_handled
 .L_notf8:
         cmp     r1, #0xea               @ NOP
         bne     .L_notea
+.Lopea:
         b       .L_handled
 .L_notea:
 
         @ --- transfers with no width masking, no ZN (TXS, TCS) ---
         cmp     r1, #0x9a               @ TXS: sp = x  (no ZN)
         bne     .L_not9a
+.Lop9a:
         ldrh    r2, [r4, #CPU_X]
         strh    r2, [r4, #CPU_SP]
         b       .L_handled
 .L_not9a:
         cmp     r1, #0x1b               @ TCS: sp = a  (no ZN, no e-mask here)
         bne     .L_not1b
+.Lop1b:
         ldrh    r2, [r4, #CPU_A]
         strh    r2, [r4, #CPU_SP]
         b       .L_handled
@@ -130,6 +246,7 @@ snes_thumb2_try:
         @ --- always-16-bit transfers (TCD, TDC, TSC): setZN(value, false) ---
         cmp     r1, #0x5b               @ TCD: dp = a ; ZN(a, word)
         bne     .L_not5b
+.Lop5b:
         ldrh    r2, [r4, #CPU_A]
         strh    r2, [r4, #CPU_DP]
         movs    r1, #0                  @ byte-mode = 0
@@ -138,6 +255,7 @@ snes_thumb2_try:
 .L_not5b:
         cmp     r1, #0x7b               @ TDC: a = dp ; ZN(dp, word)
         bne     .L_not7b
+.Lop7b:
         ldrh    r2, [r4, #CPU_DP]
         strh    r2, [r4, #CPU_A]
         movs    r1, #0
@@ -146,6 +264,7 @@ snes_thumb2_try:
 .L_not7b:
         cmp     r1, #0x3b               @ TSC: a = sp ; ZN(sp, word)
         bne     .L_not3b
+.Lop3b:
         ldrh    r2, [r4, #CPU_SP]
         strh    r2, [r4, #CPU_A]
         movs    r1, #0
@@ -157,6 +276,7 @@ snes_thumb2_try:
         @ TXA (0x8a): mf ? a=(a&ff00)|(x&ff) : a=x ; ZN(a, mf)
         cmp     r1, #0x8a
         bne     .L_not8a
+.Lop8a:
         LDB     r1, CPU_MF             @ r1 = mf (byte-mode for ZN)
         ldrh    r3, [r4, #CPU_A]        @ r3 = current A (need high byte if mf)
         ldrh    r2, [r4, #CPU_X]
@@ -180,6 +300,7 @@ snes_thumb2_try:
         @ TYA (0x98): mf ? a=(a&ff00)|(y&ff) : a=y ; ZN(a, mf)
         cmp     r1, #0x98
         bne     .L_not98
+.Lop98:
         LDB     r1, CPU_MF
         ldrh    r3, [r4, #CPU_A]
         ldrh    r2, [r4, #CPU_Y]
@@ -203,6 +324,7 @@ snes_thumb2_try:
         @ TAX (0xaa): xf ? x=a&ff : x=a ; ZN(x, xf)
         cmp     r1, #0xaa
         bne     .L_notaa
+.Lopaa:
         LDB     r1, CPU_XF
         ldrh    r2, [r4, #CPU_A]
         cmp     r1, #0
@@ -221,6 +343,7 @@ snes_thumb2_try:
         @ TAY (0xa8): xf ? y=a&ff : y=a ; ZN(y, xf)
         cmp     r1, #0xa8
         bne     .L_nota8
+.Lopa8:
         LDB     r1, CPU_XF
         ldrh    r2, [r4, #CPU_A]
         cmp     r1, #0
@@ -239,6 +362,7 @@ snes_thumb2_try:
         @ TSX (0xba): xf ? x=sp&ff : x=sp ; ZN(x, xf)
         cmp     r1, #0xba
         bne     .L_notba
+.Lopba:
         LDB     r1, CPU_XF
         ldrh    r2, [r4, #CPU_SP]
         cmp     r1, #0
@@ -257,6 +381,7 @@ snes_thumb2_try:
         @ TXY (0x9b): xf ? y=x&ff : y=x ; ZN(y, xf)
         cmp     r1, #0x9b
         bne     .L_not9b
+.Lop9b:
         LDB     r1, CPU_XF
         ldrh    r2, [r4, #CPU_X]
         cmp     r1, #0
@@ -275,6 +400,7 @@ snes_thumb2_try:
         @ TYX (0xbb): xf ? x=y&ff : x=y ; ZN(x, xf)
         cmp     r1, #0xbb
         bne     .L_notbb
+.Lopbb:
         LDB     r1, CPU_XF
         ldrh    r2, [r4, #CPU_Y]
         cmp     r1, #0
@@ -294,6 +420,7 @@ snes_thumb2_try:
         @ INA (0x1a): mf ? a=(a&ff00)|((a+1)&ff) : a++ ; ZN(a, mf)
         cmp     r1, #0x1a
         bne     .L_not1a
+.Lop1a:
         LDB     r1, CPU_MF
         ldrh    r3, [r4, #CPU_A]
         cmp     r1, #0
@@ -321,6 +448,7 @@ snes_thumb2_try:
         @ DEA (0x3a): mf ? a=(a&ff00)|((a-1)&ff) : a-- ; ZN(a, mf)
         cmp     r1, #0x3a
         bne     .L_not3a
+.Lop3a:
         LDB     r1, CPU_MF
         ldrh    r3, [r4, #CPU_A]
         cmp     r1, #0
@@ -349,6 +477,7 @@ snes_thumb2_try:
         @ INX (0xe8): xf ? x=(x+1)&ff : x++ ; ZN(x, xf)
         cmp     r1, #0xe8
         bne     .L_note8
+.Lope8:
         LDB     r1, CPU_XF
         ldrh    r2, [r4, #CPU_X]
         cmp     r1, #0
@@ -370,6 +499,7 @@ snes_thumb2_try:
         @ DEX (0xca): xf ? x=(x-1)&ff : x-- ; ZN(x, xf)
         cmp     r1, #0xca
         bne     .L_notca
+.Lopca:
         LDB     r1, CPU_XF
         ldrh    r2, [r4, #CPU_X]
         cmp     r1, #0
@@ -391,6 +521,7 @@ snes_thumb2_try:
         @ INY (0xc8): xf ? y=(y+1)&ff : y++ ; ZN(y, xf)
         cmp     r1, #0xc8
         bne     .L_notc8
+.Lopc8:
         LDB     r1, CPU_XF
         ldrh    r2, [r4, #CPU_Y]
         cmp     r1, #0
@@ -412,6 +543,7 @@ snes_thumb2_try:
         @ DEY (0x88): xf ? y=(y-1)&ff : y-- ; ZN(y, xf)
         cmp     r1, #0x88
         bne     .L_not88
+.Lop88:
         LDB     r1, CPU_XF
         ldrh    r2, [r4, #CPU_Y]
         cmp     r1, #0
@@ -435,6 +567,7 @@ snes_thumb2_try:
         @    i.e. n/z reflect the NEW low byte (which is the old high byte).
         cmp     r1, #0xeb
         bne     .L_noteb
+.Lopeb:
         ldrh    r2, [r4, #CPU_A]       @ r2 = old a, e.g. 0x0000AABB
         rev16   r2, r2                 @ swap bytes in halfword: 0x0000BBAA
         uxth    r2, r2                 @ new a = 0xBBAA (old low promoted to high)
@@ -446,14 +579,22 @@ snes_thumb2_try:
         b       .L_handled
 .L_noteb:
 
-        @ --- unsupported: leave *cpu untouched, return 0 ---
-        movs    r0, #0
-        pop     {r4, pc}
+        @ --- unsupported: try returns 0; step returns fetched opcode ---
+        cmp     r5, #0
+        ite     eq
+        moveq   r0, #0
+        movne   r0, r6
+        pop     {r4, r5, r6, pc}
 
 .L_handled:
-        movs    r0, #1
-        pop     {r4, pc}
+        @ try returns 1; step returns -1.
+        cmp     r5, #0
+        ite     eq
+        moveq   r0, #1
+        movne   r0, #-1
+        pop     {r4, r5, r6, pc}
         .size   snes_thumb2_try, .-snes_thumb2_try
+        .size   snes_thumb2_step, .-snes_thumb2_step
 
 @ Keep the Stage 0 probe: it is still a build-path smoke test (offset header
 @ resolves inside assembly; the .S rule + snes_redefines pass produces a Thumb
