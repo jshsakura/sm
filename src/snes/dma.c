@@ -187,10 +187,6 @@ void dma_write(Dma* dma, uint16_t adr, uint8_t val) {
 extern bool g_fail;
 
 void dma_doDma(Dma* dma) {
-  if(dma->dmaTimer > 0) {
-    dma->dmaTimer -= 2;
-    return;
-  }
   // figure out first channel that is active
   int i = 0;
   for(i = 0; i < 8; i++) {
@@ -201,30 +197,65 @@ void dma_doDma(Dma* dma) {
   if(i == 8) {
     // no active channels
     dma->dmaBusy = false;
+    dma->dmaTimer = 0;
     return;
   }
 
-  if (!dma->channel[i].fromB && (dma->channel[i].aBank & 0x80) && !(dma->channel[i].aAdr & 0x8000) && !g_fail) {
-    printf("Warning! DMA from addr 0x%x\n", dma->channel[i].aBank << 16 | dma->channel[i].aAdr);
+  DmaChannel* ch = &dma->channel[i];
+
+  if (!ch->fromB && (ch->aBank & 0x80) && !(ch->aAdr & 0x8000) && !g_fail) {
+    printf("Warning! DMA from addr 0x%x\n", ch->aBank << 16 | ch->aAdr);
     g_fail = true;
   }
 
-  // do channel i
-  dma_transferByte(
-    dma, dma->channel[i].aAdr, dma->channel[i].aBank,
-    dma->channel[i].bAdr + bAdrOffsets[dma->channel[i].mode][dma->channel[i].offIndex++], dma->channel[i].fromB
-  );
-  dma->channel[i].offIndex &= 3;
-  dma->dmaTimer += 6; // 8 cycles for each byte taken, -2 for this cycle
-  if(!dma->channel[i].fixed) {
-    dma->channel[i].aAdr += dma->channel[i].decrement ? -1 : 1;
+  if (ch->fromB) {
+    /* B->A: the transfer writes the A-bus through snes_write(), which can
+     * decode a mirrored $420B and RE-ENTER dma_startDma (the emulator does not
+     * block that A-bus target -- see dma_transferByte's TODO). Keep the exact
+     * original one-byte-per-call form here so a re-entrant DMA re-reads channel
+     * state from the struct between bytes, byte-for-byte as before. This
+     * direction (reading PPU/APU back into RAM) is rare; the hot path is A->B. */
+    dma_transferByte(
+      dma, ch->aAdr, ch->aBank,
+      ch->bAdr + bAdrOffsets[ch->mode][ch->offIndex++], true);
+    ch->offIndex &= 3;
+    if(!ch->fixed) ch->aAdr += ch->decrement ? -1 : 1;
+    ch->size--;
+    if(ch->size == 0) { ch->offIndex = 0; ch->dmaActive = false; }
+    return;
   }
-  dma->channel[i].size--;
-  if(dma->channel[i].size == 0) {
-    dma->channel[i].offIndex = 0; // reset offset index
-    dma->channel[i].dmaActive = false;
-    dma->dmaTimer += 8; // 8 cycle overhead per channel
-  }
+
+  /* A->B (the common VRAM/CGRAM/OAM upload): every write goes to the B-bus
+   * (snes_writeBBus, $2100-$21ff) and can never reach $420B, so there is NO
+   * re-entrancy, and nothing observes the intermediate per-byte channel state
+   * -- the CPU is stalled inside $420B's synchronous `while (dma_cycle(...)) {}`,
+   * the only caller that drives a general DMA (dma_cycle's other callers in
+   * main_snes.c's event loop only run when dmaBusy, which $420B always drains to
+   * false before returning; dmaBusy/dmaTimer are referenced nowhere outside
+   * dma.c and never feed the scanline scheduler). So drain the whole channel in
+   * one call with identical per-byte address math. Host CPU only: a 32 KB VRAM
+   * upload drops from ~40*N inner iterations (per-byte timer walk + an 8-way
+   * active-channel rescan every byte) to N transfers. The dma_transferByte
+   * sequence is byte-identical to the old loop (standalone equivalence test). */
+  const int* off = bAdrOffsets[ch->mode];
+  uint16_t aAdr = ch->aAdr;
+  const uint8_t aBank = ch->aBank;
+  const uint8_t bAdr = ch->bAdr;
+  const int step = ch->fixed ? 0 : (ch->decrement ? -1 : 1);
+  unsigned oi = ch->offIndex;
+  uint16_t size = ch->size;   // 0 means 0x10000, matching the old size-- wrap
+
+  do {
+    dma_transferByte(dma, aAdr, aBank, bAdr + off[oi & 3], false);
+    oi++;
+    aAdr += step;
+    size--;
+  } while(size != 0);
+
+  ch->offIndex = 0; // reset offset index
+  ch->aAdr = aAdr;
+  ch->size = 0;
+  ch->dmaActive = false;
 }
 
 void dma_initHdma(Dma* dma) {
