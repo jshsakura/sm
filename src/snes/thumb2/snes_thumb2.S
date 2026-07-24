@@ -17,6 +17,8 @@
 @   relative branches (one operand byte at pc, taken-cycle per cpu_doBranch):
 @              BPL BMI BVC BVS BRA BCC BCS BNE BEQ
 @   immediate ALU/load: ORA AND EOR LDY LDX LDA
+@              ADC SBC CMP CPX CPY BIT #imm (ADC/SBC binary only -- decimal
+@              D-flag path bails to C before operand fetch; BIT #imm is Z-only)
 @   status masks: REP SEP
 @   direct page (bank 0x00, 16-bit wrap, dp&0xff cycle): LDA LDX LDY dp,
 @              AND ORA EOR dp, CMP dp, STA STX STY STZ dp, ADC/SBC dp (binary
@@ -562,6 +564,19 @@
         .word   .Lopa2 + 1
         .elseif \op == 0xa9
         .word   .Lopa9 + 1
+@ --- Stage 3I: immediate ALU family (ADC/SBC/CMP/CPX/CPY/BIT #imm) ---
+        .elseif \op == 0x69
+        .word   .Lop69 + 1
+        .elseif \op == 0x89
+        .word   .Lop89 + 1
+        .elseif \op == 0xc0
+        .word   .Lopc0 + 1
+        .elseif \op == 0xc9
+        .word   .Lopc9 + 1
+        .elseif \op == 0xe0
+        .word   .Lope0 + 1
+        .elseif \op == 0xe9
+        .word   .Lope9 + 1
         .elseif \op == 0xc2
         .word   .Lopc2 + 1
         .elseif \op == 0xe2
@@ -1427,6 +1442,43 @@ snes_thumb2_step:
 .Lopa2:                                 @ LDX #imm(x)
         ldrb    r0, [r4, #CPU_XF]
         orr     r6, r6, r0, lsl #8
+        b       .Limm_common
+
+.Lop69:                                 @ ADC #imm(m)  -- decimal bail before fetch
+        ldrb    r0, [r4, #CPU_D]
+        cmp     r0, #0
+        bne     .L_noteb
+        ldrb    r0, [r4, #CPU_MF]
+        orr     r6, r6, r0, lsl #8
+        b       .Limm_common
+
+.Lope9:                                 @ SBC #imm(m)  -- decimal bail before fetch
+        ldrb    r0, [r4, #CPU_D]
+        cmp     r0, #0
+        bne     .L_noteb
+        ldrb    r0, [r4, #CPU_MF]
+        orr     r6, r6, r0, lsl #8
+        b       .Limm_common
+
+.Lopc9:                                 @ CMP #imm(m)
+        ldrb    r0, [r4, #CPU_MF]
+        orr     r6, r6, r0, lsl #8
+        b       .Limm_common
+
+.Lope0:                                 @ CPX #imm(x)
+        ldrb    r0, [r4, #CPU_XF]
+        orr     r6, r6, r0, lsl #8
+        b       .Limm_common
+
+.Lopc0:                                 @ CPY #imm(x)
+        ldrb    r0, [r4, #CPU_XF]
+        orr     r6, r6, r0, lsl #8
+        b       .Limm_common
+
+.Lop89:                                 @ BIT #imm(m)  -- Z-ONLY quirk
+        ldrb    r0, [r4, #CPU_MF]
+        orr     r6, r6, r0, lsl #8
+        b       .Limm_common
 
 .Limm_common:
         IMM_FETCH_BYTE                  @ low operand
@@ -1456,6 +1508,18 @@ snes_thumb2_step:
         beq     .Limm_ldx
         cmp     r0, #0x09
         beq     .Limm_ora
+        cmp     r0, #0x69
+        beq     .Limm_adc
+        cmp     r0, #0xe9
+        beq     .Limm_sbc
+        cmp     r0, #0xc9
+        beq     .Limm_cmp
+        cmp     r0, #0xe0
+        beq     .Limm_cpx
+        cmp     r0, #0xc0
+        beq     .Limm_cpy
+        cmp     r0, #0x89
+        beq     .Limm_bit
         @ only remaining shared entry is EOR # (0x49)
         ldrh    r3, [r4, #CPU_A]
         eor     r0, r3, r2
@@ -1494,6 +1558,195 @@ snes_thumb2_step:
 .Limm_ldy:
         strh    r2, [r4, #CPU_Y]
         SETZN
+        b       .L_handled
+
+@ --- immediate ALU family (Stage 3I): CMP/CPX/CPY/ADC/SBC/BIT #imm ---
+@ Mirrors the dp templates (.Lopc5/.Lope4/.Lopc4/.Lop65/.Lope5) but r2=value
+@ and r1=byte-mode are already extracted by .Limm_common.  r6 is dead here.
+.Limm_cmp:
+        cbz     r1, .Limm_cmp_w
+        @ byte: result = (a&0xff) + (value^0xff) + 1
+        ldrh    r3, [r4, #CPU_A]
+        uxtb    r3, r3
+        mvn     r2, r2
+        uxtb    r2, r2
+        add     r2, r3, r2
+        adds    r2, r2, #1
+        lsr     r3, r2, #8              @ c = result > 0xff
+        strb    r3, [r4, #CPU_C]
+        uxtb    r2, r2
+        movs    r1, #1
+        SETZN
+        b       .L_handled
+.Limm_cmp_w:
+        ldrh    r3, [r4, #CPU_A]
+        mvn     r2, r2
+        uxth    r2, r2
+        add     r2, r3, r2
+        adds    r2, r2, #1
+        lsr     r3, r2, #16             @ c = result > 0xffff
+        strb    r3, [r4, #CPU_C]
+        uxth    r2, r2
+        movs    r1, #0
+        SETZN
+        b       .L_handled
+
+.Limm_cpx:
+        cbz     r1, .Limm_cpx_w
+        ldrh    r3, [r4, #CPU_X]
+        uxtb    r3, r3
+        mvn     r2, r2
+        uxtb    r2, r2
+        add     r2, r3, r2
+        adds    r2, r2, #1
+        lsr     r3, r2, #8
+        strb    r3, [r4, #CPU_C]
+        uxtb    r2, r2
+        movs    r1, #1
+        SETZN
+        b       .L_handled
+.Limm_cpx_w:
+        ldrh    r3, [r4, #CPU_X]
+        mvn     r2, r2
+        uxth    r2, r2
+        add     r2, r3, r2
+        adds    r2, r2, #1
+        lsr     r3, r2, #16
+        strb    r3, [r4, #CPU_C]
+        uxth    r2, r2
+        movs    r1, #0
+        SETZN
+        b       .L_handled
+
+.Limm_cpy:
+        cbz     r1, .Limm_cpy_w
+        ldrh    r3, [r4, #CPU_Y]
+        uxtb    r3, r3
+        mvn     r2, r2
+        uxtb    r2, r2
+        add     r2, r3, r2
+        adds    r2, r2, #1
+        lsr     r3, r2, #8
+        strb    r3, [r4, #CPU_C]
+        uxtb    r2, r2
+        movs    r1, #1
+        SETZN
+        b       .L_handled
+.Limm_cpy_w:
+        ldrh    r3, [r4, #CPU_Y]
+        mvn     r2, r2
+        uxth    r2, r2
+        add     r2, r3, r2
+        adds    r2, r2, #1
+        lsr     r3, r2, #16
+        strb    r3, [r4, #CPU_C]
+        uxth    r2, r2
+        movs    r1, #0
+        SETZN
+        b       .L_handled
+
+.Limm_adc:
+        cbz     r1, .Limm_adc_w
+        @ byte: r2=value; result=(a&0xff)+value+c; V=((value^result)&~(a^value))>>7
+        ldrh    r3, [r4, #CPU_A]
+        ldrb    r1, [r4, #CPU_C]
+        mov     r6, r2                  @ preserve value for V XOR
+        uxtb    r0, r3                  @ a & 0xff
+        add     r2, r0, r6              @ (a&0xff) + value
+        add     r2, r2, r1              @ + c
+        lsr     r1, r2, #8              @ c = result > 0xff
+        strb    r1, [r4, #CPU_C]
+        eor     r0, r3, r6              @ a ^ value
+        eor     r1, r6, r2              @ value ^ result
+        bic     r0, r1, r0              @ (value^result) & ~(a^value)
+        ubfx    r0, r0, #7, #1          @ V = bit7
+        strb    r0, [r4, #CPU_V]
+        bfi     r3, r2, #0, #8          @ a = (a&0xff00)|(result&0xff)
+        strh    r3, [r4, #CPU_A]
+        uxtb    r2, r3
+        movs    r1, #1
+        SETZN
+        b       .L_handled
+.Limm_adc_w:
+        ldrh    r3, [r4, #CPU_A]
+        ldrb    r1, [r4, #CPU_C]
+        mov     r0, r2                  @ preserve value
+        add     r2, r3, r0              @ a + value
+        add     r2, r2, r1              @ + c
+        lsr     r1, r2, #16             @ c = result > 0xffff
+        strb    r1, [r4, #CPU_C]
+        eor     r3, r3, r0              @ a ^ value
+        eor     r1, r0, r2              @ value ^ result
+        bic     r0, r1, r3              @ (value^result) & ~(a^value)
+        ubfx    r0, r0, #15, #1         @ V = bit15
+        strb    r0, [r4, #CPU_V]
+        strh    r2, [r4, #CPU_A]
+        uxth    r2, r2
+        movs    r1, #0
+        SETZN
+        b       .L_handled
+
+.Limm_sbc:
+        cbz     r1, .Limm_sbc_w
+        @ byte: complement value first
+        eor     r2, r2, #0xff
+        ldrh    r3, [r4, #CPU_A]
+        ldrb    r1, [r4, #CPU_C]
+        mov     r6, r2                  @ preserve complemented value
+        uxtb    r0, r3
+        add     r2, r0, r6
+        add     r2, r2, r1
+        lsr     r1, r2, #8
+        strb    r1, [r4, #CPU_C]
+        eor     r0, r3, r6
+        eor     r1, r6, r2
+        bic     r0, r1, r0
+        ubfx    r0, r0, #7, #1
+        strb    r0, [r4, #CPU_V]
+        bfi     r3, r2, #0, #8
+        strh    r3, [r4, #CPU_A]
+        uxtb    r2, r3
+        movs    r1, #1
+        SETZN
+        b       .L_handled
+.Limm_sbc_w:
+        @ word: complement value first
+        mvn     r2, r2
+        uxth    r2, r2
+        ldrh    r3, [r4, #CPU_A]
+        ldrb    r1, [r4, #CPU_C]
+        mov     r0, r2
+        add     r2, r3, r0
+        add     r2, r2, r1
+        lsr     r1, r2, #16
+        strb    r1, [r4, #CPU_C]
+        eor     r3, r3, r0
+        eor     r1, r0, r2
+        bic     r0, r1, r3
+        ubfx    r0, r0, #15, #1
+        strb    r0, [r4, #CPU_V]
+        strh    r2, [r4, #CPU_A]
+        uxth    r2, r2
+        movs    r1, #0
+        SETZN
+        b       .L_handled
+
+.Limm_bit:
+        cbz     r1, .Limm_bit_w
+        @ byte: z = ((a&0xff) & value) == 0
+        ldrh    r3, [r4, #CPU_A]
+        uxtb    r3, r3
+        tst     r3, r2
+        b       .Limm_bit_z
+.Limm_bit_w:
+        @ word: z = (a & value) == 0
+        ldrh    r3, [r4, #CPU_A]
+        tst     r3, r2
+.Limm_bit_z:
+        mov     r0, #0
+        it      eq
+        moveq   r0, #1                  @ z=1 if AND result was zero
+        strb    r0, [r4, #CPU_Z]
         b       .L_handled
 
 @ REP/SEP update only mask-selected status fields, then reproduce every
