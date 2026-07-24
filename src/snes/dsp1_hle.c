@@ -174,7 +174,11 @@ static void cmd_inverse(Dsp1* d) {
   int16_t a = d->in[0];
   int16_t e = d->in[1];
   if (a == 0) { d->out[0] = 0x7fff; d->out[1] = 0x7fff; return; }
-  double v = (double)a / 32768.0 * pow(2.0, (double)e);
+  /* base is always exactly 2 with an integer exponent -- scalbn (direct
+   * exponent manipulation) is exact and avoids pulling the generic pow()
+   * (which pulls exp()/log()/log10()/fmod() with it: several KB nothing else
+   * in this command needs). */
+  double v = scalbn((double)a / 32768.0, e);
   double inv = 1.0 / v;
   int oe = 0;
   double m = fabs(inv);
@@ -262,8 +266,10 @@ static void execute(Dsp1* d) {
       break;
   }
   d->unknownCmds++;
+#ifndef TARGET_GNW
   if (d->unknownCmds <= 8)
     fprintf(stderr, "[dsp1] UNKNOWN command %02x\n", c);
+#endif
   d->out[0] = 0;
 }
 
@@ -300,7 +306,7 @@ static void io_shape(uint8_t cmd, uint8_t* inW, uint8_t* outW) {
 /* ---- transfer state machine --------------------------------------------- */
 
 static void start_command(Dsp1* d, uint8_t val) {
-#ifndef NDEBUG_DSP1_TRACE
+#if !defined(NDEBUG_DSP1_TRACE) && !defined(TARGET_GNW)
   static uint64_t seen;            /* one line per distinct opcode bucket, diagnostics */
   if (!(seen & (1ull << (val & 0x3f)))) {
     seen |= 1ull << (val & 0x3f);
@@ -319,13 +325,21 @@ static void start_command(Dsp1* d, uint8_t val) {
   }
 }
 
-/* byte-level wire trace for bring-up: DSP1_TRACE=1 in the environment */
+/* byte-level wire trace for bring-up: DSP1_TRACE=1 in the environment.
+ * Host-only: getenv() has nothing to read on-device (no environment), so this
+ * is compiled out under TARGET_GNW rather than left to always resolve false --
+ * it was the sole caller of getenv() in the whole firmware, pulling in real
+ * newlib reentrant-environ support for a check that can never do anything. */
+#ifndef TARGET_GNW
 #include <stdlib.h>
 static int trace_on(void) {
   static int t = -1;
   if (t < 0) t = getenv("DSP1_TRACE") ? 1 : 0;
   return t;
 }
+#else
+static int trace_on(void) { return 0; }
+#endif
 
 void dsp1_writeDR(Dsp1* d, uint8_t val) {
   if (trace_on()) fprintf(stderr, "W %02x s%d i%d c%02x\n", val, d->state, d->byteIdx, d->cmd);
