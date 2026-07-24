@@ -103,6 +103,28 @@ static void cpu_write(Cpu* cpu, uint32_t adr, uint8_t val) {
 }
 #endif
 
+/* Stage 3D -- non-static data-access bridges for the Thumb-2 direct-page
+ * handlers (snes_thumb2.S). These are byte-identical to the static cpu_read /
+ * cpu_write above: same spin-skip hooks (when SNES_SPIN_SKIP), same raw bus
+ * call. They exist only so the assembly can BL a data read/write that takes the
+ * hooked path -- operand fetches stay raw (snes_cpuRead via the engine's
+ * IMM_FETCH_BYTE), exactly as cpu_adrDp uses cpu_readOpcode (cpu_read_raw).
+ * Non-static + unreferenced from C: the BL from .S resolves the symbol at link;
+ * -Wunused-function does not fire for extern linkage. */
+uint8_t cpu_thumb2_read(Cpu* cpu, uint32_t adr) {
+#ifdef SNES_SPIN_SKIP
+  if(g_spin.phase) spin_hook_read(cpu, adr);
+#endif
+  return snes_cpuRead((Snes*) cpu->mem, adr);
+}
+
+void cpu_thumb2_write(Cpu* cpu, uint32_t adr, uint8_t val) {
+#ifdef SNES_SPIN_SKIP
+  if(g_spin.phase) spin_hook_write();
+#endif
+  snes_cpuWrite((Snes*) cpu->mem, adr, val);
+}
+
 Cpu* cpu_init(void* mem, int memType) {
   Cpu* cpu = malloc(sizeof(Cpu));
   memset(cpu, 0, sizeof(Cpu));

@@ -18,6 +18,9 @@
 @              BPL BMI BVC BVS BRA BCC BCS BNE BEQ
 @   immediate ALU/load: ORA AND EOR LDY LDX LDA
 @   status masks: REP SEP
+@   direct page (bank 0x00, 16-bit wrap, dp&0xff cycle): LDA LDX LDY dp,
+@              AND ORA EOR dp, CMP dp, STA STX STY STZ dp, ADC/SBC dp (binary
+@              only -- decimal D-flag path bails to C before operand fetch).
 @ Every width-sensitive opcode honours the M/X/E flags exactly as cpu_doOpcode
 @ does. Unsupported opcodes return 0 and leave *cpu untouched, so the C
 @ dispatcher falls through to cpu_doOpcode(cpu, opcode) on the fetched byte.
@@ -77,6 +80,61 @@
         strh    r3, [r4, #CPU_PC]       @ uint16 PC wrap; K never carries
         bl      snes_cpuRead
         uxtb    r0, r0
+        .endm
+
+@ --- Stage 3D direct-page helpers.  Like IMM_FETCH_BYTE these are macros, not
+@ subroutines: each contains a BL, and a BL-called helper would lose its own
+@ return address (the outer entry already saved the caller LR).  r6 carries the
+@ only live state across the C calls (AAPCS callee-saved). ---
+
+@ DP_ADDR: fetch the DP offset operand (RAW -- matches cpu_adrDp's
+@ cpu_readOpcode = cpu_read_raw, NO spin hook), compute r6 = addr_low =
+@ (dp + offset) & 0xffff.  Direct page is ALWAYS bank 0x00 with 16-bit wrap
+@ (it does NOT use db), matching cpu_adrDp.  Charges +1 cycle when (dp & 0xff)
+@ != 0.  Clobbers r0,r1,r2,r3; leaves r6 = addr_low.
+        .macro DP_ADDR
+        IMM_FETCH_BYTE                  @ r0 = offset byte; pc++ (uint16 wrap)
+        ldrh    r2, [r4, #CPU_DP]
+        add     r6, r2, r0              @ dp + offset (may carry into bit 16)
+        uxth    r6, r6                  @ addr_low = (dp+offset) & 0xffff, bank 0
+        ldrb    r2, [r4, #CPU_DP]       @ dp low byte (little-endian field base)
+        lsls    r2, r2, #24             @ Z set iff dp low byte == 0
+        beq     82f                     @ dp & 0xff == 0: no extra cycle
+        ldrb    r2, [r4, #CPU_CYCLESUSED]
+        adds    r2, r2, #1
+        strb    r2, [r4, #CPU_CYCLESUSED]
+82:
+        .endm
+
+@ DP_READ_VALUE wid: given r6 = addr_low, read the data operand into r2 (byte:
+@ 0..0xff, word: 0..0xffff) honouring the \wid flag (CPU_MF or CPU_XF).  Word
+@ mode charges +1 cycle and reads low@addr_low then high@addr_high where
+@ addr_high = (addr_low + 1) & 0xffff -- the high address is derived into r1
+@ (the arg register) just before r6 is reused to carry the low byte, so no
+@ second callee-saved register is needed.  r6 holds the low byte in word mode
+@ (addr_low is spent by then).  Clobbers r0,r1,r3 (and r6 in word mode).
+        .macro DP_READ_VALUE wid
+        ldrb    r1, [r4, #\wid]
+        cbz     r1, .Ldprw_\@
+        mov     r0, r4
+        mov     r1, r6
+        bl      cpu_thumb2_read
+        uxtb    r2, r0                  @ byte value
+        b       .Ldprd_\@
+.Ldprw_\@:
+        ldrb    r0, [r4, #CPU_CYCLESUSED]
+        adds    r0, r0, #1
+        strb    r0, [r4, #CPU_CYCLESUSED]
+        mov     r0, r4
+        mov     r1, r6                  @ addr_low
+        bl      cpu_thumb2_read         @ r0 = low byte; r6 still addr_low (callee-saved)
+        add     r1, r6, #1
+        uxth    r1, r1                  @ r1 = addr_high (formed before r6 is reused)
+        mov     r6, r0                  @ r6 = low byte (addr_low no longer needed)
+        mov     r0, r4                  @ r1 still holds addr_high -> arg
+        bl      cpu_thumb2_read         @ r0 = high byte
+        orr     r2, r6, r0, lsl #8      @ word value (low | high<<8)
+.Ldprd_\@:
         .endm
 
 @ Dense O(1) opcode dispatch.  Table entries carry the Thumb bit because the
@@ -179,6 +237,32 @@
         .word   .Lopc2 + 1
         .elseif \op == 0xe2
         .word   .Lope2 + 1
+        .elseif \op == 0x05
+        .word   .Lop05 + 1
+        .elseif \op == 0x25
+        .word   .Lop25 + 1
+        .elseif \op == 0x45
+        .word   .Lop45 + 1
+        .elseif \op == 0x85
+        .word   .Lop85 + 1
+        .elseif \op == 0xa4
+        .word   .Lopa4 + 1
+        .elseif \op == 0xa5
+        .word   .Lopa5 + 1
+        .elseif \op == 0xa6
+        .word   .Lopa6 + 1
+        .elseif \op == 0xc5
+        .word   .Lopc5 + 1
+        .elseif \op == 0x64
+        .word   .Lop64 + 1
+        .elseif \op == 0x84
+        .word   .Lop84 + 1
+        .elseif \op == 0x86
+        .word   .Lop86 + 1
+        .elseif \op == 0x65
+        .word   .Lop65 + 1
+        .elseif \op == 0xe5
+        .word   .Lope5 + 1
         .else
         .word   .L_noteb + 1
         .endif
@@ -952,6 +1036,7 @@ snes_thumb2_step:
         adds    r0, r0, #1
         strb    r0, [r4, #CPU_CYCLESUSED]
         b       .L_handled
+
 .L_noteb:
 
         @ --- unsupported: try returns 0; step returns fetched opcode ---
@@ -968,6 +1053,373 @@ snes_thumb2_step:
         moveq   r0, #1
         movne   r0, #-1
         pop     {r4, r5, r6, pc}
+
+@ ===========================================================================
+@ Stage 3D -- direct-page opcodes (bank 0x00, 16-bit wrap, dp&0xff cycle).
+@ Read/load/ALU opcodes inline the data read via the cpu_thumb2_read bridge
+@ (spin-hook path); store opcodes inline the write via cpu_thumb2_write (gate 1:
+@ every write takes the hooked path).  ADC/SBC (0x65/0xe5) inline only the
+@ BINARY path; the decimal (D-flag) path bails to .L_noteb before any operand
+@ fetch so C handles it -- operand fetch happens in the C fallback, pc stays
+@ correct.  V flag uses the identity  V = ((~(a^value)) & (value^result)) & sign
+@ which is provably equal to the C form (a&sign)==(value&sign) && sign differs.
+@ ===========================================================================
+
+.Lopa5:                                 @ LDA dp
+        DP_ADDR
+        DP_READ_VALUE CPU_MF
+        ldrb    r1, [r4, #CPU_MF]
+        cbz     r1, .Llda_dp_w
+        ldrh    r3, [r4, #CPU_A]
+        bfi     r3, r2, #0, #8          @ a = (a & 0xff00) | value
+        strh    r3, [r4, #CPU_A]
+        uxtb    r2, r3                  @ SETZN value = a & 0xff
+        movs    r1, #1                  @ byte mode
+        SETZN
+        b       .L_handled
+.Llda_dp_w:
+        strh    r2, [r4, #CPU_A]        @ a = value (word)
+        movs    r1, #0                  @ word mode
+        SETZN
+        b       .L_handled
+
+.Lop25:                                 @ AND dp
+        DP_ADDR
+        DP_READ_VALUE CPU_MF
+        ldrb    r1, [r4, #CPU_MF]
+        cbz     r1, .Land_dp_w
+        ldrh    r3, [r4, #CPU_A]
+        and     r2, r3, r2              @ a & value (already <= 0xff: value is a byte)
+        bfi     r3, r2, #0, #8          @ a = (a & 0xff00) | (a & value)
+        strh    r3, [r4, #CPU_A]
+        uxtb    r2, r2                  @ SETZN value = (a & value) & 0xff
+        movs    r1, #1
+        SETZN
+        b       .L_handled
+.Land_dp_w:
+        ldrh    r3, [r4, #CPU_A]
+        and     r2, r3, r2              @ a & value (word)
+        strh    r2, [r4, #CPU_A]
+        movs    r1, #0
+        SETZN
+        b       .L_handled
+
+.Lop05:                                 @ ORA dp
+        DP_ADDR
+        DP_READ_VALUE CPU_MF
+        ldrb    r1, [r4, #CPU_MF]
+        cbz     r1, .Lora_dp_w
+        ldrh    r3, [r4, #CPU_A]
+        orr     r2, r3, r2              @ a | value (low byte; value is a byte)
+        bfi     r3, r2, #0, #8          @ a = (a & 0xff00) | (a | value)
+        strh    r3, [r4, #CPU_A]
+        uxtb    r2, r2
+        movs    r1, #1
+        SETZN
+        b       .L_handled
+.Lora_dp_w:
+        ldrh    r3, [r4, #CPU_A]
+        orr     r2, r3, r2
+        strh    r2, [r4, #CPU_A]
+        movs    r1, #0
+        SETZN
+        b       .L_handled
+
+.Lop45:                                 @ EOR dp
+        DP_ADDR
+        DP_READ_VALUE CPU_MF
+        ldrb    r1, [r4, #CPU_MF]
+        cbz     r1, .Leor_dp_w
+        ldrh    r3, [r4, #CPU_A]
+        eor     r2, r3, r2              @ a ^ value (low byte)
+        bfi     r3, r2, #0, #8          @ a = (a & 0xff00) | (a ^ value)
+        strh    r3, [r4, #CPU_A]
+        uxtb    r2, r2
+        movs    r1, #1
+        SETZN
+        b       .L_handled
+.Leor_dp_w:
+        ldrh    r3, [r4, #CPU_A]
+        eor     r2, r3, r2
+        strh    r2, [r4, #CPU_A]
+        movs    r1, #0
+        SETZN
+        b       .L_handled
+
+.Lopc5:                                 @ CMP dp  (sets C/Z/N; A unchanged)
+        DP_ADDR
+        DP_READ_VALUE CPU_MF
+        ldrb    r1, [r4, #CPU_MF]
+        cbz     r1, .Lcmp_dp_w
+        ldrh    r3, [r4, #CPU_A]
+        uxtb    r3, r3                  @ a & 0xff
+        mvn     r2, r2                  @ value ^ 0xff (low byte)
+        uxtb    r2, r2
+        add     r2, r3, r2              @ (a&0xff) + (value^0xff)
+        adds    r2, r2, #1             @ +1 -> result (0..0x1ff)
+        lsr     r3, r2, #8             @ c = result > 0xff (result>>8 is 0/1)
+        strb    r3, [r4, #CPU_C]
+        uxtb    r2, r2                  @ SETZN value = result & 0xff
+        movs    r1, #1
+        SETZN
+        b       .L_handled
+.Lcmp_dp_w:
+        ldrh    r3, [r4, #CPU_A]
+        mvn     r2, r2                  @ value ^ 0xffff
+        uxth    r2, r2
+        add     r2, r3, r2
+        adds    r2, r2, #1             @ result (0..0x1ffff)
+        lsr     r3, r2, #16            @ c = result > 0xffff (result>>16 is 0/1)
+        strb    r3, [r4, #CPU_C]
+        uxth    r2, r2                  @ SETZN value = result & 0xffff
+        movs    r1, #0
+        SETZN
+        b       .L_handled
+
+.Lopa6:                                 @ LDX dp  (XF width)
+        DP_ADDR
+        DP_READ_VALUE CPU_XF
+        ldrb    r1, [r4, #CPU_XF]
+        cbz     r1, .Lldx_dp_w
+        strh    r2, [r4, #CPU_X]        @ byte zero-extends into x
+        uxtb    r2, r2
+        movs    r1, #1
+        SETZN
+        b       .L_handled
+.Lldx_dp_w:
+        strh    r2, [r4, #CPU_X]
+        movs    r1, #0
+        SETZN
+        b       .L_handled
+
+.Lopa4:                                 @ LDY dp  (XF width)
+        DP_ADDR
+        DP_READ_VALUE CPU_XF
+        ldrb    r1, [r4, #CPU_XF]
+        cbz     r1, .Lldy_dp_w
+        strh    r2, [r4, #CPU_Y]
+        uxtb    r2, r2
+        movs    r1, #1
+        SETZN
+        b       .L_handled
+.Lldy_dp_w:
+        strh    r2, [r4, #CPU_Y]
+        movs    r1, #0
+        SETZN
+        b       .L_handled
+
+.Lop85:                                 @ STA dp  (MF width; writes via bridge)
+        DP_ADDR
+        ldrb    r1, [r4, #CPU_MF]
+        cbz     r1, .Lsta_dp_w
+        ldrh    r2, [r4, #CPU_A]
+        uxtb    r2, r2                  @ a & 0xff
+        mov     r0, r4
+        mov     r1, r6                  @ addr_low
+        bl      cpu_thumb2_write
+        b       .L_handled
+.Lsta_dp_w:
+        ldrb    r0, [r4, #CPU_CYCLESUSED]
+        adds    r0, r0, #1
+        strb    r0, [r4, #CPU_CYCLESUSED]
+        ldrh    r2, [r4, #CPU_A]
+        uxtb    r2, r2                  @ low byte
+        mov     r0, r4
+        mov     r1, r6                  @ addr_low
+        bl      cpu_thumb2_write
+        add     r1, r6, #1
+        uxth    r1, r1                  @ addr_high
+        ldrh    r2, [r4, #CPU_A]        @ re-read a (clobbered by the BL)
+        lsr     r2, r2, #8             @ high byte
+        mov     r0, r4
+        bl      cpu_thumb2_write
+        b       .L_handled
+
+.Lop86:                                 @ STX dp  (XF width; writes via bridge)
+        DP_ADDR
+        ldrb    r1, [r4, #CPU_XF]
+        cbz     r1, .Lstx_dp_w
+        ldrh    r2, [r4, #CPU_X]
+        uxtb    r2, r2
+        mov     r0, r4
+        mov     r1, r6
+        bl      cpu_thumb2_write
+        b       .L_handled
+.Lstx_dp_w:
+        ldrb    r0, [r4, #CPU_CYCLESUSED]
+        adds    r0, r0, #1
+        strb    r0, [r4, #CPU_CYCLESUSED]
+        ldrh    r2, [r4, #CPU_X]
+        uxtb    r2, r2
+        mov     r0, r4
+        mov     r1, r6
+        bl      cpu_thumb2_write
+        add     r1, r6, #1
+        uxth    r1, r1
+        ldrh    r2, [r4, #CPU_X]
+        lsr     r2, r2, #8
+        mov     r0, r4
+        bl      cpu_thumb2_write
+        b       .L_handled
+
+.Lop84:                                 @ STY dp  (XF width; writes via bridge)
+        DP_ADDR
+        ldrb    r1, [r4, #CPU_XF]
+        cbz     r1, .Lsty_dp_w
+        ldrh    r2, [r4, #CPU_Y]
+        uxtb    r2, r2
+        mov     r0, r4
+        mov     r1, r6
+        bl      cpu_thumb2_write
+        b       .L_handled
+.Lsty_dp_w:
+        ldrb    r0, [r4, #CPU_CYCLESUSED]
+        adds    r0, r0, #1
+        strb    r0, [r4, #CPU_CYCLESUSED]
+        ldrh    r2, [r4, #CPU_Y]
+        uxtb    r2, r2
+        mov     r0, r4
+        mov     r1, r6
+        bl      cpu_thumb2_write
+        add     r1, r6, #1
+        uxth    r1, r1
+        ldrh    r2, [r4, #CPU_Y]
+        lsr     r2, r2, #8
+        mov     r0, r4
+        bl      cpu_thumb2_write
+        b       .L_handled
+
+.Lop64:                                 @ STZ dp  (MF width; stores zero)
+        DP_ADDR
+        ldrb    r1, [r4, #CPU_MF]
+        cbz     r1, .Lstz_dp_w
+        movs    r2, #0
+        mov     r0, r4
+        mov     r1, r6
+        bl      cpu_thumb2_write
+        b       .L_handled
+.Lstz_dp_w:
+        ldrb    r0, [r4, #CPU_CYCLESUSED]
+        adds    r0, r0, #1
+        strb    r0, [r4, #CPU_CYCLESUSED]
+        movs    r2, #0
+        mov     r0, r4
+        mov     r1, r6
+        bl      cpu_thumb2_write
+        add     r1, r6, #1
+        uxth    r1, r1
+        movs    r2, #0
+        mov     r0, r4
+        bl      cpu_thumb2_write
+        b       .L_handled
+
+@ --- ADC dp (0x65) / SBC dp (0xe5): binary path only.  Decimal mode (D flag
+@ set) bails to .L_noteb BEFORE the operand fetch, so C's cpu_adc/cpu_sbc
+@ re-dispatch and fetch the operand themselves (pc is still post-opcode).  The
+@ binary maths are identical for ADC and SBC once SBC's operand is one's-
+@ complemented (value ^= 0xff/0xffff); only the complement step differs, so the
+@ two handlers share the same ALU shape.  V flag identity (proven equal to the
+@ C form):  V = ((~(a^value)) & (value^result)) & sign_bit.
+.Lop65:                                 @ ADC dp  (binary; decimal -> C fallback)
+        ldrb    r0, [r4, #CPU_D]
+        cmp     r0, #0
+        bne     .L_noteb
+        DP_ADDR
+        DP_READ_VALUE CPU_MF
+        ldrb    r1, [r4, #CPU_MF]
+        cbz     r1, .Ladc_dp_w
+        @ --- byte: r2 = value (0..0xff) ---
+        ldrh    r3, [r4, #CPU_A]         @ r3 = a (16-bit; high byte kept for writeback)
+        ldrb    r1, [r4, #CPU_C]         @ r1 = c (0/1)
+        mov     r6, r2                   @ r6 = value (preserve for V XOR)
+        uxtb    r0, r3                   @ r0 = a & 0xff
+        add     r2, r0, r6               @ (a&0xff) + value
+        add     r2, r2, r1               @ + c -> result (0..0x1ff)
+        lsr     r1, r2, #8               @ c = result > 0xff
+        strb    r1, [r4, #CPU_C]
+        eor     r0, r3, r6               @ (full a) ^ value -- bit7 of low byte is the sign
+        eor     r1, r6, r2               @ value ^ result
+        bic     r0, r1, r0               @ (value^result) & ~(a^value)
+        ubfx    r0, r0, #7, #1           @ V = bit7 (0/1)
+        strb    r0, [r4, #CPU_V]
+        bfi     r3, r2, #0, #8           @ a = (a & 0xff00) | (result & 0xff)
+        strh    r3, [r4, #CPU_A]
+        uxtb    r2, r3                   @ SETZN value = a & 0xff
+        movs    r1, #1                   @ byte mode
+        SETZN
+        b       .L_handled
+.Ladc_dp_w:
+        @ --- word: r2 = value (0..0xffff) ---
+        ldrh    r3, [r4, #CPU_A]         @ r3 = a
+        ldrb    r1, [r4, #CPU_C]         @ r1 = c
+        mov     r0, r2                   @ r0 = value (preserve for V XOR)
+        add     r2, r3, r0               @ a + value
+        add     r2, r2, r1               @ + c -> result (0..0x1ffff)
+        lsr     r1, r2, #16              @ c = result > 0xffff
+        strb    r1, [r4, #CPU_C]
+        eor     r3, r3, r0               @ a ^ value
+        eor     r1, r0, r2               @ value ^ result
+        bic     r0, r1, r3               @ (value^result) & ~(a^value)
+        ubfx    r0, r0, #15, #1          @ V = bit15 (0/1)
+        strb    r0, [r4, #CPU_V]
+        strh    r2, [r4, #CPU_A]         @ a = result (16-bit)
+        uxth    r2, r2                   @ SETZN value = result & 0xffff
+        movs    r1, #0                   @ word mode
+        SETZN
+        b       .L_handled
+
+.Lope5:                                 @ SBC dp  (binary; decimal -> C fallback)
+        ldrb    r0, [r4, #CPU_D]
+        cmp     r0, #0
+        bne     .L_noteb
+        DP_ADDR
+        DP_READ_VALUE CPU_MF
+        ldrb    r1, [r4, #CPU_MF]
+        cbz     r1, .Lsbc_dp_w
+        @ --- byte: complement operand first (value = read ^ 0xff) ---
+        eor     r2, r2, #0xff
+        ldrh    r3, [r4, #CPU_A]
+        ldrb    r1, [r4, #CPU_C]
+        mov     r6, r2                   @ r6 = complemented value
+        uxtb    r0, r3                   @ a & 0xff
+        add     r2, r0, r6               @ (a&0xff) + value
+        add     r2, r2, r1               @ + c -> result (0..0x1ff)
+        lsr     r1, r2, #8               @ c = result > 0xff
+        strb    r1, [r4, #CPU_C]
+        eor     r0, r3, r6               @ a ^ value
+        eor     r1, r6, r2               @ value ^ result
+        bic     r0, r1, r0               @ (value^result) & ~(a^value)
+        ubfx    r0, r0, #7, #1           @ V = bit7
+        strb    r0, [r4, #CPU_V]
+        bfi     r3, r2, #0, #8           @ a = (a & 0xff00) | (result & 0xff)
+        strh    r3, [r4, #CPU_A]
+        uxtb    r2, r3
+        movs    r1, #1
+        SETZN
+        b       .L_handled
+.Lsbc_dp_w:
+        @ --- word: complement operand (value = read ^ 0xffff) ---
+        mvn     r2, r2                   @ ~read; low 16 bits = read ^ 0xffff
+        uxth    r2, r2
+        ldrh    r3, [r4, #CPU_A]
+        ldrb    r1, [r4, #CPU_C]
+        mov     r0, r2                   @ r0 = complemented value
+        add     r2, r3, r0               @ a + value
+        add     r2, r2, r1               @ + c -> result (0..0x1ffff)
+        lsr     r1, r2, #16              @ c = result > 0xffff
+        strb    r1, [r4, #CPU_C]
+        eor     r3, r3, r0               @ a ^ value
+        eor     r1, r0, r2               @ value ^ result
+        bic     r0, r1, r3               @ (value^result) & ~(a^value)
+        ubfx    r0, r0, #15, #1          @ V = bit15
+        strb    r0, [r4, #CPU_V]
+        strh    r2, [r4, #CPU_A]         @ a = result (16-bit)
+        uxth    r2, r2
+        movs    r1, #0
+        SETZN
+        b       .L_handled
+
+
         .size   snes_thumb2_try, .-snes_thumb2_try
         .size   snes_thumb2_step, .-snes_thumb2_step
 
