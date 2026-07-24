@@ -1191,6 +1191,25 @@
         .word   .Lope3 + 1
         .elseif \op == 0xf3
         .word   .Lopf3 + 1
+@ --- Stage 3N: misc native (WDM WAI STP XCE MVP MVN PER PEI PEA) ---
+        .elseif \op == 0x42
+        .word   .Lop42 + 1
+        .elseif \op == 0x44
+        .word   .Lop44 + 1
+        .elseif \op == 0x54
+        .word   .Lop54 + 1
+        .elseif \op == 0x62
+        .word   .Lop62 + 1
+        .elseif \op == 0xcb
+        .word   .Lopcb + 1
+        .elseif \op == 0xd4
+        .word   .Lopd4 + 1
+        .elseif \op == 0xdb
+        .word   .Lopdb + 1
+        .elseif \op == 0xf4
+        .word   .Lopf4 + 1
+        .elseif \op == 0xfb
+        .word   .Lopfb + 1
         .else
         .word   .L_noteb + 1
         .endif
@@ -7859,24 +7878,37 @@ snes_thumb2_step:
         strh    r6, [r4, #CPU_PC]       @ pc = target
         b       .L_handled
 
-@ --- 0x60 RTS: GATE on spBreakpoint (bail to C if nonzero, BEFORE any
-@ pull -- the C fallback runs the HookedFunctionRts gate).  Then pull
-@ word -> pc, pc+1 (uint16 wrap via strh). ---
+@ --- 0x60 RTS: GATE on spBreakpoint -- the oracle's real condition
+@ (cpu.c:1525) is `sp >= spBreakpoint && spBreakpoint`, NOT merely
+@ `spBreakpoint != 0`: a breakpoint armed for a DEEPER, not-yet-reached
+@ stack frame must not force every intervening RTS to C. Bail to C
+@ (BEFORE any pull -- the C fallback runs the HookedFunctionRts gate)
+@ only when both hold; otherwise pull word -> pc, pc+1 (uint16 wrap via
+@ strh), same as before. sp/spBreakpoint are uint16_t promoted to a
+@ non-negative int in C, so an unsigned ARM compare matches exactly. ---
 .Lop60:
         ldrh    r0, [r4, #CPU_SPBREAKPOINT]
-        cmp     r0, #0
-        bne     .L_noteb                @ spBreakpoint != 0: C handles the gate
+        cbz     r0, .Lop60_native       @ spBreakpoint == 0: never gates
+        ldrh    r1, [r4, #CPU_SP]
+        cmp     r1, r0                  @ sp - spBreakpoint (unsigned)
+        blo     .Lop60_native           @ sp < spBreakpoint: not reached yet
+        b       .L_noteb                @ sp >= spBreakpoint && spBreakpoint: gate fires
+.Lop60_native:
         PULL_WORD                       @ r6 = return pc
         adds    r6, r6, #1              @ pc + 1
         strh    r6, [r4, #CPU_PC]
         b       .L_handled
 
-@ --- 0x6b RTL: GATE on spBreakpoint (same as RTS).  Then pull word -> pc
-@ (+1), pull byte -> k. ---
+@ --- 0x6b RTL: GATE on spBreakpoint (same two-condition test as RTS --
+@ see its comment). Then pull word -> pc (+1), pull byte -> k. ---
 .Lop6b:
         ldrh    r0, [r4, #CPU_SPBREAKPOINT]
-        cmp     r0, #0
-        bne     .L_noteb                @ spBreakpoint != 0: C handles the gate
+        cbz     r0, .Lop6b_native       @ spBreakpoint == 0: never gates
+        ldrh    r1, [r4, #CPU_SP]
+        cmp     r1, r0                  @ sp - spBreakpoint (unsigned)
+        blo     .Lop6b_native           @ sp < spBreakpoint: not reached yet
+        b       .L_noteb                @ sp >= spBreakpoint && spBreakpoint: gate fires
+.Lop6b_native:
         PULL_WORD                       @ r6 = return pc
         adds    r6, r6, #1              @ pc + 1
         strh    r6, [r4, #CPU_PC]
@@ -8397,6 +8429,220 @@ snes_thumb2_step:
         uxth    r2, r2
         movs    r1, #0
         SETZN
+        b       .L_handled
+
+@ ===========================================================================
+@ Stage 3N: 9 remaining native opcodes (WDM WAI STP XCE MVP MVN PER PEI PEA).
+@ Operand bytes are RAW (IMM_FETCH_BYTE = cpu_readOpcode = cpu_read_raw, NO
+@ spin hook); data and stack accesses are HOOKED (cpu_thumb2_read/write =
+@ cpu_read/cpu_write).  r6 is the only state carried across BLs (callee-saved).
+@ ===========================================================================
+
+@ --- 0x42 WDM: 2-byte NOP.  Read & discard 1 operand byte (RAW).  cpu.c:1317.
+.Lop42:
+        IMM_FETCH_BYTE                  @ read & discard operand; pc++
+        b       .L_handled
+
+@ --- 0xcb WAI: set waiting, overwrite cyclesUsed=3 (NOT add).  cpu.c:2199.
+@ The runOpcode pre-work (cpu.c:226) has already cleared waiting before the
+@ opcode is fetched; the handler sets it again so the NEXT runOpcode blocks.
+.Lopcb:
+        movs    r0, #1
+        strb    r0, [r4, #CPU_WAITING]
+        movs    r0, #3
+        strb    r0, [r4, #CPU_CYCLESUSED]  @ OVERWRITE base cycle, not add
+        b       .L_handled
+
+@ --- 0xdb STP: set stopped (freeze).  cpu.c:2298.
+.Lopdb:
+        movs    r0, #1
+        strb    r0, [r4, #CPU_STOPPED]
+        b       .L_handled
+
+@ --- 0xfb XCE: swap C and E, then cpu_setFlags(cpu, cpu_getFlags(cpu)).
+@ getFlags packs N<<7|V<<6|MF<<5|XF<<4|D<<3|I<<2|Z<<1|C (each field 0/1).
+@ SETFLAGS_TAIL unpacks r0 and re-normalises using the POST-swap E (read fresh),
+@ matching cpu_setFlags.  cpu.c:2490.
+.Lopfb:
+        ldrb    r0, [r4, #CPU_C]
+        ldrb    r1, [r4, #CPU_E]
+        strb    r1, [r4, #CPU_C]          @ c = old e
+        strb    r0, [r4, #CPU_E]          @ e = old c
+        @ build flags byte into r0 from current (post-swap) fields
+        ldrb    r1, [r4, #CPU_N]
+        lsl     r0, r1, #7
+        ldrb    r1, [r4, #CPU_V]
+        lsl     r1, r1, #6
+        orr     r0, r0, r1
+        ldrb    r1, [r4, #CPU_MF]
+        lsl     r1, r1, #5
+        orr     r0, r0, r1
+        ldrb    r1, [r4, #CPU_XF]
+        lsl     r1, r1, #4
+        orr     r0, r0, r1
+        ldrb    r1, [r4, #CPU_D]
+        lsl     r1, r1, #3
+        orr     r0, r0, r1
+        ldrb    r1, [r4, #CPU_I]
+        lsl     r1, r1, #2
+        orr     r0, r0, r1
+        ldrb    r1, [r4, #CPU_Z]
+        lsl     r1, r1, #1
+        orr     r0, r0, r1
+        ldrb    r1, [r4, #CPU_C]          @ post-swap c
+        orr     r0, r0, r1
+        SETFLAGS_TAIL                    @ unpack + renormalise (reads E fresh)
+        b       .L_handled
+
+@ --- 0x44 MVP: block move (src->dest), a/x/y--.  cpu.c:1327.
+@ dest=readOpcode, src=readOpcode (RAW); db=dest; write[(dest<<16)|y] =
+@ read[(src<<16)|x] (HOOKED); a--,x--,y--; if(a!=0xffff) pc-=3; if(xf) x&=0xff,
+@ y&=0xff.  r6 carries dest across both BLs; the read value is spilled to the
+@ ARM stack across the write-addr computation.
+.Lop44:
+        IMM_FETCH_BYTE                  @ r0 = dest
+        mov     r6, r0
+        IMM_FETCH_BYTE                  @ r0 = src
+        strb    r6, [r4, #CPU_DB]       @ db = dest
+        lsl     r3, r0, #16             @ src << 16
+        ldrh    r1, [r4, #CPU_X]
+        orr     r1, r3, r1             @ read_addr = (src<<16) | x
+        mov     r0, r4
+        bl      cpu_thumb2_read         @ r0 = value (HOOKED); r6=dest survives
+        push    {r0}                    @ save value
+        lsl     r3, r6, #16             @ dest << 16
+        ldrh    r1, [r4, #CPU_Y]
+        orr     r1, r3, r1             @ write_addr = (dest<<16) | y
+        mov     r0, r4
+        pop     {r2}                    @ r2 = value
+        bl      cpu_thumb2_write        @ write (HOOKED)
+        ldrh    r0, [r4, #CPU_A]
+        subs    r0, r0, #1
+        strh    r0, [r4, #CPU_A]
+        ldrh    r0, [r4, #CPU_X]
+        subs    r0, r0, #1
+        strh    r0, [r4, #CPU_X]
+        ldrh    r0, [r4, #CPU_Y]
+        subs    r0, r0, #1
+        strh    r0, [r4, #CPU_Y]
+        ldrh    r0, [r4, #CPU_A]        @ reload truncated 16-bit a
+        movw    r1, #0xffff
+        cmp     r0, r1
+        beq     91f                     @ a == 0xffff: no rewind
+        ldrh    r0, [r4, #CPU_PC]
+        subs    r0, r0, #3
+        strh    r0, [r4, #CPU_PC]
+91:
+        ldrb    r0, [r4, #CPU_XF]
+        cbz     r0, 92f
+        ldrh    r0, [r4, #CPU_X]
+        uxtb    r0, r0
+        strh    r0, [r4, #CPU_X]
+        ldrh    r0, [r4, #CPU_Y]
+        uxtb    r0, r0
+        strh    r0, [r4, #CPU_Y]
+92:
+        b       .L_handled
+
+@ --- 0x54 MVN: block move (src->dest), a--, x++, y++.  cpu.c:1435.
+@ Identical to MVP except X and Y are INCREMENTED (and the high half of the
+@ pointer banks still come from the operand bytes, not db).
+.Lop54:
+        IMM_FETCH_BYTE                  @ r0 = dest
+        mov     r6, r0
+        IMM_FETCH_BYTE                  @ r0 = src
+        strb    r6, [r4, #CPU_DB]       @ db = dest
+        lsl     r3, r0, #16             @ src << 16
+        ldrh    r1, [r4, #CPU_X]
+        orr     r1, r3, r1             @ read_addr = (src<<16) | x
+        mov     r0, r4
+        bl      cpu_thumb2_read         @ r0 = value (HOOKED); r6=dest survives
+        push    {r0}                    @ save value
+        lsl     r3, r6, #16             @ dest << 16
+        ldrh    r1, [r4, #CPU_Y]
+        orr     r1, r3, r1             @ write_addr = (dest<<16) | y
+        mov     r0, r4
+        pop     {r2}                    @ r2 = value
+        bl      cpu_thumb2_write        @ write (HOOKED)
+        ldrh    r0, [r4, #CPU_A]
+        subs    r0, r0, #1
+        strh    r0, [r4, #CPU_A]
+        ldrh    r0, [r4, #CPU_X]
+        adds    r0, r0, #1             @ MVN: x++
+        strh    r0, [r4, #CPU_X]
+        ldrh    r0, [r4, #CPU_Y]
+        adds    r0, r0, #1             @ MVN: y++
+        strh    r0, [r4, #CPU_Y]
+        ldrh    r0, [r4, #CPU_A]        @ reload truncated 16-bit a
+        movw    r1, #0xffff
+        cmp     r0, r1
+        beq     93f                     @ a == 0xffff: no rewind
+        ldrh    r0, [r4, #CPU_PC]
+        subs    r0, r0, #3
+        strh    r0, [r4, #CPU_PC]
+93:
+        ldrb    r0, [r4, #CPU_XF]
+        cbz     r0, 94f
+        ldrh    r0, [r4, #CPU_X]
+        uxtb    r0, r0
+        strh    r0, [r4, #CPU_X]
+        ldrh    r0, [r4, #CPU_Y]
+        uxtb    r0, r0
+        strh    r0, [r4, #CPU_Y]
+94:
+        b       .L_handled
+
+@ --- 0x62 PER: push (pc + sign-extended operand word).  cpu.c:1541.
+@ operand word is RAW (2 IMM_FETCH_BYTE); pc has advanced past both bytes, so
+@ CPU_PC holds pc+2.  sxth sign-extends the displacement; PUSH_WORD pushes the
+@ low 16 bits of the sum (HIGH byte first).
+.Lop62:
+        IMM_FETCH_BYTE                  @ r0 = lo
+        mov     r6, r0
+        IMM_FETCH_BYTE                  @ r0 = hi
+        lsl     r0, r0, #8
+        orr     r6, r6, r0             @ r6 = word
+        sxth    r6, r6                  @ (int16_t) disp
+        ldrh    r0, [r4, #CPU_PC]       @ pc (past both operand bytes)
+        add     r6, r0, r6             @ pc + disp (low 16 bits pushed)
+        PUSH_WORD
+        b       .L_handled
+
+@ --- 0xd4 PEI: push indirect-pointer word from direct page.  cpu.c:2255.
+@ DP_ADDR computes r6 = (dp+off)&0xffff (bank 0) and charges the dp&0xff cycle.
+@ Two HOOKED reads at r6 and (r6+1)&0xffff build the pointer; PUSH_WORD pushes it.
+.Lopd4:
+        DP_ADDR                         @ r6 = (dp+off)&0xffff, bank 0
+        mov     r0, r4
+        mov     r1, r6
+        bl      cpu_thumb2_read         @ r0 = ptr_lo (HOOKED); r6 survives
+        push    {r0}                    @ save ptr_lo
+        add     r1, r6, #1
+        uxth    r1, r1                  @ ptr_hi addr = (r6+1)&0xffff (bank 0)
+        mov     r0, r4
+        bl      cpu_thumb2_read         @ r0 = ptr_hi (HOOKED)
+        lsl     r0, r0, #8
+        pop     {r1}                    @ r1 = ptr_lo
+        orr     r6, r1, r0             @ r6 = pointer
+        PUSH_WORD
+        b       .L_handled
+
+@ --- 0xf4 PEA: push effective address (raw operand word).  cpu.c:2444.
+@ operand word is RAW; if it equals the 0xC2AE sentinel Y is cleared first
+@ (matches the C hack); then PUSH_WORD.
+.Lopf4:
+        IMM_FETCH_BYTE                  @ r0 = lo
+        mov     r6, r0
+        IMM_FETCH_BYTE                  @ r0 = hi
+        lsl     r0, r0, #8
+        orr     r6, r6, r0             @ r6 = word
+        movw    r0, #0xc2ae
+        cmp     r6, r0
+        bne     95f
+        movs    r0, #0
+        strh    r0, [r4, #CPU_Y]       @ y = 0 hack
+95:
+        PUSH_WORD
         b       .L_handled
 
         .size   snes_thumb2_try, .-snes_thumb2_try
