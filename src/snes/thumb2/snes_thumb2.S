@@ -193,6 +193,46 @@
 .Labrd_\@:
         .endm
 
+@ --- Stage 3F absolute,X / absolute,Y helpers.  Same macro-not-subroutine rule
+@ as ABS_ADDR: each contains BLs (IMM_FETCH_BYTE), and r6 carries the only live
+@ state across the C calls (AAPCS callee-saved). ---
+
+@ ABXY_ADDR write idxoff: fetch the two operand bytes (RAW -- matches
+@ cpu_adrAbx/Aby's cpu_readOpcodeWord = cpu_read_raw, NO spin hook), compute
+@ r6 = addr_low = ((db<<16) + adr + idx) & 0xffffff with 24-bit wrap, matching
+@ cpu_adrAbx/Aby (cpu.c:462-476).  \idxoff = CPU_X (abx) or CPU_Y (aby).
+@ Page-cross penalty (cpu.c:464/472): ONLY writes (\write=1) pay +1 cycle when
+@ EITHER xf==0 (16-bit index, short-circuit -- the || skips the page test) OR
+@ (adr>>8) != ((adr+idx)>>8) (256-byte page cross on the 16-bit operand adr).
+@ Reads (\write=0) pay ZERO penalty always.  Clobbers r0-r3; r6 = addr_low.
+        .macro ABXY_ADDR write idxoff
+        IMM_FETCH_BYTE                  @ r0 = lo; pc++ (uint16 wrap)
+        mov     r6, r0                  @ preserve lo across 2nd fetch
+        IMM_FETCH_BYTE                  @ r0 = hi; pc++
+        orr     r6, r6, r0, lsl #8     @ r6 = adr (0..0xffff, zero-extended)
+        ldrh    r2, [r4, #\idxoff]     @ r2 = idx (always needed for addr_low)
+        .if \write
+        ldrb    r0, [r4, #CPU_XF]
+        cbz     r0, 83f                 @ xf==0 -> always penalty (short-circuit)
+        mov     r3, r6                  @ r3 = adr
+        lsr     r3, r3, #8              @ r3 = adr>>8
+        add     r0, r6, r2              @ r0 = adr+idx (0..0x1fffe, 32-bit like C)
+        lsr     r0, r0, #8              @ r0 = (adr+idx)>>8
+        cmp     r3, r0
+        beq     84f                     @ same page -> no penalty
+83:
+        ldrb    r0, [r4, #CPU_CYCLESUSED]
+        adds    r0, r0, #1
+        strb    r0, [r4, #CPU_CYCLESUSED]
+84:
+        .endif
+        ldrb    r1, [r4, #CPU_DB]
+        lsl     r1, r1, #16             @ r1 = db<<16
+        add     r6, r6, r2              @ r6 = adr + idx
+        add     r6, r6, r1              @ r6 = db<<16 + adr + idx
+        ubfx    r6, r6, #0, #24         @ r6 = addr_low & 0xffffff
+        .endm
+
 @ Dense O(1) opcode dispatch.  Table entries carry the Thumb bit because the
 @ local handler labels are not function symbols and therefore do not acquire
 @ it automatically.
@@ -368,6 +408,60 @@
         .word   .Lopec + 1
         .elseif \op == 0xee
         .word   .Lopee + 1
+@ --- Stage 3F Pass 1: absolute,X / absolute,Y ---
+        .elseif \op == 0x19
+        .word   .Lop19 + 1
+        .elseif \op == 0x1d
+        .word   .Lop1d + 1
+        .elseif \op == 0x39
+        .word   .Lop39 + 1
+        .elseif \op == 0x3d
+        .word   .Lop3d + 1
+        .elseif \op == 0x59
+        .word   .Lop59 + 1
+        .elseif \op == 0x5d
+        .word   .Lop5d + 1
+        .elseif \op == 0x79
+        .word   .Lop79 + 1
+        .elseif \op == 0x7d
+        .word   .Lop7d + 1
+        .elseif \op == 0x99
+        .word   .Lop99 + 1
+        .elseif \op == 0x9d
+        .word   .Lop9d + 1
+        .elseif \op == 0x9e
+        .word   .Lop9e + 1
+        .elseif \op == 0xb9
+        .word   .Lopb9 + 1
+        .elseif \op == 0xbc
+        .word   .Lopbc + 1
+        .elseif \op == 0xbd
+        .word   .Lopbd + 1
+        .elseif \op == 0xbe
+        .word   .Lopbe + 1
+        .elseif \op == 0xd9
+        .word   .Lopd9 + 1
+        .elseif \op == 0xdd
+        .word   .Lopdd + 1
+        .elseif \op == 0xf9
+        .word   .Lopf9 + 1
+        .elseif \op == 0xfd
+        .word   .Lopfd + 1
+@ --- Stage 3F Pass 2: absolute,X RMW / BIT ---
+        .elseif \op == 0x1e
+        .word   .Lop1e + 1
+        .elseif \op == 0x3e
+        .word   .Lop3e + 1
+        .elseif \op == 0x3c
+        .word   .Lop3c + 1
+        .elseif \op == 0x5e
+        .word   .Lop5e + 1
+        .elseif \op == 0x7e
+        .word   .Lop7e + 1
+        .elseif \op == 0xde
+        .word   .Lopde + 1
+        .elseif \op == 0xfe
+        .word   .Lopfe + 1
         .else
         .word   .L_noteb + 1
         .endif
@@ -2463,6 +2557,955 @@ snes_thumb2_step:
         b       .L_handled
 
 
+@ ===========================================================================
+@ Stage 3F Pass 1 -- absolute,X / absolute,Y opcodes.  Each handler is the
+@ verbatim abs handler with ABS_ADDR replaced by ABXY_ADDR: the ALU tails,
+@ SETZN, and write tails are byte-identical because cpu_adrAbx/Aby feed the SAME
+@ cpu_lda/cpu_and/... helpers as cpu_adrAbs.  The ONLY new semantics are in
+@ ABXY_ADDR itself: the +idx term in the effective address and the write-only
+@ page-cross penalty (cpu.c:464/472).  ADC/SBC (0x7d/0xfd abx, 0x79/0xf9 aby)
+@ keep the decimal-bail BEFORE ABXY_ADDR, exactly as the abs ADC/SBC handlers
+@ bail before ABS_ADDR (pc correctness for the C fallback).  LDY abx (0xbc) and
+@ LDX aby (0xbe) gate on XF, mirroring abs LDX/LDY.  STA/STZ/STA writes pass
+@ write=1 to ABXY_ADDR so the page-cross penalty is charged.
+@ ===========================================================================
+
+@ ---------------- absolute,X (idx = X, idxoff = CPU_X) ----------------
+
+.Lopbd:                                 @ LDA abx  (read)
+        ABXY_ADDR 0, CPU_X
+        ABS_READ_VALUE CPU_MF
+        ldrb    r1, [r4, #CPU_MF]
+        cbz     r1, .Llda_abx_w
+        ldrh    r3, [r4, #CPU_A]
+        bfi     r3, r2, #0, #8          @ a = (a & 0xff00) | value
+        strh    r3, [r4, #CPU_A]
+        uxtb    r2, r3                  @ SETZN value = a & 0xff
+        movs    r1, #1                  @ byte mode
+        SETZN
+        b       .L_handled
+.Llda_abx_w:
+        strh    r2, [r4, #CPU_A]        @ a = value (word)
+        movs    r1, #0                  @ word mode
+        SETZN
+        b       .L_handled
+
+.Lop3d:                                 @ AND abx  (read)
+        ABXY_ADDR 0, CPU_X
+        ABS_READ_VALUE CPU_MF
+        ldrb    r1, [r4, #CPU_MF]
+        cbz     r1, .Land_abx_w
+        ldrh    r3, [r4, #CPU_A]
+        and     r2, r3, r2              @ a & value (value is a byte)
+        bfi     r3, r2, #0, #8          @ a = (a & 0xff00) | (a & value)
+        strh    r3, [r4, #CPU_A]
+        uxtb    r2, r2
+        movs    r1, #1
+        SETZN
+        b       .L_handled
+.Land_abx_w:
+        ldrh    r3, [r4, #CPU_A]
+        and     r2, r3, r2              @ a & value (word)
+        strh    r2, [r4, #CPU_A]
+        movs    r1, #0
+        SETZN
+        b       .L_handled
+
+.Lop1d:                                 @ ORA abx  (read)
+        ABXY_ADDR 0, CPU_X
+        ABS_READ_VALUE CPU_MF
+        ldrb    r1, [r4, #CPU_MF]
+        cbz     r1, .Lora_abx_w
+        ldrh    r3, [r4, #CPU_A]
+        orr     r2, r3, r2              @ a | value (low byte)
+        bfi     r3, r2, #0, #8          @ a = (a & 0xff00) | (a | value)
+        strh    r3, [r4, #CPU_A]
+        uxtb    r2, r2
+        movs    r1, #1
+        SETZN
+        b       .L_handled
+.Lora_abx_w:
+        ldrh    r3, [r4, #CPU_A]
+        orr     r2, r3, r2
+        strh    r2, [r4, #CPU_A]
+        movs    r1, #0
+        SETZN
+        b       .L_handled
+
+.Lop5d:                                 @ EOR abx  (read)
+        ABXY_ADDR 0, CPU_X
+        ABS_READ_VALUE CPU_MF
+        ldrb    r1, [r4, #CPU_MF]
+        cbz     r1, .Leor_abx_w
+        ldrh    r3, [r4, #CPU_A]
+        eor     r2, r3, r2              @ a ^ value (low byte)
+        bfi     r3, r2, #0, #8          @ a = (a & 0xff00) | (a ^ value)
+        strh    r3, [r4, #CPU_A]
+        uxtb    r2, r2
+        movs    r1, #1
+        SETZN
+        b       .L_handled
+.Leor_abx_w:
+        ldrh    r3, [r4, #CPU_A]
+        eor     r2, r3, r2
+        strh    r2, [r4, #CPU_A]
+        movs    r1, #0
+        SETZN
+        b       .L_handled
+
+.Lopdd:                                 @ CMP abx  (read; sets C/Z/N; A unchanged)
+        ABXY_ADDR 0, CPU_X
+        ABS_READ_VALUE CPU_MF
+        ldrb    r1, [r4, #CPU_MF]
+        cbz     r1, .Lcmp_abx_w
+        ldrh    r3, [r4, #CPU_A]
+        uxtb    r3, r3                  @ a & 0xff
+        mvn     r2, r2                  @ value ^ 0xff (low byte)
+        uxtb    r2, r2
+        add     r2, r3, r2              @ (a&0xff) + (value^0xff)
+        adds    r2, r2, #1             @ +1 -> result (0..0x1ff)
+        lsr     r3, r2, #8             @ c = result > 0xff
+        strb    r3, [r4, #CPU_C]
+        uxtb    r2, r2                  @ SETZN value = result & 0xff
+        movs    r1, #1
+        SETZN
+        b       .L_handled
+.Lcmp_abx_w:
+        ldrh    r3, [r4, #CPU_A]
+        mvn     r2, r2                  @ value ^ 0xffff
+        uxth    r2, r2
+        add     r2, r3, r2
+        adds    r2, r2, #1             @ result (0..0x1ffff)
+        lsr     r3, r2, #16            @ c = result > 0xffff
+        strb    r3, [r4, #CPU_C]
+        uxth    r2, r2                  @ SETZN value = result & 0xffff
+        movs    r1, #0
+        SETZN
+        b       .L_handled
+
+.Lopbc:                                 @ LDY abx  (read; XF width)
+        ABXY_ADDR 0, CPU_X
+        ABS_READ_VALUE CPU_XF
+        ldrb    r1, [r4, #CPU_XF]
+        cbz     r1, .Lldy_abx_w
+        strh    r2, [r4, #CPU_Y]
+        uxtb    r2, r2
+        movs    r1, #1
+        SETZN
+        b       .L_handled
+.Lldy_abx_w:
+        strh    r2, [r4, #CPU_Y]
+        movs    r1, #0
+        SETZN
+        b       .L_handled
+
+.Lop9d:                                 @ STA abx  (WRITE; MF width; writes via bridge)
+        ABXY_ADDR 1, CPU_X
+        ldrb    r1, [r4, #CPU_MF]
+        cbz     r1, .Lsta_abx_w
+        ldrh    r2, [r4, #CPU_A]
+        uxtb    r2, r2                  @ a & 0xff
+        mov     r0, r4
+        mov     r1, r6                  @ addr_low
+        bl      cpu_thumb2_write
+        b       .L_handled
+.Lsta_abx_w:
+        ldrb    r0, [r4, #CPU_CYCLESUSED]
+        adds    r0, r0, #1
+        strb    r0, [r4, #CPU_CYCLESUSED]
+        ldrh    r2, [r4, #CPU_A]
+        uxtb    r2, r2                  @ low byte
+        mov     r0, r4
+        mov     r1, r6                  @ addr_low
+        bl      cpu_thumb2_write
+        add     r1, r6, #1
+        ubfx    r1, r1, #0, #24         @ addr_high = (addr_low+1) & 0xffffff
+        ldrh    r2, [r4, #CPU_A]        @ re-read a (clobbered by the BL)
+        lsr     r2, r2, #8             @ high byte
+        mov     r0, r4
+        bl      cpu_thumb2_write
+        b       .L_handled
+
+.Lop9e:                                 @ STZ abx  (WRITE; MF width; stores zero)
+        ABXY_ADDR 1, CPU_X
+        ldrb    r1, [r4, #CPU_MF]
+        cbz     r1, .Lstz_abx_w
+        movs    r2, #0
+        mov     r0, r4
+        mov     r1, r6
+        bl      cpu_thumb2_write
+        b       .L_handled
+.Lstz_abx_w:
+        ldrb    r0, [r4, #CPU_CYCLESUSED]
+        adds    r0, r0, #1
+        strb    r0, [r4, #CPU_CYCLESUSED]
+        movs    r2, #0
+        mov     r0, r4
+        mov     r1, r6
+        bl      cpu_thumb2_write
+        add     r1, r6, #1
+        ubfx    r1, r1, #0, #24         @ addr_high = (addr_low+1) & 0xffffff
+        movs    r2, #0
+        mov     r0, r4
+        bl      cpu_thumb2_write
+        b       .L_handled
+
+@ --- ADC abx (0x7d) / SBC abx (0xfd): binary path only.  Decimal mode (D flag
+@ set) bails to .L_noteb BEFORE any operand fetch, so C's cpu_adc/cpu_sbc
+@ re-dispatch and fetch the operand themselves (pc is still post-opcode).  Maths
+@ identical to the abs ADC/SBC handlers; only the address source differs.
+.Lop7d:                                 @ ADC abx  (binary; decimal -> C fallback)
+        ldrb    r0, [r4, #CPU_D]
+        cmp     r0, #0
+        bne     .L_noteb
+        ABXY_ADDR 0, CPU_X
+        ABS_READ_VALUE CPU_MF
+        ldrb    r1, [r4, #CPU_MF]
+        cbz     r1, .Ladc_abx_w
+        @ --- byte: r2 = value (0..0xff) ---
+        ldrh    r3, [r4, #CPU_A]         @ r3 = a (high byte kept for writeback)
+        ldrb    r1, [r4, #CPU_C]         @ r1 = c (0/1)
+        mov     r6, r2                   @ r6 = value (preserve for V XOR)
+        uxtb    r0, r3                   @ r0 = a & 0xff
+        add     r2, r0, r6               @ (a&0xff) + value
+        add     r2, r2, r1               @ + c -> result (0..0x1ff)
+        lsr     r1, r2, #8               @ c = result > 0xff
+        strb    r1, [r4, #CPU_C]
+        eor     r0, r3, r6               @ (full a) ^ value -- bit7 is the sign
+        eor     r1, r6, r2               @ value ^ result
+        bic     r0, r1, r0               @ (value^result) & ~(a^value)
+        ubfx    r0, r0, #7, #1           @ V = bit7 (0/1)
+        strb    r0, [r4, #CPU_V]
+        bfi     r3, r2, #0, #8           @ a = (a & 0xff00) | (result & 0xff)
+        strh    r3, [r4, #CPU_A]
+        uxtb    r2, r3                   @ SETZN value = a & 0xff
+        movs    r1, #1                   @ byte mode
+        SETZN
+        b       .L_handled
+.Ladc_abx_w:
+        @ --- word: r2 = value (0..0xffff) ---
+        ldrh    r3, [r4, #CPU_A]         @ r3 = a
+        ldrb    r1, [r4, #CPU_C]         @ r1 = c
+        mov     r0, r2                   @ r0 = value (preserve for V XOR)
+        add     r2, r3, r0               @ a + value
+        add     r2, r2, r1               @ + c -> result (0..0x1ffff)
+        lsr     r1, r2, #16              @ c = result > 0xffff
+        strb    r1, [r4, #CPU_C]
+        eor     r3, r3, r0               @ a ^ value
+        eor     r1, r0, r2               @ value ^ result
+        bic     r0, r1, r3               @ (value^result) & ~(a^value)
+        ubfx    r0, r0, #15, #1          @ V = bit15 (0/1)
+        strb    r0, [r4, #CPU_V]
+        strh    r2, [r4, #CPU_A]         @ a = result (16-bit)
+        uxth    r2, r2                   @ SETZN value = result & 0xffff
+        movs    r1, #0                   @ word mode
+        SETZN
+        b       .L_handled
+
+.Lopfd:                                 @ SBC abx  (binary; decimal -> C fallback)
+        ldrb    r0, [r4, #CPU_D]
+        cmp     r0, #0
+        bne     .L_noteb
+        ABXY_ADDR 0, CPU_X
+        ABS_READ_VALUE CPU_MF
+        ldrb    r1, [r4, #CPU_MF]
+        cbz     r1, .Lsbc_abx_w
+        @ --- byte: complement operand first (value = read ^ 0xff) ---
+        eor     r2, r2, #0xff
+        ldrh    r3, [r4, #CPU_A]
+        ldrb    r1, [r4, #CPU_C]
+        mov     r6, r2                   @ r6 = complemented value
+        uxtb    r0, r3                   @ a & 0xff
+        add     r2, r0, r6               @ (a&0xff) + value
+        add     r2, r2, r1               @ + c -> result (0..0x1ff)
+        lsr     r1, r2, #8               @ c = result > 0xff
+        strb    r1, [r4, #CPU_C]
+        eor     r0, r3, r6               @ a ^ value
+        eor     r1, r6, r2               @ value ^ result
+        bic     r0, r1, r0               @ (value^result) & ~(a^value)
+        ubfx    r0, r0, #7, #1           @ V = bit7
+        strb    r0, [r4, #CPU_V]
+        bfi     r3, r2, #0, #8           @ a = (a & 0xff00) | (result & 0xff)
+        strh    r3, [r4, #CPU_A]
+        uxtb    r2, r3
+        movs    r1, #1
+        SETZN
+        b       .L_handled
+.Lsbc_abx_w:
+        @ --- word: complement operand (value = read ^ 0xffff) ---
+        mvn     r2, r2                   @ ~read; low 16 bits = read ^ 0xffff
+        uxth    r2, r2
+        ldrh    r3, [r4, #CPU_A]
+        ldrb    r1, [r4, #CPU_C]
+        mov     r0, r2                   @ r0 = complemented value
+        add     r2, r3, r0               @ a + value
+        add     r2, r2, r1               @ + c -> result (0..0x1ffff)
+        lsr     r1, r2, #16              @ c = result > 0xffff
+        strb    r1, [r4, #CPU_C]
+        eor     r3, r3, r0               @ a ^ value
+        eor     r1, r0, r2               @ value ^ result
+        bic     r0, r1, r3               @ (value^result) & ~(a^value)
+        ubfx    r0, r0, #15, #1          @ V = bit15
+        strb    r0, [r4, #CPU_V]
+        strh    r2, [r4, #CPU_A]         @ a = result (16-bit)
+        uxth    r2, r2
+        movs    r1, #0
+        SETZN
+        b       .L_handled
+
+@ ---------------- absolute,Y (idx = Y, idxoff = CPU_Y) ----------------
+
+.Lopb9:                                 @ LDA aby  (read)
+        ABXY_ADDR 0, CPU_Y
+        ABS_READ_VALUE CPU_MF
+        ldrb    r1, [r4, #CPU_MF]
+        cbz     r1, .Llda_aby_w
+        ldrh    r3, [r4, #CPU_A]
+        bfi     r3, r2, #0, #8          @ a = (a & 0xff00) | value
+        strh    r3, [r4, #CPU_A]
+        uxtb    r2, r3                  @ SETZN value = a & 0xff
+        movs    r1, #1                  @ byte mode
+        SETZN
+        b       .L_handled
+.Llda_aby_w:
+        strh    r2, [r4, #CPU_A]        @ a = value (word)
+        movs    r1, #0                  @ word mode
+        SETZN
+        b       .L_handled
+
+.Lop39:                                 @ AND aby  (read)
+        ABXY_ADDR 0, CPU_Y
+        ABS_READ_VALUE CPU_MF
+        ldrb    r1, [r4, #CPU_MF]
+        cbz     r1, .Land_aby_w
+        ldrh    r3, [r4, #CPU_A]
+        and     r2, r3, r2              @ a & value (value is a byte)
+        bfi     r3, r2, #0, #8          @ a = (a & 0xff00) | (a & value)
+        strh    r3, [r4, #CPU_A]
+        uxtb    r2, r2
+        movs    r1, #1
+        SETZN
+        b       .L_handled
+.Land_aby_w:
+        ldrh    r3, [r4, #CPU_A]
+        and     r2, r3, r2              @ a & value (word)
+        strh    r2, [r4, #CPU_A]
+        movs    r1, #0
+        SETZN
+        b       .L_handled
+
+.Lop19:                                 @ ORA aby  (read)
+        ABXY_ADDR 0, CPU_Y
+        ABS_READ_VALUE CPU_MF
+        ldrb    r1, [r4, #CPU_MF]
+        cbz     r1, .Lora_aby_w
+        ldrh    r3, [r4, #CPU_A]
+        orr     r2, r3, r2              @ a | value (low byte)
+        bfi     r3, r2, #0, #8          @ a = (a & 0xff00) | (a | value)
+        strh    r3, [r4, #CPU_A]
+        uxtb    r2, r2
+        movs    r1, #1
+        SETZN
+        b       .L_handled
+.Lora_aby_w:
+        ldrh    r3, [r4, #CPU_A]
+        orr     r2, r3, r2
+        strh    r2, [r4, #CPU_A]
+        movs    r1, #0
+        SETZN
+        b       .L_handled
+
+.Lop59:                                 @ EOR aby  (read)
+        ABXY_ADDR 0, CPU_Y
+        ABS_READ_VALUE CPU_MF
+        ldrb    r1, [r4, #CPU_MF]
+        cbz     r1, .Leor_aby_w
+        ldrh    r3, [r4, #CPU_A]
+        eor     r2, r3, r2              @ a ^ value (low byte)
+        bfi     r3, r2, #0, #8          @ a = (a & 0xff00) | (a ^ value)
+        strh    r3, [r4, #CPU_A]
+        uxtb    r2, r2
+        movs    r1, #1
+        SETZN
+        b       .L_handled
+.Leor_aby_w:
+        ldrh    r3, [r4, #CPU_A]
+        eor     r2, r3, r2
+        strh    r2, [r4, #CPU_A]
+        movs    r1, #0
+        SETZN
+        b       .L_handled
+
+.Lopd9:                                 @ CMP aby  (read; sets C/Z/N; A unchanged)
+        ABXY_ADDR 0, CPU_Y
+        ABS_READ_VALUE CPU_MF
+        ldrb    r1, [r4, #CPU_MF]
+        cbz     r1, .Lcmp_aby_w
+        ldrh    r3, [r4, #CPU_A]
+        uxtb    r3, r3                  @ a & 0xff
+        mvn     r2, r2                  @ value ^ 0xff (low byte)
+        uxtb    r2, r2
+        add     r2, r3, r2              @ (a&0xff) + (value^0xff)
+        adds    r2, r2, #1             @ +1 -> result (0..0x1ff)
+        lsr     r3, r2, #8             @ c = result > 0xff
+        strb    r3, [r4, #CPU_C]
+        uxtb    r2, r2                  @ SETZN value = result & 0xff
+        movs    r1, #1
+        SETZN
+        b       .L_handled
+.Lcmp_aby_w:
+        ldrh    r3, [r4, #CPU_A]
+        mvn     r2, r2                  @ value ^ 0xffff
+        uxth    r2, r2
+        add     r2, r3, r2
+        adds    r2, r2, #1             @ result (0..0x1ffff)
+        lsr     r3, r2, #16            @ c = result > 0xffff
+        strb    r3, [r4, #CPU_C]
+        uxth    r2, r2                  @ SETZN value = result & 0xffff
+        movs    r1, #0
+        SETZN
+        b       .L_handled
+
+.Lopbe:                                 @ LDX aby  (read; XF width)
+        ABXY_ADDR 0, CPU_Y
+        ABS_READ_VALUE CPU_XF
+        ldrb    r1, [r4, #CPU_XF]
+        cbz     r1, .Lldx_aby_w
+        strh    r2, [r4, #CPU_X]        @ byte zero-extends into x
+        uxtb    r2, r2
+        movs    r1, #1
+        SETZN
+        b       .L_handled
+.Lldx_aby_w:
+        strh    r2, [r4, #CPU_X]
+        movs    r1, #0
+        SETZN
+        b       .L_handled
+
+.Lop99:                                 @ STA aby  (WRITE; MF width; writes via bridge)
+        ABXY_ADDR 1, CPU_Y
+        ldrb    r1, [r4, #CPU_MF]
+        cbz     r1, .Lsta_aby_w
+        ldrh    r2, [r4, #CPU_A]
+        uxtb    r2, r2                  @ a & 0xff
+        mov     r0, r4
+        mov     r1, r6                  @ addr_low
+        bl      cpu_thumb2_write
+        b       .L_handled
+.Lsta_aby_w:
+        ldrb    r0, [r4, #CPU_CYCLESUSED]
+        adds    r0, r0, #1
+        strb    r0, [r4, #CPU_CYCLESUSED]
+        ldrh    r2, [r4, #CPU_A]
+        uxtb    r2, r2                  @ low byte
+        mov     r0, r4
+        mov     r1, r6                  @ addr_low
+        bl      cpu_thumb2_write
+        add     r1, r6, #1
+        ubfx    r1, r1, #0, #24         @ addr_high = (addr_low+1) & 0xffffff
+        ldrh    r2, [r4, #CPU_A]        @ re-read a (clobbered by the BL)
+        lsr     r2, r2, #8             @ high byte
+        mov     r0, r4
+        bl      cpu_thumb2_write
+        b       .L_handled
+
+@ --- ADC aby (0x79) / SBC aby (0xf9): binary path only.  Decimal mode (D flag
+@ set) bails to .L_noteb BEFORE any operand fetch, so C's cpu_adc/cpu_sbc
+@ re-dispatch and fetch the operand themselves (pc is still post-opcode).  Maths
+@ identical to the abs ADC/SBC handlers; only the address source differs.
+.Lop79:                                 @ ADC aby  (binary; decimal -> C fallback)
+        ldrb    r0, [r4, #CPU_D]
+        cmp     r0, #0
+        bne     .L_noteb
+        ABXY_ADDR 0, CPU_Y
+        ABS_READ_VALUE CPU_MF
+        ldrb    r1, [r4, #CPU_MF]
+        cbz     r1, .Ladc_aby_w
+        @ --- byte: r2 = value (0..0xff) ---
+        ldrh    r3, [r4, #CPU_A]         @ r3 = a (high byte kept for writeback)
+        ldrb    r1, [r4, #CPU_C]         @ r1 = c (0/1)
+        mov     r6, r2                   @ r6 = value (preserve for V XOR)
+        uxtb    r0, r3                   @ r0 = a & 0xff
+        add     r2, r0, r6               @ (a&0xff) + value
+        add     r2, r2, r1               @ + c -> result (0..0x1ff)
+        lsr     r1, r2, #8               @ c = result > 0xff
+        strb    r1, [r4, #CPU_C]
+        eor     r0, r3, r6               @ (full a) ^ value -- bit7 is the sign
+        eor     r1, r6, r2               @ value ^ result
+        bic     r0, r1, r0               @ (value^result) & ~(a^value)
+        ubfx    r0, r0, #7, #1           @ V = bit7 (0/1)
+        strb    r0, [r4, #CPU_V]
+        bfi     r3, r2, #0, #8           @ a = (a & 0xff00) | (result & 0xff)
+        strh    r3, [r4, #CPU_A]
+        uxtb    r2, r3                   @ SETZN value = a & 0xff
+        movs    r1, #1                   @ byte mode
+        SETZN
+        b       .L_handled
+.Ladc_aby_w:
+        @ --- word: r2 = value (0..0xffff) ---
+        ldrh    r3, [r4, #CPU_A]         @ r3 = a
+        ldrb    r1, [r4, #CPU_C]         @ r1 = c
+        mov     r0, r2                   @ r0 = value (preserve for V XOR)
+        add     r2, r3, r0               @ a + value
+        add     r2, r2, r1               @ + c -> result (0..0x1ffff)
+        lsr     r1, r2, #16              @ c = result > 0xffff
+        strb    r1, [r4, #CPU_C]
+        eor     r3, r3, r0               @ a ^ value
+        eor     r1, r0, r2               @ value ^ result
+        bic     r0, r1, r3               @ (value^result) & ~(a^value)
+        ubfx    r0, r0, #15, #1          @ V = bit15 (0/1)
+        strb    r0, [r4, #CPU_V]
+        strh    r2, [r4, #CPU_A]         @ a = result (16-bit)
+        uxth    r2, r2                   @ SETZN value = result & 0xffff
+        movs    r1, #0                   @ word mode
+        SETZN
+        b       .L_handled
+
+.Lopf9:                                 @ SBC aby  (binary; decimal -> C fallback)
+        ldrb    r0, [r4, #CPU_D]
+        cmp     r0, #0
+        bne     .L_noteb
+        ABXY_ADDR 0, CPU_Y
+        ABS_READ_VALUE CPU_MF
+        ldrb    r1, [r4, #CPU_MF]
+        cbz     r1, .Lsbc_aby_w
+        @ --- byte: complement operand first (value = read ^ 0xff) ---
+        eor     r2, r2, #0xff
+        ldrh    r3, [r4, #CPU_A]
+        ldrb    r1, [r4, #CPU_C]
+        mov     r6, r2                   @ r6 = complemented value
+        uxtb    r0, r3                   @ a & 0xff
+        add     r2, r0, r6               @ (a&0xff) + value
+        add     r2, r2, r1               @ + c -> result (0..0x1ff)
+        lsr     r1, r2, #8               @ c = result > 0xff
+        strb    r1, [r4, #CPU_C]
+        eor     r0, r3, r6               @ a ^ value
+        eor     r1, r6, r2               @ value ^ result
+        bic     r0, r1, r0               @ (value^result) & ~(a^value)
+        ubfx    r0, r0, #7, #1           @ V = bit7
+        strb    r0, [r4, #CPU_V]
+        bfi     r3, r2, #0, #8           @ a = (a & 0xff00) | (result & 0xff)
+        strh    r3, [r4, #CPU_A]
+        uxtb    r2, r3
+        movs    r1, #1
+        SETZN
+        b       .L_handled
+.Lsbc_aby_w:
+        @ --- word: complement operand (value = read ^ 0xffff) ---
+        mvn     r2, r2                   @ ~read; low 16 bits = read ^ 0xffff
+        uxth    r2, r2
+        ldrh    r3, [r4, #CPU_A]
+        ldrb    r1, [r4, #CPU_C]
+        mov     r0, r2                   @ r0 = complemented value
+        add     r2, r3, r0               @ a + value
+        add     r2, r2, r1               @ + c -> result (0..0x1ffff)
+        lsr     r1, r2, #16              @ c = result > 0xffff
+        strb    r1, [r4, #CPU_C]
+        eor     r3, r3, r0               @ a ^ value
+        eor     r1, r0, r2               @ value ^ result
+        bic     r0, r1, r3               @ (value^result) & ~(a^value)
+        ubfx    r0, r0, #15, #1          @ V = bit15
+        strb    r0, [r4, #CPU_V]
+        strh    r2, [r4, #CPU_A]         @ a = result (16-bit)
+        uxth    r2, r2
+        movs    r1, #0
+        SETZN
+        b       .L_handled
+
+
+@ ===========================================================================
+@ Stage 3F Pass 2 -- absolute,X RMW / BIT opcodes.  Each handler is the VERBATIM
+@ abs ancestor (Stage 3E Pass 2) with ABS_ADDR replaced by ABXY_ADDR.  The ALU
+@ tails, SETZN, reversed word write-back and BIT flag extraction are byte-identical
+@ because cpu_adrAbx feeds the SAME cpu_asl/cpu_lsr/cpu_rol/cpu_ror/cpu_inc/
+@ cpu_dec/cpu_bit helpers as cpu_adrAbs (cpu.c:1096 ASL abx, 1280 BIT abx,
+@ 1292 ROL abx, 1512 LSR abx, 1719 ROR abx, 2314 DEC abx, 2509 INC abx -- all
+@ call cpu_adrAbx(,,write)).  The ONLY new semantics are in ABXY_ADDR: the +X
+@ term in the effective address and the write-only page-cross penalty.  BIT abx
+@ (0x3c) is a READ (write=0, no page-cross penalty); the 6 RMW opcodes are
+@ WRITES (write=1, penalty applies when xf==0 OR page crossed).
+@
+@ RMW CYCLE STACKING (oracle-critical): RMW abx word mode with a page-cross
+@ charges TWO independent cycle increments that MUST both accumulate:
+@   (1) +1 from the page-cross penalty inside ABXY_ADDR 1, CPU_X (xf==0 OR
+@       (adr>>8)!=((adr+X)>>8)) -- cpu.c:464, mirrored in the ABXY_ADDR macro.
+@   (2) +2 from the RMW word-mode tail (the `adds r0,r0,#2` copied verbatim from
+@       the abs handler) -- cpu.c cpu_asl..cpu_dec charge cyclesUsed += 2.
+@ Total = +3 worst case.  The two charges are in different code regions (macro
+@ vs tail), both read-modify-write [r4,#CPU_CYCLESUSED] (ldrb/adds/strb), so they
+@ stack -- DO NOT remove or merge either.  BIT abx word mode pays only the +1
+@ from ABS_READ_VALUE (read, no ABXY_ADDR penalty, no RMW tail).
+@ ===========================================================================
+
+.Lop1e:                                 @ ASL abx  (RMW; reversed word write-back)
+        ABXY_ADDR 1, CPU_X
+        ldrb    r1, [r4, #CPU_MF]
+        cbz     r1, .Lasl_abx_w
+        @ --- byte: result = value << 1; c = result & 0x100 ---
+        mov     r0, r4
+        mov     r1, r6                  @ addr_low
+        bl      cpu_thumb2_read
+        uxtb    r2, r0                  @ value (0..0xff)
+        lsl     r2, r2, #1              @ result = value << 1 (0..0x1fe)
+        lsr     r3, r2, #8              @ c = bit8
+        strb    r3, [r4, #CPU_C]
+        uxtb    r2, r2                  @ result & 0xff
+        push    {r2}                    @ stash for setZN (write clobbers r2)
+        mov     r0, r4
+        mov     r1, r6                  @ addr_low
+        bl      cpu_thumb2_write
+        pop     {r2}
+        movs    r1, #1                  @ byte mode
+        SETZN
+        b       .L_handled
+.Lasl_abx_w:
+        @ --- word: cyclesUsed += 2; read word; result = value << 1; c = bit16 ---
+        ldrb    r0, [r4, #CPU_CYCLESUSED]
+        adds    r0, r0, #2
+        strb    r0, [r4, #CPU_CYCLESUSED]
+        mov     r0, r4
+        mov     r1, r6                  @ addr_low
+        bl      cpu_thumb2_read         @ r0 = low byte
+        push    {r0}                    @ stash low byte across high read
+        add     r1, r6, #1
+        ubfx    r1, r1, #0, #24         @ addr_high = (addr_low+1) & 0xffffff
+        mov     r0, r4
+        bl      cpu_thumb2_read         @ r0 = high byte
+        pop     {r3}                    @ r3 = low byte
+        orr     r2, r3, r0, lsl #8      @ word value
+        lsl     r2, r2, #1              @ result = value << 1 (0..0x1fffe)
+        lsr     r3, r2, #16             @ c = bit16
+        strb    r3, [r4, #CPU_C]
+        uxth    r2, r2                  @ result & 0xffff
+        push    {r2}                    @ stash result for low write + setZN
+        lsr     r2, r2, #8              @ high byte
+        add     r1, r6, #1
+        ubfx    r1, r1, #0, #24         @ addr_high
+        mov     r0, r4
+        bl      cpu_thumb2_write        @ write HIGH first (reversed)
+        ldr     r2, [sp]                @ reload result (still pushed)
+        uxtb    r2, r2                  @ low byte
+        mov     r0, r4
+        mov     r1, r6                  @ addr_low
+        bl      cpu_thumb2_write        @ write LOW second
+        pop     {r2}                    @ r2 = result (word)
+        movs    r1, #0                  @ word mode
+        SETZN
+        b       .L_handled
+
+.Lop5e:                                 @ LSR abx  (RMW; reversed word write-back)
+        ABXY_ADDR 1, CPU_X
+        ldrb    r1, [r4, #CPU_MF]
+        cbz     r1, .Llsr_abx_w
+        @ --- byte: c = value & 1 (capture first); result = value >> 1 ---
+        mov     r0, r4
+        mov     r1, r6
+        bl      cpu_thumb2_read
+        uxtb    r2, r0                  @ value
+        ubfx    r3, r2, #0, #1          @ c = value & 1
+        strb    r3, [r4, #CPU_C]
+        lsr     r2, r2, #1              @ result = value >> 1
+        push    {r2}
+        mov     r0, r4
+        mov     r1, r6
+        bl      cpu_thumb2_write
+        pop     {r2}
+        movs    r1, #1
+        SETZN
+        b       .L_handled
+.Llsr_abx_w:
+        @ --- word: cyclesUsed += 2 ---
+        ldrb    r0, [r4, #CPU_CYCLESUSED]
+        adds    r0, r0, #2
+        strb    r0, [r4, #CPU_CYCLESUSED]
+        mov     r0, r4
+        mov     r1, r6
+        bl      cpu_thumb2_read
+        push    {r0}
+        add     r1, r6, #1
+        ubfx    r1, r1, #0, #24
+        mov     r0, r4
+        bl      cpu_thumb2_read
+        pop     {r3}
+        orr     r2, r3, r0, lsl #8      @ word value
+        ubfx    r3, r2, #0, #1          @ c = value & 1
+        strb    r3, [r4, #CPU_C]
+        lsr     r2, r2, #1              @ result = value >> 1
+        push    {r2}
+        lsr     r2, r2, #8
+        add     r1, r6, #1
+        ubfx    r1, r1, #0, #24
+        mov     r0, r4
+        bl      cpu_thumb2_write        @ HIGH first
+        ldr     r2, [sp]
+        uxtb    r2, r2
+        mov     r0, r4
+        mov     r1, r6
+        bl      cpu_thumb2_write        @ LOW second
+        pop     {r2}
+        movs    r1, #0
+        SETZN
+        b       .L_handled
+
+.Lop3e:                                 @ ROL abx  (RMW; reversed word write-back)
+        ABXY_ADDR 1, CPU_X
+        ldrb    r1, [r4, #CPU_MF]
+        cbz     r1, .Lrol_abx_w
+        @ --- byte: result = (value<<1) | c; new c = result & 0x100 ---
+        mov     r0, r4
+        mov     r1, r6
+        bl      cpu_thumb2_read
+        uxtb    r2, r0                  @ value
+        ldrb    r3, [r4, #CPU_C]        @ old c (shifted-in bit)
+        lsl     r2, r2, #1
+        orr     r2, r2, r3              @ result = (value<<1) | c (0..0x1ff)
+        lsr     r3, r2, #8              @ c = bit8
+        strb    r3, [r4, #CPU_C]
+        uxtb    r2, r2                  @ result & 0xff
+        push    {r2}
+        mov     r0, r4
+        mov     r1, r6
+        bl      cpu_thumb2_write
+        pop     {r2}
+        movs    r1, #1
+        SETZN
+        b       .L_handled
+.Lrol_abx_w:
+        @ --- word: cyclesUsed += 2 ---
+        ldrb    r0, [r4, #CPU_CYCLESUSED]
+        adds    r0, r0, #2
+        strb    r0, [r4, #CPU_CYCLESUSED]
+        mov     r0, r4
+        mov     r1, r6
+        bl      cpu_thumb2_read
+        push    {r0}
+        add     r1, r6, #1
+        ubfx    r1, r1, #0, #24
+        mov     r0, r4
+        bl      cpu_thumb2_read
+        pop     {r3}
+        orr     r2, r3, r0, lsl #8      @ word value
+        ldrb    r3, [r4, #CPU_C]        @ old c
+        lsl     r2, r2, #1
+        orr     r2, r2, r3              @ result = (value<<1) | c (0..0x1ffff)
+        lsr     r3, r2, #16             @ c = bit16
+        strb    r3, [r4, #CPU_C]
+        uxth    r2, r2
+        push    {r2}
+        lsr     r2, r2, #8
+        add     r1, r6, #1
+        ubfx    r1, r1, #0, #24
+        mov     r0, r4
+        bl      cpu_thumb2_write        @ HIGH first
+        ldr     r2, [sp]
+        uxtb    r2, r2
+        mov     r0, r4
+        mov     r1, r6
+        bl      cpu_thumb2_write        @ LOW second
+        pop     {r2}
+        movs    r1, #0
+        SETZN
+        b       .L_handled
+
+.Lop7e:                                 @ ROR abx  (RMW; reversed word write-back)
+        ABXY_ADDR 1, CPU_X
+        ldrb    r1, [r4, #CPU_MF]
+        cbz     r1, .Lror_abx_w
+        @ --- byte: carry = value & 1; result = (value>>1)|(c<<7); c set LAST ---
+        mov     r0, r4
+        mov     r1, r6
+        bl      cpu_thumb2_read
+        uxtb    r2, r0                  @ value
+        ubfx    r3, r2, #0, #1          @ carry = value & 1 (new c)
+        push    {r3}                    @ stash carry across write+setZN
+        ldrb    r1, [r4, #CPU_C]        @ old c (shifted-in bit)
+        lsr     r2, r2, #1
+        lsl     r1, r1, #7              @ c << 7
+        orr     r2, r2, r1             @ result = (value>>1) | (c<<7)
+        push    {r2}
+        mov     r0, r4
+        mov     r1, r6
+        bl      cpu_thumb2_write
+        pop     {r2}                    @ result byte
+        movs    r1, #1
+        SETZN
+        pop     {r3}                    @ carry
+        strb    r3, [r4, #CPU_C]        @ c = carry (set after setZN, per cpu.c)
+        b       .L_handled
+.Lror_abx_w:
+        @ --- word: cyclesUsed += 2 ---
+        ldrb    r0, [r4, #CPU_CYCLESUSED]
+        adds    r0, r0, #2
+        strb    r0, [r4, #CPU_CYCLESUSED]
+        mov     r0, r4
+        mov     r1, r6
+        bl      cpu_thumb2_read
+        push    {r0}
+        add     r1, r6, #1
+        ubfx    r1, r1, #0, #24
+        mov     r0, r4
+        bl      cpu_thumb2_read
+        pop     {r3}
+        orr     r2, r3, r0, lsl #8      @ word value
+        ubfx    r3, r2, #0, #1          @ carry = value & 1
+        push    {r3}                    @ stash carry
+        ldrb    r1, [r4, #CPU_C]
+        lsr     r2, r2, #1
+        lsl     r1, r1, #15             @ c << 15
+        orr     r2, r2, r1             @ result = (value>>1) | (c<<15)
+        push    {r2}
+        lsr     r2, r2, #8
+        add     r1, r6, #1
+        ubfx    r1, r1, #0, #24
+        mov     r0, r4
+        bl      cpu_thumb2_write        @ HIGH first
+        ldr     r2, [sp]                @ reload result (top of stack)
+        uxtb    r2, r2
+        mov     r0, r4
+        mov     r1, r6
+        bl      cpu_thumb2_write        @ LOW second
+        pop     {r2}                    @ result
+        movs    r1, #0
+        SETZN
+        pop     {r3}                    @ carry
+        strb    r3, [r4, #CPU_C]
+        b       .L_handled
+
+.Lopfe:                                 @ INC abx  (RMW; reversed word write-back; no carry change)
+        ABXY_ADDR 1, CPU_X
+        ldrb    r1, [r4, #CPU_MF]
+        cbz     r1, .Linc_abx_w
+        @ --- byte: result = value + 1 ---
+        mov     r0, r4
+        mov     r1, r6
+        bl      cpu_thumb2_read
+        uxtb    r2, r0
+        adds    r2, r2, #1              @ result (0..0x100)
+        uxtb    r2, r2
+        push    {r2}
+        mov     r0, r4
+        mov     r1, r6
+        bl      cpu_thumb2_write
+        pop     {r2}
+        movs    r1, #1
+        SETZN
+        b       .L_handled
+.Linc_abx_w:
+        @ --- word: cyclesUsed += 2 ---
+        ldrb    r0, [r4, #CPU_CYCLESUSED]
+        adds    r0, r0, #2
+        strb    r0, [r4, #CPU_CYCLESUSED]
+        mov     r0, r4
+        mov     r1, r6
+        bl      cpu_thumb2_read
+        push    {r0}
+        add     r1, r6, #1
+        ubfx    r1, r1, #0, #24
+        mov     r0, r4
+        bl      cpu_thumb2_read
+        pop     {r3}
+        orr     r2, r3, r0, lsl #8
+        adds    r2, r2, #1              @ result (0..0x10000)
+        uxth    r2, r2
+        push    {r2}
+        lsr     r2, r2, #8
+        add     r1, r6, #1
+        ubfx    r1, r1, #0, #24
+        mov     r0, r4
+        bl      cpu_thumb2_write
+        ldr     r2, [sp]
+        uxtb    r2, r2
+        mov     r0, r4
+        mov     r1, r6
+        bl      cpu_thumb2_write
+        pop     {r2}
+        movs    r1, #0
+        SETZN
+        b       .L_handled
+
+.Lopde:                                 @ DEC abx  (RMW; reversed word write-back; no carry change)
+        ABXY_ADDR 1, CPU_X
+        ldrb    r1, [r4, #CPU_MF]
+        cbz     r1, .Ldec_abx_w
+        @ --- byte: result = value - 1 ---
+        mov     r0, r4
+        mov     r1, r6
+        bl      cpu_thumb2_read
+        uxtb    r2, r0
+        subs    r2, r2, #1              @ result (-1..0xfe); uxtb wraps 0->0xff
+        uxtb    r2, r2
+        push    {r2}
+        mov     r0, r4
+        mov     r1, r6
+        bl      cpu_thumb2_write
+        pop     {r2}
+        movs    r1, #1
+        SETZN
+        b       .L_handled
+.Ldec_abx_w:
+        @ --- word: cyclesUsed += 2 ---
+        ldrb    r0, [r4, #CPU_CYCLESUSED]
+        adds    r0, r0, #2
+        strb    r0, [r4, #CPU_CYCLESUSED]
+        mov     r0, r4
+        mov     r1, r6
+        bl      cpu_thumb2_read
+        push    {r0}
+        add     r1, r6, #1
+        ubfx    r1, r1, #0, #24
+        mov     r0, r4
+        bl      cpu_thumb2_read
+        pop     {r3}
+        orr     r2, r3, r0, lsl #8
+        subs    r2, r2, #1
+        uxth    r2, r2
+        push    {r2}
+        lsr     r2, r2, #8
+        add     r1, r6, #1
+        ubfx    r1, r1, #0, #24
+        mov     r0, r4
+        bl      cpu_thumb2_write
+        ldr     r2, [sp]
+        uxtb    r2, r2
+        mov     r0, r4
+        mov     r1, r6
+        bl      cpu_thumb2_write
+        pop     {r2}
+        movs    r1, #0
+        SETZN
+        b       .L_handled
+
+.Lop3c:                                 @ BIT abx  (read-only; N/V from memory value, Z from AND)
+        ABXY_ADDR 0, CPU_X
+        ABS_READ_VALUE CPU_MF
+        ldrb    r1, [r4, #CPU_MF]
+        cbz     r1, .Lbit_abx_w
+        @ --- byte: r2 = value; z=((a&0xff)&value)==0; n=value&0x80; v=value&0x40 ---
+        ldrh    r3, [r4, #CPU_A]
+        uxtb    r3, r3                  @ a & 0xff
+        tst     r3, r2                  @ (a&0xff) & value
+        ite     eq
+        moveq   r3, #1                  @ z = 1 if zero
+        movne   r3, #0
+        strb    r3, [r4, #CPU_Z]
+        ubfx    r3, r2, #7, #1          @ n = value & 0x80 -> bit7
+        strb    r3, [r4, #CPU_N]
+        ubfx    r3, r2, #6, #1          @ v = value & 0x40 -> bit6
+        strb    r3, [r4, #CPU_V]
+        b       .L_handled
+.Lbit_abx_w:
+        @ --- word: r2 = value; z=(a&value)==0; n=value&0x8000; v=value&0x4000 ---
+        ldrh    r3, [r4, #CPU_A]
+        tst     r3, r2                  @ a & value
+        ite     eq
+        moveq   r3, #1
+        movne   r3, #0
+        strb    r3, [r4, #CPU_Z]
+        ubfx    r3, r2, #15, #1         @ n = value & 0x8000 -> bit15
+        strb    r3, [r4, #CPU_N]
+        ubfx    r3, r2, #14, #1         @ v = value & 0x4000 -> bit14
+        strb    r3, [r4, #CPU_V]
+        b       .L_handled
         .size   snes_thumb2_try, .-snes_thumb2_try
         .size   snes_thumb2_step, .-snes_thumb2_step
 
