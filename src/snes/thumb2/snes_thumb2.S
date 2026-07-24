@@ -35,6 +35,11 @@
 @              ADC/SBC abl (binary only -- decimal bails to C before operand
 @              fetch); abl,X (alx) -- same 8 ops with +X 24-bit wrap (NOT uxth).
 @   dp,Y (bank 0x00, 16-bit wrap, dp&0xff cycle): STX LDX dpy (XF width).
+@   stack push/pull (implied): PHP PHD PHA PHK PHY PHB PHX (push) and
+@              PLP PLD PLA PLY PLB PLX (pull).  All via HOOKED bridges;
+@              e-mode SP clamp (sp&0xff|0x100) on every byte.  PLP runs the
+@              full setFlags re-normalization (e-force M/X, SP clamp, XF X/Y
+@              truncation) -- same tail as REP/SEP.
 @ Every width-sensitive opcode honours the M/X/E flags exactly as cpu_doOpcode
 @ does. Unsupported opcodes return 0 and leave *cpu untouched, so the C
 @ dispatcher falls through to cpu_doOpcode(cpu, opcode) on the fetched byte.
@@ -529,6 +534,62 @@
         ubfx    r6, r6, #0, #24         @ r6 = (pointer + Y) & 0xffffff
         .endm
 
+@ --- stack push/pull primitives (Stage 3K) ---
+@ All stack accesses use the HOOKED cpu_thumb2_read/write bridges.
+@ r4=Cpu* throughout.  r0-r3 are clobbered; r6 (callee-saved) survives.
+@ Emulation-mode SP clamp: (sp & 0xff) | 0x100, applied AFTER inc/dec.
+
+@ PUSH_BYTE: caller sets r2 = byte value.  Writes [SP], SP--, e-clamp.
+        .macro PUSH_BYTE
+        ldrh    r1, [r4, #CPU_SP]
+        mov     r0, r4                  @ Cpu*
+        bl      cpu_thumb2_write        @ [SP] = r2
+        ldrh    r3, [r4, #CPU_SP]
+        subs    r3, r3, #1
+        strh    r3, [r4, #CPU_SP]
+        ldrb    r0, [r4, #CPU_E]
+        cbz     r0, 81f
+        uxtb    r3, r3
+        add.w   r3, r3, #0x100
+        strh    r3, [r4, #CPU_SP]
+81:
+        .endm
+
+@ PULL_BYTE: SP++, e-clamp, reads [SP] -> r0 (byte).  Clobbers r0-r3.
+        .macro PULL_BYTE
+        ldrh    r3, [r4, #CPU_SP]
+        adds    r3, r3, #1
+        strh    r3, [r4, #CPU_SP]
+        ldrb    r0, [r4, #CPU_E]
+        cbz     r0, 82f
+        uxtb    r3, r3
+        add.w   r3, r3, #0x100
+        strh    r3, [r4, #CPU_SP]
+82:
+        ldrh    r1, [r4, #CPU_SP]
+        mov     r0, r4
+        bl      cpu_thumb2_read
+        uxtb    r0, r0
+        .endm
+
+@ PUSH_WORD: caller sets r6 = word value.  HIGH byte first, then LOW.
+@ r6 survives both PUSH_BYTE BLs (callee-saved).
+        .macro PUSH_WORD
+        lsr     r2, r6, #8              @ HIGH byte
+        PUSH_BYTE
+        uxtb    r2, r6                  @ LOW byte (r6 intact)
+        PUSH_BYTE
+        .endm
+
+@ PULL_WORD: returns word in r6.  LOW first, then HIGH.
+        .macro PULL_WORD
+        PULL_BYTE                        @ r0 = low
+        mov     r6, r0
+        PULL_BYTE                        @ r0 = high
+        lsl     r0, r0, #8
+        orr     r6, r6, r0
+        .endm
+
 @ Dense O(1) opcode dispatch.  Table entries carry the Thumb bit because the
 @ local handler labels are not function symbols and therefore do not acquire
 @ it automatically.
@@ -948,6 +1009,32 @@
         .word   .Lop96 + 1
         .elseif \op == 0xb6
         .word   .Lopb6 + 1
+        .elseif \op == 0x08
+        .word   .Lop08 + 1
+        .elseif \op == 0x0b
+        .word   .Lop0b + 1
+        .elseif \op == 0x28
+        .word   .Lop28 + 1
+        .elseif \op == 0x2b
+        .word   .Lop2b + 1
+        .elseif \op == 0x48
+        .word   .Lop48 + 1
+        .elseif \op == 0x4b
+        .word   .Lop4b + 1
+        .elseif \op == 0x5a
+        .word   .Lop5a + 1
+        .elseif \op == 0x68
+        .word   .Lop68 + 1
+        .elseif \op == 0x7a
+        .word   .Lop7a + 1
+        .elseif \op == 0x8b
+        .word   .Lop8b + 1
+        .elseif \op == 0xab
+        .word   .Lopab + 1
+        .elseif \op == 0xda
+        .word   .Lopda + 1
+        .elseif \op == 0xfa
+        .word   .Lopfa + 1
         .else
         .word   .L_noteb + 1
         .endif
@@ -7214,6 +7301,226 @@ snes_thumb2_step:
 .Lldx_dpy_w:
         strh    r2, [r4, #CPU_X]
         movs    r1, #0
+        SETZN
+        b       .L_handled
+
+@ ===== Stage 3K: stack push/pull (13 opcodes) =====
+@ All stack R/W via HOOKED cpu_thumb2_read/write.  e-mode SP clamp in macros.
+@ r4=Cpu*, r5=contract (preserved), r6=callee-saved scratch.
+
+@ --- 0x08 PHP: push flags byte ---
+.Lop08:
+        ldrb    r2, [r4, #CPU_N]
+        lsl     r2, r2, #7
+        ldrb    r1, [r4, #CPU_V]
+        lsl     r1, r1, #6
+        orr     r2, r1
+        ldrb    r1, [r4, #CPU_MF]
+        lsl     r1, r1, #5
+        orr     r2, r1
+        ldrb    r1, [r4, #CPU_XF]
+        lsl     r1, r1, #4
+        orr     r2, r1
+        ldrb    r1, [r4, #CPU_D]
+        lsl     r1, r1, #3
+        orr     r2, r1
+        ldrb    r1, [r4, #CPU_I]
+        lsl     r1, r1, #2
+        orr     r2, r1
+        ldrb    r1, [r4, #CPU_Z]
+        lsl     r1, r1, #1
+        orr     r2, r1
+        ldrb    r1, [r4, #CPU_C]
+        orr     r2, r1
+        PUSH_BYTE
+        b       .L_handled
+
+@ --- 0x0b PHD: push DP word ---
+.Lop0b:
+        ldrh    r6, [r4, #CPU_DP]
+        PUSH_WORD
+        b       .L_handled
+
+@ --- 0x28 PLP: pull byte -> setFlags (full re-normalization) ---
+.Lop28:
+        PULL_BYTE                       @ r0 = flags byte
+        ubfx    r1, r0, #7, #1          @ N
+        strb    r1, [r4, #CPU_N]
+        ubfx    r1, r0, #6, #1          @ V
+        strb    r1, [r4, #CPU_V]
+        ubfx    r1, r0, #5, #1          @ MF
+        strb    r1, [r4, #CPU_MF]
+        ubfx    r1, r0, #4, #1          @ XF
+        strb    r1, [r4, #CPU_XF]
+        ubfx    r1, r0, #3, #1          @ D
+        strb    r1, [r4, #CPU_D]
+        ubfx    r1, r0, #2, #1          @ I
+        strb    r1, [r4, #CPU_I]
+        ubfx    r1, r0, #1, #1          @ Z
+        strb    r1, [r4, #CPU_Z]
+        ubfx    r1, r0, #0, #1          @ C
+        strb    r1, [r4, #CPU_C]
+        @ setFlags re-normalization tail (mirrors REP/SEP handler)
+        ldrb    r0, [r4, #CPU_E]
+        cbz     r0, .Lplp_xf
+        movs    r0, #1
+        strb    r0, [r4, #CPU_MF]       @ emulation pins M=X=1
+        strb    r0, [r4, #CPU_XF]
+        ldrh    r1, [r4, #CPU_SP]
+        uxtb    r1, r1
+        add.w   r1, r1, #0x100
+        strh    r1, [r4, #CPU_SP]
+.Lplp_xf:
+        ldrb    r0, [r4, #CPU_XF]
+        cbz     r0, .Lplp_done
+        ldrh    r1, [r4, #CPU_X]
+        uxtb    r1, r1
+        strh    r1, [r4, #CPU_X]
+        ldrh    r1, [r4, #CPU_Y]
+        uxtb    r1, r1
+        strh    r1, [r4, #CPU_Y]
+.Lplp_done:
+        b       .L_handled
+
+@ --- 0x2b PLD: pull word -> DP, setZN(word) ---
+.Lop2b:
+        PULL_WORD                       @ r6 = word
+        strh    r6, [r4, #CPU_DP]
+        mov     r2, r6
+        movs    r1, #0                  @ word mode
+        SETZN
+        b       .L_handled
+
+@ --- 0x48 PHA: push A (MF width) ---
+.Lop48:
+        ldrb    r0, [r4, #CPU_MF]
+        cbz     r0, .Lpha_w
+        ldrb    r2, [r4, #CPU_A]        @ byte: push A low
+        PUSH_BYTE
+        b       .L_handled
+.Lpha_w:
+        ldrb    r0, [r4, #CPU_CYCLESUSED]
+        adds    r0, r0, #1
+        strb    r0, [r4, #CPU_CYCLESUSED]
+        ldrh    r6, [r4, #CPU_A]
+        PUSH_WORD
+        b       .L_handled
+
+@ --- 0x4b PHK: push K byte ---
+.Lop4b:
+        ldrb    r2, [r4, #CPU_K]
+        PUSH_BYTE
+        b       .L_handled
+
+@ --- 0x5a PHY: push Y (XF width) ---
+.Lop5a:
+        ldrb    r0, [r4, #CPU_XF]
+        cbz     r0, .Lphy_w
+        ldrb    r2, [r4, #CPU_Y]
+        PUSH_BYTE
+        b       .L_handled
+.Lphy_w:
+        ldrb    r0, [r4, #CPU_CYCLESUSED]
+        adds    r0, r0, #1
+        strb    r0, [r4, #CPU_CYCLESUSED]
+        ldrh    r6, [r4, #CPU_Y]
+        PUSH_WORD
+        b       .L_handled
+
+@ --- 0x68 PLA: pull -> A (MF width), setZN ---
+.Lop68:
+        ldrb    r0, [r4, #CPU_MF]
+        cbz     r0, .Lpla_w
+        PULL_BYTE                       @ r0 = byte
+        ldrh    r3, [r4, #CPU_A]
+        bfi     r3, r0, #0, #8         @ A = (A & 0xff00) | byte
+        strh    r3, [r4, #CPU_A]
+        uxtb    r2, r3
+        ldrb    r1, [r4, #CPU_MF]       @ byte-mode flag
+        SETZN
+        b       .L_handled
+.Lpla_w:
+        ldrb    r0, [r4, #CPU_CYCLESUSED]
+        adds    r0, r0, #1
+        strb    r0, [r4, #CPU_CYCLESUSED]
+        PULL_WORD                       @ r6 = word
+        strh    r6, [r4, #CPU_A]
+        mov     r2, r6
+        movs    r1, #0                  @ word mode
+        SETZN
+        b       .L_handled
+
+@ --- 0x7a PLY: pull -> Y (XF width), setZN ---
+.Lop7a:
+        ldrb    r0, [r4, #CPU_XF]
+        cbz     r0, .Lply_w
+        PULL_BYTE                       @ r0 = byte
+        uxtb    r6, r0                  @ zero-extend (high = 0)
+        strh    r6, [r4, #CPU_Y]
+        mov     r2, r6
+        ldrb    r1, [r4, #CPU_XF]       @ byte-mode flag
+        SETZN
+        b       .L_handled
+.Lply_w:
+        ldrb    r0, [r4, #CPU_CYCLESUSED]
+        adds    r0, r0, #1
+        strb    r0, [r4, #CPU_CYCLESUSED]
+        PULL_WORD                       @ r6 = word
+        strh    r6, [r4, #CPU_Y]
+        mov     r2, r6
+        movs    r1, #0                  @ word mode
+        SETZN
+        b       .L_handled
+
+@ --- 0x8b PHB: push DB byte ---
+.Lop8b:
+        ldrb    r2, [r4, #CPU_DB]
+        PUSH_BYTE
+        b       .L_handled
+
+@ --- 0xab PLB: pull -> DB, setZN(byte) ---
+.Lopab:
+        PULL_BYTE                       @ r0 = byte
+        strb    r0, [r4, #CPU_DB]
+        mov     r2, r0
+        movs    r1, #1                  @ byte mode
+        SETZN
+        b       .L_handled
+
+@ --- 0xda PHX: push X (XF width) ---
+.Lopda:
+        ldrb    r0, [r4, #CPU_XF]
+        cbz     r0, .Lphx_w
+        ldrb    r2, [r4, #CPU_X]
+        PUSH_BYTE
+        b       .L_handled
+.Lphx_w:
+        ldrb    r0, [r4, #CPU_CYCLESUSED]
+        adds    r0, r0, #1
+        strb    r0, [r4, #CPU_CYCLESUSED]
+        ldrh    r6, [r4, #CPU_X]
+        PUSH_WORD
+        b       .L_handled
+
+@ --- 0xfa PLX: pull -> X (XF width), setZN ---
+.Lopfa:
+        ldrb    r0, [r4, #CPU_XF]
+        cbz     r0, .Lplx_w
+        PULL_BYTE                       @ r0 = byte
+        uxtb    r6, r0                  @ zero-extend (high = 0)
+        strh    r6, [r4, #CPU_X]
+        mov     r2, r6
+        ldrb    r1, [r4, #CPU_XF]       @ byte-mode flag
+        SETZN
+        b       .L_handled
+.Lplx_w:
+        ldrb    r0, [r4, #CPU_CYCLESUSED]
+        adds    r0, r0, #1
+        strb    r0, [r4, #CPU_CYCLESUSED]
+        PULL_WORD                       @ r6 = word
+        strh    r6, [r4, #CPU_X]
+        mov     r2, r6
+        movs    r1, #0                  @ word mode
         SETZN
         b       .L_handled
 
