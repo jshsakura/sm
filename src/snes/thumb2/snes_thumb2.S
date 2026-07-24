@@ -590,6 +590,52 @@
         orr     r6, r6, r0
         .endm
 
+@ SETFLAGS_TAIL: caller provides r0 = flags byte.  Unpacks all 8 flag bits
+@ into their Cpu fields (each stored as 0/1, matching cpu_setFlags's bool
+@ assignment of val&mask), then runs the setFlags re-normalization that
+@ cpu_setFlags applies: e-check (emulation pins M=X=1 and clamps SP to
+@ (sp&0xff)|0x100) then xf-check (truncates X and Y to 8 bits).  Clobbers
+@ r0,r1.  REUSED by PLP (0x28) and RTI (0x40) -- both call cpu_setFlags on
+@ a pulled byte.  Numeric labels 89/90 are unused elsewhere in this file.
+        .macro SETFLAGS_TAIL
+        ubfx    r1, r0, #7, #1          @ N
+        strb    r1, [r4, #CPU_N]
+        ubfx    r1, r0, #6, #1          @ V
+        strb    r1, [r4, #CPU_V]
+        ubfx    r1, r0, #5, #1          @ MF
+        strb    r1, [r4, #CPU_MF]
+        ubfx    r1, r0, #4, #1          @ XF
+        strb    r1, [r4, #CPU_XF]
+        ubfx    r1, r0, #3, #1          @ D
+        strb    r1, [r4, #CPU_D]
+        ubfx    r1, r0, #2, #1          @ I
+        strb    r1, [r4, #CPU_I]
+        ubfx    r1, r0, #1, #1          @ Z
+        strb    r1, [r4, #CPU_Z]
+        ubfx    r1, r0, #0, #1          @ C
+        strb    r1, [r4, #CPU_C]
+        @ setFlags re-normalization (mirrors cpu_setFlags cpu.c:285-293)
+        ldrb    r0, [r4, #CPU_E]
+        cbz     r0, 89f
+        movs    r0, #1
+        strb    r0, [r4, #CPU_MF]       @ emulation pins M=X=1
+        strb    r0, [r4, #CPU_XF]
+        ldrh    r1, [r4, #CPU_SP]
+        uxtb    r1, r1
+        add.w   r1, r1, #0x100
+        strh    r1, [r4, #CPU_SP]
+89:
+        ldrb    r0, [r4, #CPU_XF]
+        cbz     r0, 90f
+        ldrh    r1, [r4, #CPU_X]
+        uxtb    r1, r1
+        strh    r1, [r4, #CPU_X]
+        ldrh    r1, [r4, #CPU_Y]
+        uxtb    r1, r1
+        strh    r1, [r4, #CPU_Y]
+90:
+        .endm
+
 @ Dense O(1) opcode dispatch.  Table entries carry the Thumb bit because the
 @ local handler labels are not function symbols and therefore do not acquire
 @ it automatically.
@@ -1035,6 +1081,31 @@
         .word   .Lopda + 1
         .elseif \op == 0xfa
         .word   .Lopfa + 1
+@ --- Stage 3L: jump / return / subroutine (Family B) ---
+        .elseif \op == 0x4c
+        .word   .Lop4c + 1
+        .elseif \op == 0x82
+        .word   .Lop82 + 1
+        .elseif \op == 0x5c
+        .word   .Lop5c + 1
+        .elseif \op == 0x20
+        .word   .Lop20 + 1
+        .elseif \op == 0x22
+        .word   .Lop22 + 1
+        .elseif \op == 0x6c
+        .word   .Lop6c + 1
+        .elseif \op == 0xdc
+        .word   .Lopdc + 1
+        .elseif \op == 0x7c
+        .word   .Lop7c + 1
+        .elseif \op == 0xfc
+        .word   .Lopfc + 1
+        .elseif \op == 0x60
+        .word   .Lop60 + 1
+        .elseif \op == 0x6b
+        .word   .Lop6b + 1
+        .elseif \op == 0x40
+        .word   .Lop40 + 1
         .else
         .word   .L_noteb + 1
         .endif
@@ -7344,42 +7415,7 @@ snes_thumb2_step:
 @ --- 0x28 PLP: pull byte -> setFlags (full re-normalization) ---
 .Lop28:
         PULL_BYTE                       @ r0 = flags byte
-        ubfx    r1, r0, #7, #1          @ N
-        strb    r1, [r4, #CPU_N]
-        ubfx    r1, r0, #6, #1          @ V
-        strb    r1, [r4, #CPU_V]
-        ubfx    r1, r0, #5, #1          @ MF
-        strb    r1, [r4, #CPU_MF]
-        ubfx    r1, r0, #4, #1          @ XF
-        strb    r1, [r4, #CPU_XF]
-        ubfx    r1, r0, #3, #1          @ D
-        strb    r1, [r4, #CPU_D]
-        ubfx    r1, r0, #2, #1          @ I
-        strb    r1, [r4, #CPU_I]
-        ubfx    r1, r0, #1, #1          @ Z
-        strb    r1, [r4, #CPU_Z]
-        ubfx    r1, r0, #0, #1          @ C
-        strb    r1, [r4, #CPU_C]
-        @ setFlags re-normalization tail (mirrors REP/SEP handler)
-        ldrb    r0, [r4, #CPU_E]
-        cbz     r0, .Lplp_xf
-        movs    r0, #1
-        strb    r0, [r4, #CPU_MF]       @ emulation pins M=X=1
-        strb    r0, [r4, #CPU_XF]
-        ldrh    r1, [r4, #CPU_SP]
-        uxtb    r1, r1
-        add.w   r1, r1, #0x100
-        strh    r1, [r4, #CPU_SP]
-.Lplp_xf:
-        ldrb    r0, [r4, #CPU_XF]
-        cbz     r0, .Lplp_done
-        ldrh    r1, [r4, #CPU_X]
-        uxtb    r1, r1
-        strh    r1, [r4, #CPU_X]
-        ldrh    r1, [r4, #CPU_Y]
-        uxtb    r1, r1
-        strh    r1, [r4, #CPU_Y]
-.Lplp_done:
+        SETFLAGS_TAIL                   @ unpack 8 bits + e/xf renormalization
         b       .L_handled
 
 @ --- 0x2b PLD: pull word -> DP, setZN(word) ---
@@ -7522,6 +7558,260 @@ snes_thumb2_step:
         mov     r2, r6
         movs    r1, #0                  @ word mode
         SETZN
+        b       .L_handled
+
+@ ===========================================================================
+@ Stage 3L -- jump / return / subroutine opcodes (Family B).
+@
+@ Twelve opcodes that redirect control flow.  All operand bytes are RAW
+@ (IMM_FETCH_BYTE = cpu_readOpcode = cpu_read_raw, NO spin hook); indirect
+@ pointer bytes and all stack accesses are HOOKED (cpu_thumb2_read/write =
+@ cpu_read/cpu_write WITH spin hook).  Banks: JMP/JSR abs use NO bank (raw
+@ word fetch); 0x6c/0xdc indirect pointers are bank 0; 0x7c/0xfc indirect
+@ pointers are bank K.  JSR/JSL push pc-1; RTS/RTL add +1; RTI adds NO +1.
+@ RTS/RTL gate on spBreakpoint (bail to C before any pull); RTI does not.
+@ ===========================================================================
+
+@ --- 0x4c JMP abs: raw 2-byte word fetch, pc = word.  No push, no DB. ---
+.Lop4c:
+        IMM_FETCH_BYTE                  @ r0 = low byte; pc++ (uint16 wrap)
+        mov     r6, r0                  @ stash low (callee-saved)
+        IMM_FETCH_BYTE                  @ r0 = high byte; pc++
+        lsl     r0, r0, #8
+        orr     r6, r6, r0              @ r6 = target word
+        strh    r6, [r4, #CPU_PC]       @ pc = word
+        b       .L_handled
+
+@ --- 0x82 BRL rll: raw 2-byte fetch, sign-extend 16-bit, pc += disp.  No
+@ taken-cycle (always-taken branch, like BRA 0x80).  K unchanged. ---
+.Lop82:
+        IMM_FETCH_BYTE                  @ r0 = low byte
+        mov     r6, r0
+        IMM_FETCH_BYTE                  @ r0 = high byte
+        lsl     r0, r0, #8
+        orr     r6, r6, r0              @ r6 = unsigned word
+        sxth    r6, r6                  @ r6 = (int16_t)word
+        ldrh    r2, [r4, #CPU_PC]       @ pc (past both operand bytes)
+        add     r6, r6, r2             @ pc += disp (signed; uint16 wrap via strh)
+        strh    r6, [r4, #CPU_PC]
+        b       .L_handled
+
+@ --- 0x5c JML abl: raw 3-byte fetch (word + byte), set k then pc.  NO push.
+@ The Die() trap at cpu.c:1497-1501 (target 0x80:0x8573) is debug-only and
+@ intentionally NOT replicated -- the rig pre-seeds operand bytes to a
+@ non-magic target (run_case_jml_safe), and on the device the crash
+@ sentinel is handled at a higher level. ---
+.Lop5c:
+        IMM_FETCH_BYTE                  @ r0 = low byte
+        mov     r6, r0
+        IMM_FETCH_BYTE                  @ r0 = high byte
+        lsl     r0, r0, #8
+        orr     r6, r6, r0              @ r6 = value (target pc)
+        IMM_FETCH_BYTE                  @ r0 = new_k byte; r6 survives (callee-saved)
+        strb    r0, [r4, #CPU_K]        @ k = new_k
+        strh    r6, [r4, #CPU_PC]       @ pc = value
+        b       .L_handled
+
+@ --- 0x20 JSR abs: raw word -> target, push pc-1, pc = target.
+@ After fetching 2 operand bytes pc points past them; pc-1 = last operand
+@ byte addr.  Target is stashed on the ARM stack across PUSH_WORD (which
+@ needs r6 = the word to push). ---
+.Lop20:
+        IMM_FETCH_BYTE                  @ r0 = low byte
+        mov     r6, r0
+        IMM_FETCH_BYTE                  @ r0 = high byte
+        lsl     r0, r0, #8
+        orr     r6, r6, r0              @ r6 = target
+        push    {r6}                    @ stash target across PUSH_WORD
+        ldrh    r6, [r4, #CPU_PC]       @ pc (past both operands)
+        subs    r6, r6, #1              @ r6 = pc - 1 (return addr word)
+        PUSH_WORD                       @ push (pc-1): HIGH then LOW
+        pop     {r6}                    @ restore target
+        strh    r6, [r4, #CPU_PC]       @ pc = target
+        b       .L_handled
+
+@ --- 0x22 JSL abl: raw 3 bytes (word->target, byte->newK).  Push K byte
+@ FIRST, then push pc-1 word.  Set pc=target, k=newK.  Target and newK are
+@ stashed together (8-byte push, stays aligned) across both pushes. ---
+.Lop22:
+        IMM_FETCH_BYTE                  @ r0 = low byte
+        mov     r6, r0
+        IMM_FETCH_BYTE                  @ r0 = high byte
+        lsl     r0, r0, #8
+        orr     r6, r6, r0              @ r6 = target (value)
+        IMM_FETCH_BYTE                  @ r0 = newK byte
+        push    {r0, r6}                @ stash newK + target (8 bytes, aligned)
+        ldrb    r2, [r4, #CPU_K]        @ r2 = current k
+        PUSH_BYTE                       @ push(k) FIRST
+        ldrh    r6, [r4, #CPU_PC]       @ pc (past 3 operands)
+        subs    r6, r6, #1              @ pc - 1
+        PUSH_WORD                       @ push(pc-1)
+        pop     {r0, r6}                @ r0 = newK, r6 = target
+        strh    r6, [r4, #CPU_PC]       @ pc = value
+        strb    r0, [r4, #CPU_K]        @ k = newK
+        b       .L_handled
+
+@ --- 0x6c JMP (abs): raw word -> adr (bank 0).  2 HOOKED reads at bank-0
+@ 16-bit-wrapped addresses (6502 page-wrap): lo@adr, hi@(adr+1)&0xffff.
+@ pc = lo|(hi<<8).  Stash adr in r6 (callee-saved), spill low byte to stack. ---
+.Lop6c:
+        IMM_FETCH_BYTE                  @ r0 = low byte of adr
+        mov     r6, r0
+        IMM_FETCH_BYTE                  @ r0 = high byte of adr
+        lsl     r0, r0, #8
+        orr     r6, r6, r0              @ r6 = adr (16-bit, bank 0)
+        mov     r0, r4
+        mov     r1, r6                  @ lo addr = adr (bank 0)
+        bl      cpu_thumb2_read         @ r0 = lo byte (HOOKED); r6 survives
+        push    {r0}                    @ stash lo byte across hi-byte BL
+        add     r1, r6, #1
+        uxth    r1, r1                  @ hi addr = (adr+1) & 0xffff (bank 0)
+        mov     r0, r4
+        bl      cpu_thumb2_read         @ r0 = hi byte (HOOKED)
+        lsl     r0, r0, #8
+        pop     {r1}                    @ r1 = lo byte
+        orr     r6, r1, r0             @ r6 = lo|(hi<<8)
+        strh    r6, [r4, #CPU_PC]       @ pc = target
+        b       .L_handled
+
+@ --- 0xdc JML [abs] indirect long: raw word -> adr.  3 HOOKED reads at
+@ bank-0 16-bit-wrapped addresses: pc-lo@adr, pc-hi@(adr+1)&0xffff,
+@ k@(adr+2)&0xffff.  2-deep stack spill (IDL_ADDR pattern). ---
+.Lopdc:
+        IMM_FETCH_BYTE                  @ r0 = low byte of adr
+        mov     r6, r0
+        IMM_FETCH_BYTE                  @ r0 = high byte of adr
+        lsl     r0, r0, #8
+        orr     r6, r6, r0              @ r6 = adr (16-bit)
+        mov     r0, r4
+        mov     r1, r6                  @ pc-lo addr (bank 0)
+        bl      cpu_thumb2_read         @ r0 = pc-lo; r6 survives
+        push    {r0}                    @ stash pc-lo
+        add     r1, r6, #1
+        uxth    r1, r1                  @ pc-hi addr (bank 0)
+        mov     r0, r4
+        bl      cpu_thumb2_read         @ r0 = pc-hi
+        push    {r0}                    @ stash pc-hi
+        add     r1, r6, #2
+        uxth    r1, r1                  @ k addr (bank 0)
+        mov     r0, r4
+        bl      cpu_thumb2_read         @ r0 = k byte
+        strb    r0, [r4, #CPU_K]        @ k = new bank
+        pop     {r1}                    @ r1 = pc-hi
+        lsl     r1, r1, #8
+        pop     {r0}                    @ r0 = pc-lo
+        orr     r0, r0, r1             @ r0 = pc-lo|(pc-hi<<8)
+        strh    r0, [r4, #CPU_PC]       @ pc = target
+        b       .L_handled
+
+@ --- 0x7c JMP (abs,X): raw word -> adr, base=(adr+X)&0xffff.  2 HOOKED
+@ reads at BANK K: lo@(k<<16)|base, hi@(k<<16)|((base+1)&0xffff).
+@ (adr+X+1)&0xffff == (base+1)&0xffff (proven: single 16-bit wrap).  r6
+@ holds base (callee-saved); (k<<16) is recomputed before each BL (r0-r3
+@ are caller-saved and clobbered by cpu_thumb2_read). ---
+.Lop7c:
+        IMM_FETCH_BYTE                  @ r0 = low byte of adr
+        mov     r6, r0
+        IMM_FETCH_BYTE                  @ r0 = high byte of adr
+        lsl     r0, r0, #8
+        orr     r6, r6, r0              @ r6 = adr
+        ldrh    r2, [r4, #CPU_X]
+        add     r2, r2, r6             @ adr + X
+        uxth    r6, r2                  @ r6 = base = (adr+X)&0xffff
+        ldrb    r1, [r4, #CPU_K]
+        lsl     r1, r1, #16
+        orr     r1, r1, r6             @ lo addr = (k<<16)|base
+        mov     r0, r4
+        bl      cpu_thumb2_read         @ r0 = lo byte; r6 survives
+        push    {r0}                    @ stash lo
+        ldrb    r1, [r4, #CPU_K]
+        lsl     r1, r1, #16
+        add     r2, r6, #1
+        uxth    r2, r2                  @ (base+1)&0xffff
+        orr     r1, r1, r2             @ hi addr = (k<<16)|((base+1)&0xffff)
+        mov     r0, r4
+        bl      cpu_thumb2_read         @ r0 = hi byte
+        lsl     r0, r0, #8
+        pop     {r1}                    @ r1 = lo byte
+        orr     r6, r1, r0             @ r6 = lo|(hi<<8)
+        strh    r6, [r4, #CPU_PC]       @ pc = target
+        b       .L_handled
+
+@ --- 0xfc JSR (abs,X): same bank-K pointer fetch as 0x7c -> target, then
+@ push pc-1 word, then pc=target.  Target fetched FIRST (before push). ---
+.Lopfc:
+        @ --- pointer fetch (identical to 0x7c) ---
+        IMM_FETCH_BYTE                  @ r0 = low byte of adr
+        mov     r6, r0
+        IMM_FETCH_BYTE                  @ r0 = high byte of adr
+        lsl     r0, r0, #8
+        orr     r6, r6, r0              @ r6 = adr
+        ldrh    r2, [r4, #CPU_X]
+        add     r2, r2, r6
+        uxth    r6, r2                  @ r6 = base = (adr+X)&0xffff
+        ldrb    r1, [r4, #CPU_K]
+        lsl     r1, r1, #16
+        orr     r1, r1, r6
+        mov     r0, r4
+        bl      cpu_thumb2_read         @ r0 = lo byte
+        push    {r0}                    @ stash lo
+        ldrb    r1, [r4, #CPU_K]
+        lsl     r1, r1, #16
+        add     r2, r6, #1
+        uxth    r2, r2
+        orr     r1, r1, r2
+        mov     r0, r4
+        bl      cpu_thumb2_read         @ r0 = hi byte
+        lsl     r0, r0, #8
+        pop     {r1}                    @ r1 = lo byte
+        orr     r6, r1, r0             @ r6 = target
+        @ --- push pc-1, set pc=target ---
+        push    {r6}                    @ stash target across PUSH_WORD
+        ldrh    r6, [r4, #CPU_PC]       @ pc (past 2 operands)
+        subs    r6, r6, #1              @ pc - 1
+        PUSH_WORD                       @ push(pc-1)
+        pop     {r6}                    @ restore target
+        strh    r6, [r4, #CPU_PC]       @ pc = target
+        b       .L_handled
+
+@ --- 0x60 RTS: GATE on spBreakpoint (bail to C if nonzero, BEFORE any
+@ pull -- the C fallback runs the HookedFunctionRts gate).  Then pull
+@ word -> pc, pc+1 (uint16 wrap via strh). ---
+.Lop60:
+        ldrh    r0, [r4, #CPU_SPBREAKPOINT]
+        cmp     r0, #0
+        bne     .L_noteb                @ spBreakpoint != 0: C handles the gate
+        PULL_WORD                       @ r6 = return pc
+        adds    r6, r6, #1              @ pc + 1
+        strh    r6, [r4, #CPU_PC]
+        b       .L_handled
+
+@ --- 0x6b RTL: GATE on spBreakpoint (same as RTS).  Then pull word -> pc
+@ (+1), pull byte -> k. ---
+.Lop6b:
+        ldrh    r0, [r4, #CPU_SPBREAKPOINT]
+        cmp     r0, #0
+        bne     .L_noteb                @ spBreakpoint != 0: C handles the gate
+        PULL_WORD                       @ r6 = return pc
+        adds    r6, r6, #1              @ pc + 1
+        strh    r6, [r4, #CPU_PC]
+        PULL_BYTE                       @ r0 = k byte
+        strb    r0, [r4, #CPU_K]
+        b       .L_handled
+
+@ --- 0x40 RTI: pull byte -> setFlags (SETFLAGS_TAIL reuses the PLP
+@ renormalization), +1 cycle (native-mode extra), pull word -> pc (NO +1),
+@ pull byte -> k.  No spBreakpoint gate (RTI has none in the oracle). ---
+.Lop40:
+        PULL_BYTE                       @ r0 = flags byte
+        SETFLAGS_TAIL                   @ unpack + e/xf renormalization
+        ldrb    r0, [r4, #CPU_CYCLESUSED]
+        adds    r0, r0, #1              @ native mode: 1 extra cycle
+        strb    r0, [r4, #CPU_CYCLESUSED]
+        PULL_WORD                       @ r6 = return pc (NO +1)
+        strh    r6, [r4, #CPU_PC]
+        PULL_BYTE                       @ r0 = k byte
+        strb    r0, [r4, #CPU_K]
         b       .L_handled
 
         .size   snes_thumb2_try, .-snes_thumb2_try
