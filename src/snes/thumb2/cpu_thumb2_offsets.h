@@ -38,4 +38,15 @@
 #define CPU_SPBREAKPOINT 34
 #define CPU_IN_EMU      36
 
+/* ---- Snes struct offsets (for the ROM fetch-page cache inline fast-path) ----
+ * Verified by the device compiler (arm-none-eabi-gcc -mcpu=cortex-m7 -mthumb)
+ * via offsetof(Snes, field). The Thumb-2 engine reads these through the Cpu.mem
+ * pointer (which is Snes*). The rig's RigBus places romPageBase/romPageTag at
+ * these exact offsets (sentinel-initialized) so the inline check always misses
+ * and falls through to the rig's snes_cpuRead. */
+#define SNES_CPUCYCLESLEFT  60
+#define SNES_CPUMEMOPS      61
+#define SNES_ROMPAGEBASE   108
+#define SNES_ROMPAGETAG    112
+
 #endif

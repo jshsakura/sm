@@ -89,6 +89,34 @@
         ldrb    \r, [r4, #(\off)]
         .endm
 
+@ ROM fetch-page cache inline fast-path (mirrors snes_cpuRead's cache in snes.c).
+@ Expects: r0=Snes*, r1=fetch_addr. Clobbers r2,r3. Returns byte in r0.
+@ On HIT: serves directly from romPageBase (skips the BL + function prologue).
+@ On MISS: falls through to bl snes_cpuRead (installs cache + updates counters).
+@ The NULL-romPageBase guard rejects the un-installed state (base is NULL until
+@ the C path first installs a real page pointer + tag).
+        .macro ROM_FETCH_FAST
+        ldr     r3, [r0, #SNES_ROMPAGEBASE]     @ base ptr
+        cbz     r3, .Lrom_miss_\@                @ NULL → cache not installed → full BL
+        ldr     r3, [r0, #SNES_ROMPAGETAG]
+        eor     r2, r1, r3
+        lsrs    r2, r2, #13                     @ Z iff addr and tag share bits 13+
+        bne     .Lrom_miss_\@                    @ different page → full BL
+        ldrb    r2, [r0, #SNES_CPUMEMOPS]       @ HIT: cpuMemOps++
+        adds    r2, r2, #1
+        strb    r2, [r0, #SNES_CPUMEMOPS]
+        ldrb    r2, [r0, #SNES_CPUCYCLESLEFT]   @ cpuCyclesLeft += 8
+        adds    r2, r2, #8
+        strb    r2, [r0, #SNES_CPUCYCLESLEFT]
+        ldr     r3, [r0, #SNES_ROMPAGEBASE]
+        ubfx    r2, r1, #0, #13                 @ adr & 0x1fff
+        ldrb    r0, [r3, r2]                    @ byte from cached ROM page
+        b       .Lrom_done_\@
+.Lrom_miss_\@:
+        bl      snes_cpuRead
+.Lrom_done_\@:
+        .endm
+
 @ Inline one raw operand fetch.  This deliberately is a macro, not a callable
 @ local helper: the contained BL may overwrite LR because the outer entry saved
 @ its caller LR in the common prologue.  A BL-called helper containing this BL
@@ -102,7 +130,7 @@
         orr     r1, r1, r2
         adds    r3, r2, #1
         strh    r3, [r4, #CPU_PC]       @ uint16 PC wrap; K never carries
-        bl      snes_cpuRead
+        ROM_FETCH_FAST
         uxtb    r0, r0
         .endm
 
@@ -853,6 +881,8 @@
 @ --- Stage 3H Pass 2: dp,X (reads/ALU/writes/RMW) ---
         .elseif \op == 0x15
         .word   .Lop15 + 1
+        .elseif \op == 0x34
+        .word   .Lop34 + 1
         .elseif \op == 0x35
         .word   .Lop35 + 1
         .elseif \op == 0x55
@@ -1247,7 +1277,7 @@ snes_thumb2_step:
         orr     r1, r1, r2
         adds    r3, r2, #1
         strh    r3, [r4, #CPU_PC]       @ uint16_t wrap matches cpu->pc++
-        bl      snes_cpuRead
+        ROM_FETCH_FAST
         uxtb    r6, r0                  @ preserve opcode across dispatch
         movw    r2, #:lower16:snes_cycles_per_opcode
         movt    r2, #:upper16:snes_cycles_per_opcode
@@ -2156,7 +2186,8 @@ snes_thumb2_step:
         strh    r1, [r4, #CPU_SP]
 .Lflags_xf:
         ldrb    r0, [r4, #CPU_XF]
-        cbz     r0, .L_handled
+        cmp     r0, #0
+        beq     .L_handled
         ldrh    r1, [r4, #CPU_X]
         uxtb    r1, r1
         strh    r1, [r4, #CPU_X]
@@ -2200,7 +2231,7 @@ snes_thumb2_step:
         movs    r6, #2
         b       .Lbr_common
 
-.Lbr_common:
+ .Lbr_common:
         @ raw operand fetch -- mirrors the step opcode fetch (lines 155-162).
         ldr     r0, [r4, #CPU_MEM]
         ldrb    r1, [r4, #CPU_K]
@@ -2209,7 +2240,7 @@ snes_thumb2_step:
         orr     r1, r1, r2
         adds    r3, r2, #1
         strh    r3, [r4, #CPU_PC]       @ pc++ (uint16 wrap)
-        bl      snes_cpuRead            @ r0 = operand byte
+        ROM_FETCH_FAST                   @ r0 = operand byte (cached)
         sxtb    r0, r0                  @ (int8_t)operand
         cbz     r6, .L_handled          @ not taken: operand consumed, done
         ldrh    r2, [r4, #CPU_PC]       @ pc (already +1)
@@ -3091,6 +3122,42 @@ snes_thumb2_step:
         strb    r3, [r4, #CPU_V]
         b       .L_handled
 .Lbit_dp_w:
+        @ --- word: r2 = value; z=(a&value)==0; n=value&0x8000; v=value&0x4000 ---
+        ldrh    r3, [r4, #CPU_A]
+        tst     r3, r2                  @ a & value
+        ite     eq
+        moveq   r3, #1
+        movne   r3, #0
+        strb    r3, [r4, #CPU_Z]
+        ubfx    r3, r2, #15, #1         @ n = value & 0x8000 -> bit15
+        strb    r3, [r4, #CPU_N]
+        ubfx    r3, r2, #14, #1         @ v = value & 0x4000 -> bit14
+        strb    r3, [r4, #CPU_V]
+        b       .L_handled
+
+@ --- 0x34 BIT dp,X: VERBATIM .Lop24 (BIT dp) with DP_ADDR -> DPX_ADDR.
+@ cpu_bit (cpu.c, fed by cpu_adrDpx == cpu_adrDp + X) is the same helper for
+@ both, so the flag extraction (N/V from the raw memory value, Z from A&value)
+@ is byte-identical -- only the effective-address computation differs. ---
+.Lop34:                                 @ BIT dp,X  (read-only; N/V from memory value, Z from AND)
+        DPX_ADDR
+        DP_READ_VALUE CPU_MF
+        ldrb    r1, [r4, #CPU_MF]
+        cbz     r1, .Lbit_dpx_w
+        @ --- byte: r2 = value; z=((a&0xff)&value)==0; n=value&0x80; v=value&0x40 ---
+        ldrh    r3, [r4, #CPU_A]
+        uxtb    r3, r3                  @ a & 0xff
+        tst     r3, r2                  @ (a&0xff) & value
+        ite     eq
+        moveq   r3, #1                  @ z = 1 if zero
+        movne   r3, #0
+        strb    r3, [r4, #CPU_Z]
+        ubfx    r3, r2, #7, #1          @ n = value & 0x80 -> bit7
+        strb    r3, [r4, #CPU_N]
+        ubfx    r3, r2, #6, #1          @ v = value & 0x40 -> bit6
+        strb    r3, [r4, #CPU_V]
+        b       .L_handled
+.Lbit_dpx_w:
         @ --- word: r2 = value; z=(a&value)==0; n=value&0x8000; v=value&0x4000 ---
         ldrh    r3, [r4, #CPU_A]
         tst     r3, r2                  @ a & value
