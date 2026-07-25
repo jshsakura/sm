@@ -92,108 +92,205 @@ static void scalar(Dsp1* d, int slot) {
   d->out[0] = clamp16(acc / 32768.0);
 }
 
-/* Ground-plane camera model shared by Raster / Project / Target.
- * Camera sits at (fx, fy) height fz, pitched down by `aas`, yawed by `azs`;
- * screen plane at distance lfe. Screen line v (0-based raster) looks along a
- * ray pitched by pitch + atan((v - vof)/lfe); where that ray meets the ground
- * is at horizontal distance dist = fz / tan(ray). */
-
-/* Polynomial atan2 that avoids libm's atan/atan2 entirely.
+/* ---- projection group: Parameter / Raster / Project / Target -------------
  *
- * WHY: libm's atan is captured by the NES overlay linker rule
- * (.overlay_nes_fceu: *libm.a:libm_a-s_atan.o), so calling it from the SNES
- * overlay resolves to the NES overlay's VMA — stale when SNES is loaded →
- * Busfault. atan2 is not captured but its wrapper objects (e_atan2.o,
- * w_atan2.o) overflow internal flash. This polynomial lives entirely in
- * the SNES overlay and has max error ~5e-5 rad — invisible at the DSP-1's
- * 16-bit fixed-point precision (1 LSB ≈ 2.7e-4 rad).
+ * The real chip's projection pipeline (documented behavior, validated
+ * numerically against the decapped chip's fixed-point algorithm used as a
+ * LOCAL test oracle — no emulator code shipped):
  *
- * Coefficients from Carlson's minimax fit (Abramowitz & Stegun §4.4.49). */
-static double dsp_atan2(double y, double x) {
-  /* x is always positive (lfe clamped to >= 1 at every call site), so this
-   * reduces to atan(y/x) with quadrant 0 or ±π. */
-  double t = y / x;
-  double a;
-  if (t > 1.0)       { t = 1.0 / t; a = 1.5707963 - t * (0.9998660 + t*t*(-0.3302995 + t*t*(0.1801410 + t*t*(-0.0851330 + t*t*0.0208351)))); }
-  else if (t < -1.0) { t = 1.0 / t; a = -1.5707963 - t * (0.9998660 + t*t*(-0.3302995 + t*t*(0.1801410 + t*t*(-0.0851330 + t*t*0.0208351)))); }
-  else               { double t2 = t*t; a = t * (0.9998660 + t2*(-0.3302995 + t2*(0.1801410 + t2*(-0.0851330 + t2*0.0208351)))); }
-  return a;
-}
+ *   Aas = azimuth (heading), Azs = zenith (downward view tilt), angles with
+ *   0x10000 = full turn. Camera at (Fx,Fy,Fz); Lfe = eye->screen distance,
+ *   Les = eye->ground reference distance.
+ *
+ *   Parameter: VPlane = Fz + Lfe*cos(Azs)  — the view-plane height term.
+ *     NOTE Fz alone can be 0 (Mario Kart drives with Fz=0!) — the Lfe*cos
+ *     term is what keeps the projection alive; the old pinhole model here
+ *     used fz/tan(ray) and collapsed to a flat single-texel ground.
+ *     The zenith angle is CLIPPED to a VPlane-magnitude-dependent maximum
+ *     (~80 deg, MaxAZS table = chip data-ROM facts) before deriving
+ *     VOffset = Les*cos(AZS) and Vva = -Les*cos(AZS)/sin(AZS) (the raster
+ *     line of the horizon, which the game feeds back as the raster stream's
+ *     STARTING Vs — negative!).
+ *
+ *   Raster(Vs): Vs is SIGNED. scale(Vs) = VPlane / (Vs*sin(Azs) + VOffset);
+ *     A =  256*scale*cos(Aas)          C = 256*scale*sin(Aas)
+ *     B = -256*(scale/cos(AZS))*sin(Aas)  D = 256*(scale/cos(AZS))*cos(Aas)
+ *     (256 = the PPU's 8.8 fixed-point unit for $211B-E.)
+ *
+ *   Project(X,Y,Z): translate by -F, rotate by (pi - Aas) around Z, then by
+ *     -Azs around X, push the view plane out by Lfe; behind-plane objects
+ *     project H = -X'*Les/|Z'|, V = -Y'*Les/|Z'|, M = 256*Les/|Z'| (clamped
+ *     to 0xFFFF); at/into the plane the chip pins H=0, V=224, M=0xFFFF. */
 
-static double ground_dist(Dsp1* d, double v) {
-  double pitch = angle(d->aas);            /* attack angle: >0 pitches down */
-  double ray = pitch + dsp_atan2(v, (double)(d->lfe ? d->lfe : 1));
-  /* tan(ray) = sin(ray)/cos(ray): sin/cos are already linked for other DSP-1
-   * handlers and live in internal flash (not overlay-captured like atan).
-   * This avoids pulling in libm's k_tan.o, saving ~500B of internal flash. */
-  double t = sin(ray) / cos(ray);
-  if (t < 1e-4) t = 1e-4;                  /* above horizon: clamp far */
-  return (double)d->fz / t;
+/* Derived trig state, deliberately NOT stored in Dsp1: the struct is a raw
+ * savestate blob, so growing it would break every existing save. The cache
+ * keys on the seven raw parameters; a savestate load simply misses once and
+ * recomputes. Also the perf story: trig runs once per Parameter (per frame),
+ * not once per scanline — raster_line itself is one divide + four multiplies. */
+static struct {
+  int valid;
+  int16_t fx, fy, fz, lfe, les;
+  uint16_t aas, azs;
+  double sinAas, cosAas, sinAzs, cosAzs;
+  double vplane;               /* Fz + Lfe*cos(Azs) */
+  double sinAZS, cosAZS;       /* clipped zenith */
+  double voffset;              /* Les*cos(AZS) */
+  int16_t azs_clipped;         /* clipped zenith in angle units (for Vof path) */
+} pj;
+
+/* Maximum zenith angle by view-plane magnitude (chip data-ROM table).
+ * Indexed by the normalization shift count of |VPlane| as an int16:
+ * idx = 14 - floor(log2(|vplane|)), clamped to [0,15]. */
+static const int16_t dsp1_maxazs[16] = {
+  0x38b4, 0x38b7, 0x38ba, 0x38be, 0x38c0, 0x38c4, 0x38c7, 0x38ca,
+  0x38ce, 0x38d0, 0x38d4, 0x38d7, 0x38da, 0x38dd, 0x38e0, 0x38e4
+};
+
+static void proj_update(Dsp1* d) {
+  if (pj.valid && pj.fx == d->fx && pj.fy == d->fy && pj.fz == d->fz &&
+      pj.lfe == d->lfe && pj.les == d->les && pj.aas == d->aas &&
+      pj.azs == d->azs)
+    return;
+  pj.fx = d->fx; pj.fy = d->fy; pj.fz = d->fz;
+  pj.lfe = d->lfe; pj.les = d->les; pj.aas = d->aas; pj.azs = d->azs;
+
+  double aas = angle(d->aas), azs = angle(d->azs);
+  pj.sinAas = sin(aas); pj.cosAas = cos(aas);
+  pj.sinAzs = sin(azs); pj.cosAzs = cos(azs);
+  pj.vplane = (double)d->fz + (double)d->lfe * pj.cosAzs;
+
+  /* zenith clip: max angle depends on |VPlane|'s binary magnitude */
+  double av = pj.vplane < 0 ? -pj.vplane : pj.vplane;
+  int idx;
+  if (av < 1.0) idx = 15;
+  else {
+    int lg = 0;
+    while ((1 << (lg + 1)) <= (int)av && lg < 14) lg++;
+    idx = 14 - lg;
+    if (idx < 0) idx = 0;
+    if (idx > 15) idx = 15;
+  }
+  int16_t maxazs = dsp1_maxazs[idx];
+  int16_t azs_s = (int16_t)d->azs;
+  if (azs_s < 0) {
+    if (azs_s < (int16_t)(-maxazs + 1)) azs_s = (int16_t)(-maxazs + 1);
+  } else {
+    if (azs_s > maxazs) azs_s = maxazs;
+  }
+  pj.azs_clipped = azs_s;
+  double azsc = angle((uint16_t)azs_s);
+  pj.sinAZS = sin(azsc);
+  pj.cosAZS = cos(azsc);
+  if (pj.cosAZS < 1e-6 && pj.cosAZS > -1e-6) pj.cosAZS = 1e-6;
+  if (pj.sinAZS < 1e-6 && pj.sinAZS > -1e-6) pj.sinAZS = 1e-6;
+  pj.voffset = (double)d->les * pj.cosAZS;
 }
 
 static void cmd_parameter(Dsp1* d) {
   d->fx = d->in[0]; d->fy = d->in[1]; d->fz = d->in[2];
   d->lfe = d->in[3]; d->les = d->in[4];
   d->aas = (uint16_t)d->in[5]; d->azs = (uint16_t)d->in[6];
+  pj.valid = 0;
+  proj_update(d);
 
-  /* horizon raster: ray pitch crosses 0 at v = -tan(pitch)*lfe
-   * (sin/cos, not tan() — see ground_dist comment) */
-  double pitch = angle(d->aas);
-  double vHorizon = -(sin(pitch) / cos(pitch)) * (double)(d->lfe ? d->lfe : 1);
-  d->vof = clamp16(vHorizon);
-  d->vva = clamp16(vHorizon);              /* same reference in this model */
+  /* projection centre on the ground plane */
+  double t = pj.vplane / pj.cosAZS;
+  if (t > 32767.0) t = 32767.0;
+  if (t < -32767.0) t = -32767.0;             /* chip saturates this term */
+  double c = t * pj.sinAZS;
+  d->centerX = clamp16((double)d->fx + (double)d->lfe * (-pj.sinAzs * pj.sinAas)
+                       + c * pj.sinAas);
+  d->centerY = clamp16((double)d->fy + (double)d->lfe * ( pj.sinAzs * pj.cosAas)
+                       - c * pj.cosAas);
 
-  /* ground point on the screen-centre ray, les ahead of the eye */
-  double dist = (double)d->les;
-  double az = angle(d->azs);
-  d->centerX = clamp16((double)d->fx + dist * sin(az));
-  d->centerY = clamp16((double)d->fy + dist * cos(az));
+  /* Vof: 0 unless the zenith angle was clipped; the clipped-branch quadratic
+   * correction (chip data-ROM constants 0x14ac/0x6488/0x0a26/0x277a as Q15:
+   * 0.1615, pi/4, 0.0793, 0.3084) nudges Vof and cos(AZS) near the limit. */
+  double vof = 0.0;
+  int16_t azs_s = (int16_t)d->azs;
+  if (azs_s != pj.azs_clipped ||
+      azs_s == (azs_s < 0 ? (int16_t)-dsp1_maxazs[0] : dsp1_maxazs[0])) {
+    double cq = (double)(azs_s - pj.azs_clipped);
+    if (cq >= 0.0) cq -= 1.0;
+    double aux = (-(cq * 4.0) - 1.0) / 32768.0;   /* ~(C<<2) as Q15 */
+    double c2 = aux * 0.161499;
+    c2 = c2 * aux + 0.785400;
+    vof -= (c2 * aux) * (double)d->les;
+    double c3 = aux * aux;
+    double aux2 = c3 * 0.079285 + 0.308411;
+    pj.cosAZS += (c3 * aux2) * pj.cosAZS;
+    pj.voffset = (double)d->les * pj.cosAZS;
+  }
+  d->vof = clamp16(vof);
+  d->vva = clamp16(floor(-pj.voffset / pj.sinAZS));
 
   d->out[0] = d->vof; d->out[1] = d->vva;
   d->out[2] = d->centerX; d->out[3] = d->centerY;
 }
 
-static void raster_line(Dsp1* d, uint16_t vs) {
-  /* Mode-7 matrix for scanline vs: rotate by azimuth, scale by ground distance
-   * per screen pixel. Matrix entries are 8.8 fixed point ($211b..$211e). */
-  double dist = ground_dist(d, (double)vs);
-  double scale = dist / (double)(d->lfe ? d->lfe : 1);
-  double az = angle(d->azs);
-  double a =  cos(az) * scale, b = sin(az) * scale;
-  d->out[0] = clamp16(a * 256.0);          /* A */
-  d->out[1] = clamp16(b * 256.0);          /* B */
-  d->out[2] = clamp16(-b * 256.0);         /* C */
-  d->out[3] = clamp16(a * 256.0);          /* D */
+static void raster_line(Dsp1* d, int16_t vs) {
+  /* Per-scanline Mode-7 matrix ($211B-E, 8.8 fixed point). Vs is SIGNED:
+   * Mario Kart starts the stream at Vs = Vva (about -73) and walks down
+   * through zero into the visible ground. The old code took uint16_t here,
+   * turned -73 into 65463, and computed garbage for every visible line. */
+  proj_update(d);
+  double denom = (double)vs * pj.sinAzs + pj.voffset;
+  double ad = denom < 0 ? -denom : denom;
+  if (ad < 1e-3) denom = denom < 0 ? -1e-3 : 1e-3;   /* horizon line: clamp */
+  double scaleA = pj.vplane / denom;
+  double scaleB = scaleA / pj.cosAZS;
+  d->out[0] = clamp16(256.0 * scaleA * pj.cosAas);   /* A */
+  d->out[1] = clamp16(-256.0 * scaleB * pj.sinAas);  /* B */
+  d->out[2] = clamp16(256.0 * scaleA * pj.sinAas);   /* C */
+  d->out[3] = clamp16(256.0 * scaleB * pj.cosAas);   /* D */
 }
 
 static void cmd_project(Dsp1* d) {
-  /* world (X,Y,Z) -> screen (H,V) + size M */
-  double rx = (double)d->in[0] - d->fx;
-  double ry = (double)d->in[1] - d->fy;
-  double rz = (double)d->in[2] - d->fz;
-  double az = angle(d->azs), pitch = angle(d->aas);
-  /* yaw into camera frame: forward = +y' */
-  double cx =  rx * cos(az) - ry * sin(az);
-  double cy =  rx * sin(az) + ry * cos(az);
-  /* pitch around x': depth d, up u */
-  double depth = cy * cos(pitch) - rz * sin(pitch);
-  double up    = cy * sin(pitch) + rz * cos(pitch);
-  if (depth < 1.0) depth = 1.0;
-  double lfe = (double)(d->lfe ? d->lfe : 1);
-  d->out[0] = clamp16(cx * lfe / depth + 128.0);   /* H */
-  d->out[1] = clamp16(up * lfe / depth + 96.0);    /* V */
-  d->out[2] = clamp16(lfe * 256.0 / depth);        /* M: enlargement ratio, 8.8 */
+  /* world (X,Y,Z) -> screen (H,V) + enlargement M (out[2], unsigned) */
+  proj_update(d);
+  double px = (double)d->in[0] - d->fx;
+  double py = (double)d->in[1] - d->fy;
+  double pz = (double)d->in[2] - d->fz;
+
+  /* rotate by (pi - Aas) around Z: cos -> -cosAas, sin -> +sinAas */
+  double x1 = px * (-pj.cosAas) - py * pj.sinAas;
+  double y1 = px * pj.sinAas    - py * pj.cosAas;
+  /* rotate by -Azs around X: cos -> cosAzs, sin -> -sinAzs */
+  double y2 = y1 * pj.cosAzs + pz * pj.sinAzs;
+  double z2 = -y1 * pj.sinAzs + pz * pj.cosAzs;
+  z2 -= (double)d->lfe;
+
+  if (z2 < 0.0) {
+    double inv = (double)d->les / -z2;
+    d->out[0] = clamp16(-x1 * inv);
+    d->out[1] = clamp16(-y2 * inv);
+    double m = 256.0 * (double)d->les / -z2;
+    if (m > 65535.0) m = 65535.0;
+    if (m < 0.0) m = 0.0;
+    d->out[2] = (int16_t)(uint16_t)m;
+  } else {
+    d->out[0] = 0;
+    d->out[1] = 224;
+    d->out[2] = (int16_t)0xffff;
+  }
 }
 
 static void cmd_target(Dsp1* d) {
-  /* screen (H,V) -> ground (X,Y): invert the per-line ground model */
-  double h = (double)d->in[0] - 128.0;
-  double v = (double)d->in[1];
-  double dist = ground_dist(d, v);
-  double lateral = h * dist / (double)(d->lfe ? d->lfe : 1);
-  double az = angle(d->azs);
-  d->out[0] = clamp16((double)d->fx + dist * sin(az) + lateral * cos(az));
-  d->out[1] = clamp16((double)d->fy + dist * cos(az) - lateral * sin(az));
+  /* screen (H,V) -> ground (X,Y): apply the same per-line matrix the PPU
+   * would use for line V (consistent with raster_line by construction;
+   * unused by Mario Kart, kept coherent for Target-using titles). */
+  proj_update(d);
+  int16_t h = d->in[0];
+  int16_t v = d->in[1];
+  double denom = (double)v * pj.sinAzs + pj.voffset;
+  double ad = denom < 0 ? -denom : denom;
+  if (ad < 1e-3) denom = denom < 0 ? -1e-3 : 1e-3;
+  double scaleA = pj.vplane / denom;
+  double scaleB = scaleA / pj.cosAZS;
+  d->out[0] = clamp16((double)d->centerX + scaleA * pj.cosAas * h
+                                        - scaleB * pj.sinAas * v);
+  d->out[1] = clamp16((double)d->centerY + scaleA * pj.sinAas * h
+                                        + scaleB * pj.cosAas * v);
 }
 
 static void cmd_inverse(Dsp1* d) {
@@ -286,7 +383,7 @@ static void execute(Dsp1* d) {
     case 0x02: cmd_parameter(d); return;
     case 0x06: cmd_project(d); return;
     case 0x0e: cmd_target(d); return;
-    case 0x0a: raster_line(d, (uint16_t)d->in[0]); return;
+    case 0x0a: raster_line(d, (int16_t)d->in[0]); return;   /* Vs is SIGNED */
     case 0x14: {  /* gyrate: integrate angular velocities (docs sparse; see log) */
       d->out[0] = (int16_t)(d->in[0] + d->in[3]);
       d->out[1] = (int16_t)(d->in[1] + d->in[4]);
@@ -420,7 +517,7 @@ uint8_t dsp1_readDR(Dsp1* d) {
       if (d->byteIdx >= 8) {       /* line consumed: advance and refill */
         d->byteIdx = 0;
         d->rasterVs++;
-        raster_line(d, d->rasterVs);
+        raster_line(d, (int16_t)d->rasterVs);  /* signed walk: -73 -> 0 -> +150 */
       }
       return b;
     }
