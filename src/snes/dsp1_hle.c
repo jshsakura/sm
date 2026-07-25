@@ -97,18 +97,35 @@ static void scalar(Dsp1* d, int slot) {
  * screen plane at distance lfe. Screen line v (0-based raster) looks along a
  * ray pitched by pitch + atan((v - vof)/lfe); where that ray meets the ground
  * is at horizontal distance dist = fz / tan(ray). */
+
+/* Polynomial atan2 that avoids libm's atan/atan2 entirely.
+ *
+ * WHY: libm's atan is captured by the NES overlay linker rule
+ * (.overlay_nes_fceu: *libm.a:libm_a-s_atan.o), so calling it from the SNES
+ * overlay resolves to the NES overlay's VMA — stale when SNES is loaded →
+ * Busfault. atan2 is not captured but its wrapper objects (e_atan2.o,
+ * w_atan2.o) overflow internal flash. This polynomial lives entirely in
+ * the SNES overlay and has max error ~5e-5 rad — invisible at the DSP-1's
+ * 16-bit fixed-point precision (1 LSB ≈ 2.7e-4 rad).
+ *
+ * Coefficients from Carlson's minimax fit (Abramowitz & Stegun §4.4.49). */
+static double dsp_atan2(double y, double x) {
+  /* x is always positive (lfe clamped to >= 1 at every call site), so this
+   * reduces to atan(y/x) with quadrant 0 or ±π. */
+  double t = y / x;
+  double a;
+  if (t > 1.0)       { t = 1.0 / t; a = 1.5707963 - t * (0.9998660 + t*t*(-0.3302995 + t*t*(0.1801410 + t*t*(-0.0851330 + t*t*0.0208351)))); }
+  else if (t < -1.0) { t = 1.0 / t; a = -1.5707963 - t * (0.9998660 + t*t*(-0.3302995 + t*t*(0.1801410 + t*t*(-0.0851330 + t*t*0.0208351)))); }
+  else               { double t2 = t*t; a = t * (0.9998660 + t2*(-0.3302995 + t2*(0.1801410 + t2*(-0.0851330 + t2*0.0208351)))); }
+  return a;
+}
+
 static double ground_dist(Dsp1* d, double v) {
   double pitch = angle(d->aas);            /* attack angle: >0 pitches down */
-  /* atan2(v, lfe), but lfe is always forced positive just above (never 0 or
-   * negative) -- atan2's quadrant correction only differs from plain atan()
-   * when its x-argument is <=0, which can't happen here, so atan(v/lfe) is
-   * exact and reuses atan2's own already-linked atan() rather than also
-   * needing e_atan2.o/w_atan2.o's wrapper. */
-  double ray = pitch + atan(v / (double)(d->lfe ? d->lfe : 1));
-  /* tan(ray) = sin(ray)/cos(ray): sin/cos are already needed elsewhere in
-   * this file (their own e_rem_pio2/k_rem_pio2/k_sin/k_cos reduction is
-   * already paid for), so this avoids pulling in tan's own k_tan.o for a
-   * division nothing else here needs. */
+  double ray = pitch + dsp_atan2(v, (double)(d->lfe ? d->lfe : 1));
+  /* tan(ray) = sin(ray)/cos(ray): sin/cos are already linked for other DSP-1
+   * handlers and live in internal flash (not overlay-captured like atan).
+   * This avoids pulling in libm's k_tan.o, saving ~500B of internal flash. */
   double t = sin(ray) / cos(ray);
   if (t < 1e-4) t = 1e-4;                  /* above horizon: clamp far */
   return (double)d->fz / t;
@@ -119,8 +136,8 @@ static void cmd_parameter(Dsp1* d) {
   d->lfe = d->in[3]; d->les = d->in[4];
   d->aas = (uint16_t)d->in[5]; d->azs = (uint16_t)d->in[6];
 
-  /* horizon raster: ray pitch crosses 0 at v = -tan(pitch)*lfe (sin/cos, see
-   * ground_dist's comment on why not tan()) */
+  /* horizon raster: ray pitch crosses 0 at v = -tan(pitch)*lfe
+   * (sin/cos, not tan() — see ground_dist comment) */
   double pitch = angle(d->aas);
   double vHorizon = -(sin(pitch) / cos(pitch)) * (double)(d->lfe ? d->lfe : 1);
   d->vof = clamp16(vHorizon);
