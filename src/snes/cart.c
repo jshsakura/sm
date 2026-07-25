@@ -177,10 +177,18 @@ static uint8_t cart_readLorom(Cart* cart, uint8_t bank, uint16_t adr) {
     // adr 8000-ffff in all banks or all addresses in banks 40-7f and c0-ff
     return cart->rom[cart_romIndex(cart, ((uint32_t)bank << 15) | (adr & 0x7fff))];
   }
+#ifdef GNW_SNES_CORE
+  /* General-purpose core: an unmapped cart-region read is OPEN BUS on real
+   * hardware (last value on the bus), and commercial games do stray reads
+   * there in normal play. Crashing here is a homebrew-development aid, not
+   * emulation -- keep it for the sm/zelda3 dev builds below, never here. */
+  return cart->snes->openBus;
+#else
   printf("While trying to read from 0x%x\n", bank << 16 | adr);
   DumpCpuHistory();
   Die("The game crashed in cart_readLorom");
   return cart->snes->openBus;
+#endif
 }
 
 static void cart_writeLorom(Cart* cart, uint8_t bank, uint16_t adr, uint8_t val) {
@@ -209,8 +217,17 @@ static uint8_t cart_readHirom(Cart* cart, uint8_t bank, uint16_t adr) {
     // adr 8000-ffff in all banks or all addresses in banks 40-7f and c0-ff
     return cart->rom[cart_romIndex(cart, (((uint32_t)(bank & 0x3f)) << 16) | adr)];
   }
+#ifdef GNW_SNES_CORE
+  /* General-purpose core: unmapped reads are open bus, same reasoning as
+   * cart_readLorom above. Mario Kart reads $80:4A78 (bank 0 after masking,
+   * $4400-$5FFF system-area hole) ~40 frames into the title screen -- real
+   * hardware shrugs; this assert was a device BSOD (host builds compile
+   * asserts out with -DNDEBUG, which is why every host run sailed past it). */
+  return cart->snes->openBus;
+#else
   assert(0);
   return cart->snes->openBus;
+#endif
 }
 
 static void cart_writeHirom(Cart* cart, uint8_t bank, uint16_t adr, uint8_t val) {
