@@ -1076,8 +1076,11 @@ static void PpuDrawBackground_4bpp(Ppu *ppu, uint y, bool sub, uint layer, PpuZb
 #undef DO_PIXEL_HFLIP
 }
 
-// Draw a whole line of a 2bpp background layer into bgBuffers
-static void PpuDrawBackground_2bpp(Ppu *ppu, uint y, bool sub, uint layer, PpuZbufType zhi, PpuZbufType zlo) {
+// Draw a whole line of a 2bpp background layer into bgBuffers.
+// top_mask: 0x2000 lets priority-set tiles take the unconditional-store fast
+// path -- valid only when this layer's high priority tops every z drawn so
+// far (mode 1 BG3). Pass 0 when it does not (mode 0), forcing the z test.
+static void PpuDrawBackground_2bpp(Ppu *ppu, uint y, bool sub, uint layer, PpuZbufType zhi, PpuZbufType zlo, uint16 top_mask) {
 #define DO_PIXEL(i) do { \
   pixel = (bits >> i) & 1 | (bits >> (7 + i)) & 2; \
   if (pixel && z > dstz[i]) dstz[i] = z + pixel; } while (0)
@@ -1158,10 +1161,12 @@ static void PpuDrawBackground_2bpp(Ppu *ppu, uint y, bool sub, uint layer, PpuZb
       if (bits) {
         uint32 chunky = PpuDecode2bpp(bits);
         z += ((tile & 0x1c00) >> kPaletteShift);
-        /* This 2bpp renderer is BG3 in mode 1. Its high priority (0xf2) is
-         * above every BG1/BG2/OBJ priority, so the z test is always true. */
+        /* In mode 1 this renderer is BG3, whose high priority (0xf2) is above
+         * every BG1/BG2/OBJ priority, so the z test is always true and the
+         * TOP store can skip it (top_mask = 0x2000). Mode 0 layers have
+         * sprites above them at every priority, so they pass top_mask = 0. */
         if (tile & 0x4000) {
-          if (tile & 0x2000) {
+          if (tile & top_mask) {
             DO_TOP_CHUNKY_PIXEL(0); DO_TOP_CHUNKY_PIXEL(1); DO_TOP_CHUNKY_PIXEL(2); DO_TOP_CHUNKY_PIXEL(3);
             DO_TOP_CHUNKY_PIXEL(4); DO_TOP_CHUNKY_PIXEL(5); DO_TOP_CHUNKY_PIXEL(6); DO_TOP_CHUNKY_PIXEL(7);
           } else {
@@ -1169,7 +1174,7 @@ static void PpuDrawBackground_2bpp(Ppu *ppu, uint y, bool sub, uint layer, PpuZb
             DO_CHUNKY_PIXEL(4); DO_CHUNKY_PIXEL(5); DO_CHUNKY_PIXEL(6); DO_CHUNKY_PIXEL(7);
           }
         } else {
-          if (tile & 0x2000) {
+          if (tile & top_mask) {
             DO_TOP_CHUNKY_PIXEL_HFLIP(0); DO_TOP_CHUNKY_PIXEL_HFLIP(1); DO_TOP_CHUNKY_PIXEL_HFLIP(2); DO_TOP_CHUNKY_PIXEL_HFLIP(3);
             DO_TOP_CHUNKY_PIXEL_HFLIP(4); DO_TOP_CHUNKY_PIXEL_HFLIP(5); DO_TOP_CHUNKY_PIXEL_HFLIP(6); DO_TOP_CHUNKY_PIXEL_HFLIP(7);
           } else {
@@ -1334,7 +1339,7 @@ static void PpuDrawBackgrounds(Ppu *ppu, int y, bool sub) {
      * means the port needs a real mosaic implementation for that game. */
     PpuDrawBackground_4bpp(ppu, y, sub, 0, 0xc000, 0x8000);
     PpuDrawBackground_4bpp(ppu, y, sub, 1, 0xb100, 0x7100);
-    PpuDrawBackground_2bpp(ppu, y, sub, 2, 0xf200, 0x1200);
+    PpuDrawBackground_2bpp(ppu, y, sub, 2, 0xf200, 0x1200, 0x2000);
 #else
     if (IS_MOSAIC_ENABLED(ppu, 0))
       assert(0);
@@ -1349,8 +1354,23 @@ static void PpuDrawBackgrounds(Ppu *ppu, int y, bool sub) {
     if (IS_MOSAIC_ENABLED(ppu, 2))
       assert(0);
     else
-      PpuDrawBackground_2bpp(ppu, y, sub, 2, 0xf200, 0x1200);
+      PpuDrawBackground_2bpp(ppu, y, sub, 2, 0xf200, 0x1200, 0x2000);
 #endif
+  } else if (ppu->mode == 0) {
+    /* Mode 0: four 2bpp layers, each with its own 32-colour CGRAM window
+     * (BG2 +32, BG3 +64, BG4 +96 -- folded into the z parameters, whose low
+     * byte is the CGRAM index). Priority ranks interleave with the sprite
+     * ranks (4*prio+2 = 2/6/10/14) in the hardware order
+     * S3 BG1p1 BG2p1 S2 BG1p0 BG2p0 S1 BG3p1 BG4p1 S0 BG3p0 BG4p0.
+     * Sprites are never below any layer's fast path here, so top_mask = 0.
+     * (Mario Kart's whole menu flow -- driver select included -- is mode 0;
+     * this used to fall through to the mode-7 renderer and drew garbage.) */
+    if (ppu->lineHasSprites)
+      PpuDrawSprites(ppu, y, sub, true);
+    PpuDrawBackground_2bpp(ppu, y, sub, 0, 0xd000,      0x9000,      0);
+    PpuDrawBackground_2bpp(ppu, y, sub, 1, 0xc100 + 32, 0x8100 + 32, 0);
+    PpuDrawBackground_2bpp(ppu, y, sub, 2, 0x5200 + 64, 0x1200 + 64, 0);
+    PpuDrawBackground_2bpp(ppu, y, sub, 3, 0x4300 + 96, 0x0300 + 96, 0);
   } else {
     // mode 7
     PpuDrawBackground_mode7(ppu, y, sub, 0x5000);
