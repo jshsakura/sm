@@ -1325,6 +1325,17 @@ static void PpuDrawBackgrounds(Ppu *ppu, int y, bool sub) {
     if (ppu->lineHasSprites)
       PpuDrawSprites(ppu, y, sub, true);
 
+#ifdef GNW_SNES_CORE
+    /* General-purpose core: mosaic is a screen-transition effect half the
+     * commercial library uses (fades in Zelda, F-Zero, menu wipes...). This
+     * renderer has no mosaic path -- draw the background UN-mosaiced instead
+     * of dying: the transition looks plain, the game keeps running. The
+     * asserts stay for the sm/zelda3 dev builds below, where hitting one
+     * means the port needs a real mosaic implementation for that game. */
+    PpuDrawBackground_4bpp(ppu, y, sub, 0, 0xc000, 0x8000);
+    PpuDrawBackground_4bpp(ppu, y, sub, 1, 0xb100, 0x7100);
+    PpuDrawBackground_2bpp(ppu, y, sub, 2, 0xf200, 0x1200);
+#else
     if (IS_MOSAIC_ENABLED(ppu, 0))
       assert(0);
     else
@@ -1339,6 +1350,7 @@ static void PpuDrawBackgrounds(Ppu *ppu, int y, bool sub) {
       assert(0);
     else
       PpuDrawBackground_2bpp(ppu, y, sub, 2, 0xf200, 0x1200);
+#endif
   } else {
     // mode 7
     PpuDrawBackground_mode7(ppu, y, sub, 0x5000);

@@ -1494,11 +1494,16 @@ restart:
     case 0x5c: { // jml abl
       uint16_t value = cpu_readOpcodeWord(cpu);
       uint8_t new_k = cpu_readOpcode(cpu);
+#ifndef GNW_SNES_CORE
+      /* sm-specific crash trap: Super Metroid's own code funnels fatal states
+       * to $80:8573, so jumping there means the PORT broke. On the general
+       * core $80:8573 is ordinary ROM any game may legitimately JML to. */
       if (new_k == 0x80 && value == 0x8573) {
         printf("Current PC = 0x%x\n", cpu->k << 16 | cpu->pc);
         DumpCpuHistory();
         Die("The game has crashed!\n");
       }
+#endif
       cpu->k = new_k;
       cpu->pc = value;
       break;

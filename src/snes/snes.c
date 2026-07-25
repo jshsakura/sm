@@ -327,7 +327,12 @@ uint8_t snes_readBBus(Snes* snes, uint8_t adr) {
     return ret;
   }
 
+#ifndef GNW_SNES_CORE
+  /* dev builds: an unhandled B-bus read is a porting bug worth stopping on.
+   * General core: games read write-only $21xx registers in normal play and
+   * real hardware answers with open bus -- fall through. */
   assert(0);
+#endif
   return snes->openBus;
 }
 

@@ -115,7 +115,11 @@ uint8_t dma_read(Dma* dma, uint16_t adr) {
       return dma->channel[c].unusedByte;
     }
     default: {
+#ifndef GNW_SNES_CORE
+      /* dev builds only: $43xC-$43xE are unmapped on hardware (open bus);
+       * stray reads there are normal for commercial games. */
       assert(0);
+#endif
       return dma->snes->openBus;
     }
   }

@@ -118,7 +118,12 @@ void cart_load(Cart* cart, int type, uint8_t* rom, int romSize, int ramSize) {
   cart->rom = rom;
   cart_setRomSize(cart, romSize);
   if(ramSize > 0) {
-    assert(ramSize <= (int)sizeof(gnw_cart_sram));
+    /* A header can claim more SRAM than the 32 KB static buffer (64/128 KB
+     * carts exist). Clamp instead of assert-BSOD: the power-of-2 clamp keeps
+     * every `& (ramSize-1)` mask valid, so oversized carts see a mirrored
+     * 32 KB -- degraded but running, exactly what an undersized SRAM chip
+     * does on a repro board. */
+    if(ramSize > (int)sizeof(gnw_cart_sram)) ramSize = (int)sizeof(gnw_cart_sram);
     cart->ram = gnw_cart_sram;
     memset(cart->ram, 0, ramSize);
   } else {
