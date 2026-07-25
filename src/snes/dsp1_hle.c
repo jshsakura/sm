@@ -209,6 +209,13 @@ static void cmd_inverse(Dsp1* d) {
   double inv = 1.0 / v;
   int oe = 0;
   double m = fabs(inv);
+  /* v can UNDERFLOW to exactly +-0.0 for e <~ -1060 (any nonzero a): then
+   * inv = +-Inf, and Inf/2.0 == Inf, so the normalization loop below never
+   * terminates -- a device hang for ~half of e's int16 range. The a==0
+   * early-return above only covers the literal-zero input, not the
+   * computed-underflow. Saturate exactly like that existing convention.
+   * (m == 0.0 is the mirror overflow case, inv underflowed: same treatment.) */
+  if (!isfinite(m) || m == 0.0) { d->out[0] = 0x7fff; d->out[1] = 0x7fff; return; }
   while (m >= 1.0) { m /= 2.0; oe++; }
   while (m < 0.5)  { m *= 2.0; oe--; }
   if (inv < 0) m = -m;
