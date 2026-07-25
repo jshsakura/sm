@@ -99,8 +99,17 @@ static void scalar(Dsp1* d, int slot) {
  * is at horizontal distance dist = fz / tan(ray). */
 static double ground_dist(Dsp1* d, double v) {
   double pitch = angle(d->aas);            /* attack angle: >0 pitches down */
-  double ray = pitch + atan2(v, (double)(d->lfe ? d->lfe : 1));
-  double t = tan(ray);
+  /* atan2(v, lfe), but lfe is always forced positive just above (never 0 or
+   * negative) -- atan2's quadrant correction only differs from plain atan()
+   * when its x-argument is <=0, which can't happen here, so atan(v/lfe) is
+   * exact and reuses atan2's own already-linked atan() rather than also
+   * needing e_atan2.o/w_atan2.o's wrapper. */
+  double ray = pitch + atan(v / (double)(d->lfe ? d->lfe : 1));
+  /* tan(ray) = sin(ray)/cos(ray): sin/cos are already needed elsewhere in
+   * this file (their own e_rem_pio2/k_rem_pio2/k_sin/k_cos reduction is
+   * already paid for), so this avoids pulling in tan's own k_tan.o for a
+   * division nothing else here needs. */
+  double t = sin(ray) / cos(ray);
   if (t < 1e-4) t = 1e-4;                  /* above horizon: clamp far */
   return (double)d->fz / t;
 }
@@ -110,9 +119,10 @@ static void cmd_parameter(Dsp1* d) {
   d->lfe = d->in[3]; d->les = d->in[4];
   d->aas = (uint16_t)d->in[5]; d->azs = (uint16_t)d->in[6];
 
-  /* horizon raster: ray pitch crosses 0 at v = -tan(pitch)*lfe */
+  /* horizon raster: ray pitch crosses 0 at v = -tan(pitch)*lfe (sin/cos, see
+   * ground_dist's comment on why not tan()) */
   double pitch = angle(d->aas);
-  double vHorizon = -tan(pitch) * (double)(d->lfe ? d->lfe : 1);
+  double vHorizon = -(sin(pitch) / cos(pitch)) * (double)(d->lfe ? d->lfe : 1);
   d->vof = clamp16(vHorizon);
   d->vva = clamp16(vHorizon);              /* same reference in this model */
 

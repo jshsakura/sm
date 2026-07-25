@@ -1172,6 +1172,8 @@
         .word   .Lop5c + 1
         .elseif \op == 0x20
         .word   .Lop20 + 1
+        .elseif \op == 0x02
+        .word   .Lop02 + 1
         .elseif \op == 0x22
         .word   .Lop22 + 1
         .elseif \op == 0x6c
@@ -7996,6 +7998,66 @@ snes_thumb2_step:
         strh    r6, [r4, #CPU_PC]
         PULL_BYTE                       @ r0 = k byte
         strb    r0, [r4, #CPU_K]
+        b       .L_handled
+
+@ --- 0x02 COP: real software interrupt (unlike 0x00 BRK, which is a
+@ CpuOpcodeHook redirect -- see the note by the dispatch table's missing
+@ 0x00 entry; BRK is deliberately left in C, it can jump to an arbitrary
+@ OTHER opcode's case body at runtime via goto restart, which a fixed
+@ native handler cannot safely replicate).
+@ COP (cpu.c:924-934): consume signature byte (RAW, discarded -- cpu_readOpcode),
+@ push k, push pc (post-signature, NOT pc-1), push flags (PHP's pack, .Lop08),
+@ +1 cycle, i=1, d=0, k=0, pc = HOOKED word at bank-0 0xffe4/0xffe5
+@ (cpu_readWord -> cpu_read, hooked -- matches JMP-ind's bank-0 pattern). ---
+.Lop02:
+        IMM_FETCH_BYTE                  @ r0 = signature byte, discarded; pc++ (raw)
+        ldrb    r2, [r4, #CPU_K]
+        PUSH_BYTE                       @ push(k)
+        ldrh    r6, [r4, #CPU_PC]       @ pc (post-signature; no -1)
+        PUSH_WORD                       @ push(pc)
+        @ --- pack flags (verbatim PHP, .Lop08) ---
+        ldrb    r2, [r4, #CPU_N]
+        lsl     r2, r2, #7
+        ldrb    r1, [r4, #CPU_V]
+        lsl     r1, r1, #6
+        orr     r2, r1
+        ldrb    r1, [r4, #CPU_MF]
+        lsl     r1, r1, #5
+        orr     r2, r1
+        ldrb    r1, [r4, #CPU_XF]
+        lsl     r1, r1, #4
+        orr     r2, r1
+        ldrb    r1, [r4, #CPU_D]
+        lsl     r1, r1, #3
+        orr     r2, r1
+        ldrb    r1, [r4, #CPU_I]
+        lsl     r1, r1, #2
+        orr     r2, r1
+        ldrb    r1, [r4, #CPU_Z]
+        lsl     r1, r1, #1
+        orr     r2, r1
+        ldrb    r1, [r4, #CPU_C]
+        orr     r2, r1
+        PUSH_BYTE                       @ push(getFlags())
+        ldrb    r0, [r4, #CPU_CYCLESUSED]
+        adds    r0, r0, #1              @ native mode: 1 extra cycle
+        strb    r0, [r4, #CPU_CYCLESUSED]
+        movs    r0, #1
+        strb    r0, [r4, #CPU_I]        @ i = true
+        movs    r0, #0
+        strb    r0, [r4, #CPU_D]        @ d = false
+        strb    r0, [r4, #CPU_K]        @ k = 0
+        mov     r0, r4
+        movw    r1, #0xffe4
+        bl      cpu_thumb2_read         @ r0 = vector low byte (HOOKED, bank 0)
+        push    {r0}
+        mov     r0, r4
+        movw    r1, #0xffe5
+        bl      cpu_thumb2_read         @ r0 = vector high byte
+        lsl     r0, r0, #8
+        pop     {r1}
+        orr     r0, r0, r1
+        strh    r0, [r4, #CPU_PC]       @ pc = vector
         b       .L_handled
 
 
