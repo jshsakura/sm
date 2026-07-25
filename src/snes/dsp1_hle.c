@@ -321,20 +321,26 @@ static void cmd_inverse(Dsp1* d) {
 }
 
 static void execute(Dsp1* d) {
-  /* the chip's dispatch table has 0x40 entries: the command index is the low
-   * six bits (Mario Kart issues 0x80 for Multiply) */
-  uint8_t c = d->cmd & 0x3f;
-  int hi = (c >> 4) & 0xf;
-  switch (c & 0x0f) {
-    case 0x1: if (hi <= 2) { attitude(d, hi); return; } break;
-    case 0x3: if (hi <= 2) { subjective(d, hi); return; } break;
-    case 0xb: if (hi <= 2) { scalar(d, hi); return; } break;
-    case 0xd: if (hi <= 2) { objective(d, hi); return; } break;
-    default: break;
-  }
-  switch (c) {
+  /* d->cmd holds the CANONICAL command (cmd_canon below folded the mirror
+   * aliases already); NOPs never reach here */
+  switch (d->cmd) {
+    case 0x01: attitude(d, 0); return;
+    case 0x11: attitude(d, 1); return;
+    case 0x21: attitude(d, 2); return;
+    case 0x03: subjective(d, 0); return;
+    case 0x13: subjective(d, 1); return;
+    case 0x23: subjective(d, 2); return;
+    case 0x0b: scalar(d, 0); return;
+    case 0x1b: scalar(d, 1); return;
+    case 0x2b: scalar(d, 2); return;
+    case 0x0d: objective(d, 0); return;
+    case 0x1d: objective(d, 1); return;
+    case 0x2d: objective(d, 2); return;
     case 0x00:  /* multiply: (a*b)>>15 */
       d->out[0] = clamp16((double)d->in[0] * d->in[1] / 32768.0);
+      return;
+    case 0x20:  /* multiply variant: (a*b)>>15 + 1 (chip's second entry) */
+      d->out[0] = clamp16((double)d->in[0] * d->in[1] / 32768.0 + 1.0);
       return;
     case 0x04: {  /* triangle: r*sin, r*cos */
       double th = angle((uint16_t)d->in[0]);
@@ -390,47 +396,69 @@ static void execute(Dsp1* d) {
       d->out[2] = (int16_t)(d->in[2] + d->in[5]);
       return;
     }
-    case 0x0f: case 0x1f: case 0x2f: case 0x3f:
-      d->out[0] = 0x0000;      /* self test: pass */
+    case 0x0f:
+      d->out[0] = 0x0000;      /* self test (RAM check): pass */
+      return;
+    case 0x2f:
+      d->out[0] = 0x0100;      /* memory size probe: the chip reports 0x0100 */
+      return;
+    case 0x1f:
+      /* data-ROM dump (1024 words on the real chip). No known retail game
+       * depends on the contents at runtime; serving zeros keeps the protocol
+       * shape without carrying the ROM image. */
+      d->out[0] = 0x0000;
       return;
     default:
       break;
   }
-  d->unknownCmds++;
-#ifndef TARGET_GNW
-  if (d->unknownCmds <= 8)
-    fprintf(stderr, "[dsp1] UNKNOWN command %02x\n", c);
-#endif
   d->out[0] = 0;
 }
 
-/* word counts per command; 0xff = unknown */
-static void io_shape(uint8_t cmd, uint8_t* inW, uint8_t* outW) {
-  uint8_t c = cmd & 0x3f;          /* dispatch-table index (see execute) */
-  int hi = (c >> 4) & 0xf;
-  switch (c & 0x0f) {
-    case 0x1: if (hi <= 2) { *inW = 4; *outW = 0; return; } break;
-    case 0x3: if (hi <= 2) { *inW = 3; *outW = 3; return; } break;
-    case 0xb: if (hi <= 2) { *inW = 3; *outW = 1; return; } break;
-    case 0xd: if (hi <= 2) { *inW = 3; *outW = 3; return; } break;
-    default: break;
-  }
-  switch (c) {
-    case 0x00: *inW = 2; *outW = 1; return;
-    case 0x02: *inW = 7; *outW = 4; return;
-    case 0x04: *inW = 2; *outW = 2; return;
-    case 0x06: *inW = 3; *outW = 3; return;
-    case 0x08: *inW = 3; *outW = 2; return;
-    case 0x0a: *inW = 1; *outW = 4; return;
-    case 0x0c: *inW = 3; *outW = 2; return;
-    case 0x0e: *inW = 2; *outW = 2; return;
-    case 0x10: *inW = 2; *outW = 2; return;
-    case 0x14: *inW = 6; *outW = 3; return;
-    case 0x18: *inW = 4; *outW = 1; return;
-    case 0x1c: *inW = 6; *outW = 3; return;
-    case 0x28: *inW = 3; *outW = 1; return;
-    case 0x0f: case 0x1f: case 0x2f: case 0x3f: *inW = 1; *outW = 1; return;
-    default:   *inW = 1; *outW = 1; return;   /* unknown: consume one, emit one */
+/* The chip's byte-protocol dispatch, mirrored from its documented behavior:
+ * mirror aliases fold per-group (Parameter answers at $02/$12/$22/$32,
+ * Project at $06/$16/$26/$36, attitude A also at $05/$31/$35, ...) -- NOT a
+ * uniform low-six-bits mask. Everything else, notably $80, is a NOP: the
+ * chip consumes the byte and stays idle, no parameters, no output. Mario
+ * Kart leans on that at race start -- it writes $80 to DR 128 times as a
+ * protocol flush, which must leave the chip idle no matter what transfer
+ * phase it was in. Treating $80 as a command (the old low-six-bits read of
+ * the dispatch, "$80 = Multiply") shifted the byte stream by one command:
+ * the race-init Parameter got eaten as phantom-Multiply parameters, every
+ * Raster then ran on reset-default projection state, and the game's line
+ * buffers filled with saturated 32767s -- the flat single-colour road.
+ * Returns the canonical command, or 0xff for NOP. */
+static uint8_t cmd_canon(uint8_t cmd, uint8_t* inW, uint8_t* outW) {
+  switch (cmd) {
+    case 0x00:                                  *inW = 2; *outW = 1; return 0x00; /* multiply */
+    case 0x20:                                  *inW = 2; *outW = 1; return 0x20; /* multiply+1 */
+    case 0x10: case 0x30:                       *inW = 2; *outW = 2; return 0x10; /* inverse */
+    case 0x04: case 0x24:                       *inW = 2; *outW = 2; return 0x04; /* triangle */
+    case 0x08:                                  *inW = 3; *outW = 2; return 0x08; /* radius */
+    case 0x18: case 0x38:                       *inW = 4; *outW = 1; return 0x18; /* range */
+    case 0x28:                                  *inW = 3; *outW = 1; return 0x28; /* distance */
+    case 0x0c: case 0x2c:                       *inW = 3; *outW = 2; return 0x0c; /* rotate */
+    case 0x1c: case 0x3c:                       *inW = 6; *outW = 3; return 0x1c; /* polar */
+    case 0x02: case 0x12: case 0x22: case 0x32: *inW = 7; *outW = 4; return 0x02; /* parameter */
+    case 0x0a: case 0x1a: case 0x2a: case 0x3a: *inW = 1; *outW = 4; return 0x0a; /* raster */
+    case 0x06: case 0x16: case 0x26: case 0x36: *inW = 3; *outW = 3; return 0x06; /* project */
+    case 0x0e: case 0x1e: case 0x2e: case 0x3e: *inW = 2; *outW = 2; return 0x0e; /* target */
+    case 0x01: case 0x05: case 0x31: case 0x35: *inW = 4; *outW = 0; return 0x01; /* attitude A */
+    case 0x11: case 0x15:                       *inW = 4; *outW = 0; return 0x11; /* attitude B */
+    case 0x21: case 0x25:                       *inW = 4; *outW = 0; return 0x21; /* attitude C */
+    case 0x0d: case 0x09: case 0x39: case 0x3d: *inW = 3; *outW = 3; return 0x0d; /* objective A */
+    case 0x1d: case 0x19:                       *inW = 3; *outW = 3; return 0x1d; /* objective B */
+    case 0x2d: case 0x29:                       *inW = 3; *outW = 3; return 0x2d; /* objective C */
+    case 0x03: case 0x33:                       *inW = 3; *outW = 3; return 0x03; /* subjective A */
+    case 0x13:                                  *inW = 3; *outW = 3; return 0x13; /* subjective B */
+    case 0x23:                                  *inW = 3; *outW = 3; return 0x23; /* subjective C */
+    case 0x0b: case 0x3b:                       *inW = 3; *outW = 1; return 0x0b; /* scalar A */
+    case 0x1b:                                  *inW = 3; *outW = 1; return 0x1b; /* scalar B */
+    case 0x2b:                                  *inW = 3; *outW = 1; return 0x2b; /* scalar C */
+    case 0x14: case 0x34:                       *inW = 6; *outW = 3; return 0x14; /* gyrate */
+    case 0x0f: case 0x07:                       *inW = 1; *outW = 1; return 0x0f; /* self test */
+    case 0x2f: case 0x27:                       *inW = 1; *outW = 1; return 0x2f; /* memory size */
+    case 0x1f: case 0x17: case 0x37: case 0x3f: *inW = 1; *outW = 1; return 0x1f; /* ROM dump */
+    default:                                    *inW = 0; *outW = 0; return 0xff; /* incl. $80: NOP */
   }
 }
 
@@ -444,9 +472,14 @@ static void start_command(Dsp1* d, uint8_t val) {
     fprintf(stderr, "[dsp1] first use: cmd %02x\n", val);
   }
 #endif
-  d->cmd = val;
-  io_shape(val, &d->inWords, &d->outWords);
+  uint8_t canon = cmd_canon(val, &d->inWords, &d->outWords);
   d->byteIdx = 0;
+  if (canon == 0xff) {             /* $80 flush / undocumented: consume, stay idle */
+    if (val != 0x80) d->unknownCmds++;   /* diagnostics only; $80 is expected */
+    d->state = 0;
+    return;
+  }
+  d->cmd = canon;
   memset(d->in, 0, sizeof(d->in));
   if (d->inWords == 0) {           /* no params: execute immediately */
     execute(d);
@@ -485,15 +518,33 @@ void dsp1_writeDR(Dsp1* d, uint8_t val) {
       d->byteIdx++;
       if (d->byteIdx >= d->inWords * 2) {
         execute(d);
+        if (trace_on()) {   /* LOCAL DIAG: command-level trace with values */
+          fprintf(stderr, "X c%02x in[%d %d %d %d %d %d %d] out[%d %d %d %d]\n",
+                  d->cmd & 0x3f, d->in[0], d->in[1], d->in[2], d->in[3],
+                  d->in[4], d->in[5], d->in[6],
+                  d->out[0], d->out[1], d->out[2], d->out[3]);
+        }
         d->byteIdx = 0;
-        if ((d->cmd & 0x3f) == 0x0a) { d->rasterVs = (uint16_t)d->in[0]; d->state = 3; }
+        if (d->cmd == 0x0a) { d->rasterVs = (uint16_t)d->in[0]; d->state = 3; }
         else d->state = d->outWords ? 2 : 0;
       }
       return;
     }
+    case 3:
+      /* Raster stream: a write consumes (and discards) one pending output
+       * byte; only once the current line's 8 bytes are drained does a write
+       * count as a command byte again. This is how Mario Kart exits the
+       * stream: after reading its 96 lines it writes exactly 8 filler bytes
+       * ($8000 x4) to drain the auto-refilled line, then sends the next real
+       * command. Taking the first filler byte as a command (the old code)
+       * desynced the byte phase by half a protocol cycle. */
+      d->byteIdx++;
+      if (d->byteIdx >= 8) { d->state = 0; d->byteIdx = 0; }
+      return;
     default:
-      /* a write while we are outputting = the host moved on: treat as a new
-       * command byte (this is also how the raster stream is terminated) */
+      /* a write while results are pending = the host moved on: treat as a
+       * new command byte (the chip re-arms for a command as soon as a
+       * command finishes executing) */
       d->state = 0;
       start_command(d, val);
       return;
@@ -501,7 +552,15 @@ void dsp1_writeDR(Dsp1* d, uint8_t val) {
 }
 
 uint8_t dsp1_readDR(Dsp1* d) {
-  if (trace_on()) fprintf(stderr, "R s%d i%d c%02x\n", d->state, d->byteIdx, d->cmd);
+  if (trace_on()) {
+    /* LOCAL DIAG: include the byte the game will actually receive */
+    uint8_t peek = 0xff;
+    if (d->state == 2 || d->state == 3) {
+      int w = d->byteIdx >> 1;
+      peek = (d->byteIdx & 1) ? (uint8_t)(d->out[w] >> 8) : (uint8_t)d->out[w];
+    }
+    fprintf(stderr, "R s%d i%d c%02x =%02x\n", d->state, d->byteIdx, d->cmd, peek);
+  }
   switch (d->state) {
     case 2: {                      /* result bytes, LSB first */
       int w = d->byteIdx >> 1;
@@ -518,6 +577,9 @@ uint8_t dsp1_readDR(Dsp1* d) {
         d->byteIdx = 0;
         d->rasterVs++;
         raster_line(d, (int16_t)d->rasterVs);  /* signed walk: -73 -> 0 -> +150 */
+        if (trace_on())              /* LOCAL DIAG: per-line stream values */
+          fprintf(stderr, "RL vs=%d out[%d %d %d %d]\n", (int16_t)d->rasterVs,
+                  d->out[0], d->out[1], d->out[2], d->out[3]);
       }
       return b;
     }
