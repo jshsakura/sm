@@ -28,6 +28,30 @@ static const int cyclesPerOpcode[256] = {
   2, 8, 4, 5, 4, 5, 5, 6, 3, 4, 5, 4, 2, 2, 4, 3
 };
 
+// Non-static 8-bit mirror for the Thumb-2 SPC700 engine (spc_thumb2.S), which
+// loads via movw/movt + ldrb. snes_redefines prefixes both the definition and
+// the asm's unprefixed reference with gsnes__ at link time. Keep the values in
+// sync with cyclesPerOpcode[] above; _Static_assert guards the size.
+const uint8_t spc_cycles_per_opcode[256] = {
+  2, 8, 4, 5, 3, 4, 3, 6, 2, 6, 5, 4, 5, 4, 6, 8,
+  2, 8, 4, 5, 4, 5, 5, 6, 5, 5, 6, 5, 2, 2, 4, 6,
+  2, 8, 4, 5, 3, 4, 3, 6, 2, 6, 5, 4, 5, 4, 5, 4,
+  2, 8, 4, 5, 4, 5, 5, 6, 5, 5, 6, 5, 2, 2, 3, 8,
+  2, 8, 4, 5, 3, 4, 3, 6, 2, 6, 4, 4, 5, 4, 6, 6,
+  2, 8, 4, 5, 4, 5, 5, 6, 5, 5, 4, 5, 2, 2, 4, 3,
+  2, 8, 4, 5, 3, 4, 3, 6, 2, 6, 4, 4, 5, 4, 5, 5,
+  2, 8, 4, 5, 4, 5, 5, 6, 5, 5, 5, 5, 2, 2, 3, 6,
+  2, 8, 4, 5, 3, 4, 3, 6, 2, 6, 5, 4, 5, 2, 4, 5,
+  2, 8, 4, 5, 4, 5, 5, 6, 5, 5, 5, 5, 2, 2, 12,5,
+  2, 8, 4, 5, 3, 4, 3, 6, 2, 6, 4, 4, 5, 2, 4, 4,
+  2, 8, 4, 5, 4, 5, 5, 6, 5, 5, 5, 5, 2, 2, 3, 4,
+  2, 8, 4, 5, 4, 5, 4, 7, 2, 5, 6, 4, 5, 2, 4, 9,
+  2, 8, 4, 5, 5, 6, 6, 7, 4, 5, 5, 5, 2, 2, 6, 3,
+  2, 8, 4, 5, 3, 4, 3, 6, 2, 4, 5, 3, 4, 3, 4, 3,
+  2, 8, 4, 5, 4, 5, 5, 6, 3, 4, 5, 4, 2, 2, 4, 3
+};
+_Static_assert(sizeof(spc_cycles_per_opcode) == 256, "spc_cycles_per_opcode must be 256 bytes for ldrb indexing");
+
 static uint8_t spc_read(Spc* spc, uint16_t adr);
 static void spc_write(Spc* spc, uint16_t adr, uint8_t val);
 static uint8_t spc_readOpcode(Spc* spc);
@@ -89,10 +113,21 @@ void spc_saveload(Spc *spc, SaveLoadFunc *func, void *ctx) {
 int spc_runOpcode(Spc* spc) {
   spc->cyclesUsed = 0;
   if(spc->stopped) return 1;
+#ifdef SPC_THUMB2_SPC
+  // The Thumb-2 engine fetches the opcode, charges cyclesUsed, and dispatches.
+  // On -1 it has fully handled the opcode; on a 0..255 return it has still
+  // advanced pc past the opcode and charged cyclesUsed, and the C dispatcher
+  // takes over for the operand/data semantics of the unhandled opcode.
+  int ret = spc_thumb2_step(spc);
+  if(ret < 0) return spc->cyclesUsed;
+  spc_doOpcode(spc, (uint8_t)ret);
+  return spc->cyclesUsed;
+#else
   uint8_t opcode = spc_readOpcode(spc);
   spc->cyclesUsed = cyclesPerOpcode[opcode];
   spc_doOpcode(spc, opcode);
   return spc->cyclesUsed;
+#endif
 }
 
 static uint8_t spc_readOpcode(Spc* spc) {
