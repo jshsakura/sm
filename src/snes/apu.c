@@ -103,6 +103,54 @@ void apu_cycle(Apu* apu) {
   apu->cycles++;
 }
 
+/* SNES_SPC_IDLE_SKIP=0 compiles the idle-wait skip out, for A/B measurement.
+ * It is on by default because it changes no state at all -- see below. */
+#ifndef SNES_SPC_IDLE_SKIP
+#define SNES_SPC_IDLE_SKIP 1
+#endif
+
+#if SNES_SPC_IDLE_SKIP
+/* The N-SPC sound driver's main wait, verbatim in both ALTTP ($0873) and SMW
+ * ($0549) and 40% of every SPC opcode they execute:
+ *
+ *     EC FD 00   MOV A,$00FD     ; timer 0's counter -- the read CLEARS it
+ *     F0 FB      BEQ -5          ; loop while it is still zero
+ *
+ * Every iteration before the timer ticks reads zero and clears an already-zero
+ * counter: no observable state changes, only cycles pass. So charge those cycles
+ * in one step instead of dispatching two opcodes per eight of them. apu_run's
+ * existing closed-form bulk update advances the timers and the 32-cycle DSP tick
+ * across the skipped span exactly as it would have anyway, which is why the
+ * audio comes out bit-identical rather than merely close.
+ *
+ * Returns whole 8-cycle iterations only, and stops one short of the tick, so the
+ * iteration that actually reads a non-zero counter is still interpreted, at the
+ * cycle it would have run at. Everything unusual -- timer disabled, a target of
+ * 0, a divider already past its target, a counter that is already non-zero --
+ * returns 0 and runs the interpreter.
+ */
+static int apu_idleSkipCycles(Apu* apu, int budget) {
+  uint16_t pc = apu->spc->pc;
+  const uint8_t* r = apu->ram;
+
+  if (r[pc] != 0xec || r[(uint16_t)(pc + 1)] != 0xfd || r[(uint16_t)(pc + 2)] != 0x00 ||
+      r[(uint16_t)(pc + 3)] != 0xf0 || r[(uint16_t)(pc + 4)] != 0xfb)
+    return 0;
+  if (apu->romReadable && pc >= 0xffbc)
+    return 0;                     /* those bytes would come from the boot ROM */
+
+  Timer* t = &apu->timer[0];
+  if (!t->enabled || t->counter != 0 || t->target == 0 || t->divider >= t->target)
+    return 0;
+
+  int ticks  = t->target - t->divider;              /* ticks until counter++ */
+  int toInc  = (int)t->cycles + (ticks - 1) * 128;  /* cycles until that tick */
+  int cycles = ((toInc - 1) / 8) * 8;               /* iterations strictly before it */
+  if (cycles > budget) cycles = (budget / 8) * 8;   /* never past the caller's budget */
+  return cycles >= 8 ? cycles : 0;
+}
+#endif
+
 /* Advance the APU by `cyclesToRun` SPC cycles. Identical machine to calling
  * apu_cycle() that many times, but the per-cycle DSP tick and the three timers are
  * folded into closed-form bulk updates between opcode boundaries — the SPC700's idle
@@ -112,11 +160,24 @@ void apu_cycle(Apu* apu) {
  * the framebuffer/WRAM/SRAM state hash is bit-identical to the per-cycle loop. */
 void apu_run(Apu* apu, int cyclesToRun) {
   while (cyclesToRun > 0) {
-    if (apu->cpuCyclesLeft == 0)
-      apu->cpuCyclesLeft = spc_runOpcode(apu->spc);
+    int step;
+    bool idle = false;
 
-    int step = apu->cpuCyclesLeft < cyclesToRun ? apu->cpuCyclesLeft : cyclesToRun;
-    if (step <= 0) step = 1;   /* an opcode charging 0: step one and wrap like the ref */
+    if (apu->cpuCyclesLeft == 0) {
+#if SNES_SPC_IDLE_SKIP
+      int skip = apu_idleSkipCycles(apu, cyclesToRun);
+      if (skip > 0) {
+        step = skip;             /* the SPC does nothing observable for this long */
+        idle = true;
+      } else
+#endif
+        apu->cpuCyclesLeft = spc_runOpcode(apu->spc);
+    }
+
+    if (!idle) {
+      step = apu->cpuCyclesLeft < cyclesToRun ? apu->cpuCyclesLeft : cyclesToRun;
+      if (step <= 0) step = 1; /* an opcode charging 0: step one and wrap like the ref */
+    }
 
     /* DSP fires when (cycles & 0x1f)==0, tested before the increment — so once for
      * every multiple of 32 in [cycles, cycles+step). */
@@ -155,7 +216,7 @@ void apu_run(Apu* apu, int cyclesToRun) {
     }
 
     apu->cycles = end;
-    apu->cpuCyclesLeft -= (uint8_t)step;
+    if (!idle) apu->cpuCyclesLeft -= (uint8_t)step;  /* an idle skip runs no opcode */
     cyclesToRun -= step;
   }
 }
