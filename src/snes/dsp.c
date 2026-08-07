@@ -11,6 +11,32 @@
 
 #define MY_CHANGES 1
 
+#ifdef RIG_DSP_KEYON_PROBE
+#include <stddef.h>
+int g_keyon_probe_count = 0;
+int g_keyon_probe_filter[4] = {0,0,0,0};
+int g_keyon_probe_old_nonzero = 0;
+int g_keyon_probe_older_nonzero = 0;
+bool g_keyon_pending[8] = {0,0,0,0,0,0,0,0};
+void dsp_keyonProbeReport(void) {
+    printf("\n=== DSP KEY-ON FIRST-BLOCK FILTER PROBE ===\n");
+    printf("Total key-ons observed: %d\n", g_keyon_probe_count);
+    printf("First-block filter distribution:\n");
+    for (int i = 0; i < 4; i++)
+        printf("  filter=%d: %d (%.1f%%)\n", i, g_keyon_probe_filter[i],
+               g_keyon_probe_count ? 100.0*g_keyon_probe_filter[i]/g_keyon_probe_count : 0.0);
+    printf("old != 0 at key-on first decode: %d (%.1f%%)\n", g_keyon_probe_old_nonzero,
+           g_keyon_probe_count ? 100.0*g_keyon_probe_old_nonzero/g_keyon_probe_count : 0.0);
+    printf("older != 0 at key-on first decode: %d (%.1f%%)\n", g_keyon_probe_older_nonzero,
+           g_keyon_probe_count ? 100.0*g_keyon_probe_older_nonzero/g_keyon_probe_count : 0.0);
+    if (g_keyon_probe_filter[0] == g_keyon_probe_count)
+        printf("VERDICT: ALL first blocks use filter=0 -> old/older freeze is SAFE\n");
+    else
+        printf("VERDICT: SOME first blocks use filter!=0 -> freeze would corrupt those\n");
+    printf("=== END DSP KEY-ON PROBE ===\n\n");
+}
+#endif
+
 static const int rateValues[32] = {
   0, 2048, 1536, 1280, 1024, 768, 640, 512,
   384, 320, 256, 192, 160, 128, 96, 80,
@@ -61,6 +87,7 @@ static void dsp_cycleChannel(Dsp* dsp, int ch);
 static void dsp_handleEcho(Dsp* dsp, int* outputL, int* outputR);
 static void dsp_handleGain(Dsp* dsp, int ch);
 static void dsp_decodeBrr(Dsp* dsp, int ch);
+static void dsp_decodeBrrIdle(Dsp* dsp, int ch);
 static int16_t dsp_getSample(Dsp* dsp, int ch, int sampleNum, int offset);
 static void dsp_handleNoise(Dsp* dsp);
 
@@ -283,7 +310,11 @@ static void dsp_cycleChannel(Dsp* dsp, int ch) {
   }
   int newCounter = dsp->channel[ch].pitchCounter + pitch;
   if(newCounter > 0xffff) {
-    // next sample
+#ifdef SNES_DSP_BRR_IDLE_SKIP
+    if (dsp->channel[ch].gain == 0 && dsp->channel[ch].adsrState == 4)
+      dsp_decodeBrrIdle(dsp, ch);
+    else
+#endif
     dsp_decodeBrr(dsp, ch);
   }
   dsp->channel[ch].pitchCounter = newCounter;
@@ -429,6 +460,34 @@ static int16_t dsp_getSample(Dsp* dsp, int ch, int sampleNum, int offset) {
 #endif
 }
 
+#ifdef SNES_DSP_BRR_IDLE_SKIP
+/* Lightweight BRR advance for idle voices (gain==0 && adsrState==4).
+ * Reads header for previousFlags, advances decodeOffset past the 9-byte block,
+ * handles loop/end flags — but skips the expensive 16-sample decode + filter.
+ * old/older are FROZEN. Safe because probe shows first BRR block after every
+ * key-on uses filter=0 (ALttP: 341/341 = 100%), so old/older are never read
+ * before they'd be overwritten by a real decode. */
+static void dsp_decodeBrrIdle(Dsp* dsp, int ch) {
+  dsp->channel[ch].decodeBuffer[0] = dsp->channel[ch].decodeBuffer[16];
+  dsp->channel[ch].decodeBuffer[1] = dsp->channel[ch].decodeBuffer[17];
+  dsp->channel[ch].decodeBuffer[2] = dsp->channel[ch].decodeBuffer[18];
+  if(dsp->channel[ch].previousFlags == 1 || dsp->channel[ch].previousFlags == 3) {
+    uint16_t samplePointer = dsp->dirPage + 4 * dsp->channel[ch].srcn;
+    dsp->channel[ch].decodeOffset = dsp->apu_ram[(samplePointer + 2) & 0xffff];
+    dsp->channel[ch].decodeOffset |= dsp->apu_ram[(samplePointer + 3) & 0xffff] << 8;
+    if(dsp->channel[ch].previousFlags == 1) {
+      dsp->channel[ch].adsrState = 4;
+      dsp->channel[ch].gain = 0;
+    }
+    dsp->ram[0x7c] |= 1 << ch;
+  }
+  uint8_t header = dsp->apu_ram[dsp->channel[ch].decodeOffset++];
+  dsp->channel[ch].previousFlags = header & 0x3;
+  dsp->channel[ch].decodeOffset += 8; /* skip 8 data bytes */
+  /* old/older intentionally NOT updated */
+}
+#endif
+
 static void dsp_decodeBrr(Dsp* dsp, int ch) {
   // copy last 3 samples (16-18) to first 3 for interpolation
   dsp->channel[ch].decodeBuffer[0] = dsp->channel[ch].decodeBuffer[16];
@@ -450,6 +509,15 @@ static void dsp_decodeBrr(Dsp* dsp, int ch) {
   uint8_t header = dsp->apu_ram[dsp->channel[ch].decodeOffset++];
   int shift = header >> 4;
   int filter = (header & 0xc) >> 2;
+#ifdef RIG_DSP_KEYON_PROBE
+  if (g_keyon_pending[ch]) {
+    g_keyon_pending[ch] = false;
+    g_keyon_probe_count++;
+    if (filter >= 0 && filter <= 3) g_keyon_probe_filter[filter]++;
+    if (dsp->channel[ch].old != 0) g_keyon_probe_old_nonzero++;
+    if (dsp->channel[ch].older != 0) g_keyon_probe_older_nonzero++;
+  }
+#endif
   dsp->channel[ch].previousFlags = header & 0x3;
   uint8_t curByte = 0;
   int old = dsp->channel[ch].old;
@@ -573,6 +641,9 @@ void dsp_write(Dsp* dsp, uint8_t adr, uint8_t val) {
           memset(dsp->channel[ch].decodeBuffer, 0, sizeof(dsp->channel[ch].decodeBuffer));
           dsp->channel[ch].gain = 0;
           dsp->channel[ch].adsrState = dsp->channel[ch].useGain ? 3 : 0;
+#ifdef RIG_DSP_KEYON_PROBE
+          g_keyon_pending[ch] = true;
+#endif
         }
 #endif
       }

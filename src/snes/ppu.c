@@ -958,7 +958,7 @@ void ppu_runLine(Ppu* ppu, int line) {
     memset(g_probe_cur_vram_mask, 0, sizeof(g_probe_cur_vram_mask));
 #endif
 #ifdef SNES_LINE_CACHE
-    bool cache_eligible = PpuLineCacheBeginLine(line - 1);
+    bool cache_eligible = ppu->mode != 7 && PpuLineCacheBeginLine(line - 1);
     g_line_cache_tracking = cache_eligible;
     if (cache_eligible)
       memset(g_line_cache_cur_vram, 0, sizeof(g_line_cache_cur_vram));
