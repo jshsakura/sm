@@ -365,6 +365,9 @@ void ppu_handleVblank(Ppu* ppu) {
   ppu->frameInterlace = ppu->interlace; // set if we have a interlaced frame
 }
 
+#ifndef SNES_SPRITE_CENSUS
+#define SNES_SPRITE_CENSUS 0
+#endif
 bool g_ppu_skip_render;
 
 #ifdef TARGET_GNW
@@ -2289,6 +2292,13 @@ static void ppu_rebuildSpriteLineCache(Ppu *ppu) {
   ppu->objCacheValid = 1;
 }
 
+#if SNES_SPRITE_CENSUS
+/* How much sprite work a scene actually has, read over SWD. The reverse-draw
+ * lever removes one load per sprite PIXEL, so "is this scene sprite-heavy" is
+ * not a matter of opinion -- it is slivers per frame, and nobody had counted. */
+uint32_t g_sprite_slivers, g_sprite_lines, g_sprite_over32, g_sprite_over34;
+#endif
+
 static bool ppu_evaluateSprites(Ppu* ppu, int line) {
   // TODO: iterate over oam normally to determine in-range sprites,
   //   then iterate those in-range sprites in reverse for tile-fetching
@@ -2328,6 +2338,9 @@ static bool ppu_evaluateSprites(Ppu* ppu, int line) {
             spritesFound++;
             if(spritesFound > 32) {
               ppu->rangeOver = true;
+#if SNES_SPRITE_CENSUS
+              g_sprite_over32++;
+#endif
               goto done;
             }
             // update row according to obj-interlace
@@ -2347,8 +2360,14 @@ static bool ppu_evaluateSprites(Ppu* ppu, int line) {
                 tilesFound++;
                 if(tilesFound > 34) {
                   ppu->timeOver = true;
+#if SNES_SPRITE_CENSUS
+                  g_sprite_over34++;
+#endif
                   goto done;
                 }
+#if SNES_SPRITE_CENSUS
+                g_sprite_slivers++;
+#endif
                 // figure out which tile this uses, looping within 16x16 pages, and get it's data
                 int usedCol = oam1 & 0x4000 ? spriteSize - 1 - col : col;
                 int usedTile = ((((oam1 & 0xff) >> 4) + (row >> 3)) << 4) | (((oam1 & 0xf) + (usedCol >> 3)) & 0xf);
@@ -2385,6 +2404,9 @@ static bool ppu_evaluateSprites(Ppu* ppu, int line) {
     }
   }
 done:
+#if SNES_SPRITE_CENSUS
+  g_sprite_lines++;
+#endif
   return tilesFound != 0;
 }
 
