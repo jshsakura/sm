@@ -1290,6 +1290,63 @@ snes_thumb2_step:
         ldrb    r3, [r2, r6]
         strb    r3, [r4, #CPU_CYCLESUSED]
         movs    r5, #1                  @ return contract: step (-1/opcode)
+        b       .Ldispatch
+
+@ Whole-opcode entry: everything cpu_runOpcode() does, in one frame.
+@
+@ cpu_runOpcode is a wrapper -- five never-taken checks and a BL -- yet the
+@ device profile charged it 10.0% of the frame, because "per opcode" is tens of
+@ thousands of times per frame and a C frame is not free: its own push/pop of
+@ four registers, then immediately the engine's push/pop of the same four, then
+@ a BL and a return, to reach a body that was always going to run. This entry
+@ keeps the checks (they are semantics, not overhead) and drops the frame: the
+@ caller lands directly in the fetch.
+@
+@ The checks mirror cpu_runOpcode exactly, including that an IRQ the I flag
+@ masks is NOT a reason to leave the fast path -- `irqWanted & ~i`, both fields
+@ being normalised _Bool. Anything the fast path does not model (stopped, WAI,
+@ a taken interrupt, an active rc translation) tail-branches to the C function,
+@ which then runs the full original path from the top; nothing is half-done at
+@ the branch, because the branch is before the fetch.
+@
+@ Returns cyclesUsed, like cpu_runOpcode.
+        .global snes_thumb2_run
+        .type   snes_thumb2_run,%function
+        .thumb_func
+snes_thumb2_run:
+        ldrb    r1, [r0, #CPU_STOPPED]
+        ldrb    r2, [r0, #CPU_WAITING]
+        orrs    r1, r1, r2
+        ldrb    r2, [r0, #CPU_NMIWANTED]
+        orrs    r1, r1, r2
+        ldrb    r2, [r0, #CPU_IRQWANTED]
+        ldrb    r3, [r0, #CPU_I]
+        bics    r2, r2, r3              @ irqWanted && !i
+        orrs    r1, r1, r2
+        bne     .Lrun_slow
+        movw    r2, #:lower16:g_rc_active
+        movt    r2, #:upper16:g_rc_active
+        ldrb    r2, [r2]
+        cbnz    r2, .Lrun_slow
+        push    {r4, r5, r6, lr}
+        mov     r4, r0
+        ldr     r0, [r4, #CPU_MEM]
+        ldrb    r1, [r4, #CPU_K]
+        ldrh    r2, [r4, #CPU_PC]
+        lsl     r1, r1, #16
+        orr     r1, r1, r2
+        adds    r3, r2, #1
+        strh    r3, [r4, #CPU_PC]       @ uint16_t wrap matches cpu->pc++
+        ROM_FETCH_FAST
+        uxtb    r6, r0                  @ preserve opcode across dispatch
+        movw    r2, #:lower16:snes_cycles_per_opcode
+        movt    r2, #:upper16:snes_cycles_per_opcode
+        ldrb    r3, [r2, r6]
+        strb    r3, [r4, #CPU_CYCLESUSED]
+        movs    r5, #2                  @ return contract: run (cyclesUsed)
+        b       .Ldispatch
+.Lrun_slow:
+        b       cpu_runOpcode           @ tail call: LR is still the caller's
 
 .Ldispatch:
         adr     r2, .Ldispatch_table
@@ -2260,8 +2317,17 @@ snes_thumb2_step:
         b       .L_handled
 
 .L_noteb:
-
-        @ --- unsupported: try returns 0; step returns fetched opcode ---
+        @ --- unsupported: run finishes the byte itself; try returns 0; step
+        @ returns the fetched opcode for C to finish.  Reachable at runtime, not
+        @ just for the one opcode with no table entry: decimal-mode ADC/SBC bail
+        @ here before touching any operand. ---
+        cmp     r5, #2
+        bne     .L_noteb_legacy
+        mov     r0, r4
+        mov     r1, r6                  @ the byte already fetched; do NOT refetch
+        bl      cpu_thumb2_fallback
+        pop     {r4, r5, r6, pc}
+.L_noteb_legacy:
         cmp     r5, #0
         ite     eq
         moveq   r0, #0
@@ -2269,7 +2335,13 @@ snes_thumb2_step:
         pop     {r4, r5, r6, pc}
 
 .L_handled:
-        @ try returns 1; step returns -1.
+        @ run returns cyclesUsed; try returns 1; step returns -1.  Run is tested
+        @ first: it is the shipping path and this is the tail of every opcode.
+        cmp     r5, #2
+        bne     .L_handled_legacy
+        ldrb    r0, [r4, #CPU_CYCLESUSED]
+        pop     {r4, r5, r6, pc}
+.L_handled_legacy:
         cmp     r5, #0
         ite     eq
         moveq   r0, #1

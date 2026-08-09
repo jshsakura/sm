@@ -1499,7 +1499,19 @@ static void PpuDrawBackground_mode7(Ppu *ppu, uint y, bool sub, PpuZbufType z) {
 }
 
 
-static void PpuDrawSprites(Ppu *ppu, uint y, uint sub, bool clear_backdrop) {
+/* SNES_PPU_SPLIT=1: keep the render's three big pieces as separate symbols so
+ * the device's PC sampler can tell them apart. types.h defines NOINLINE only
+ * for MSVC -- under gcc it expands to nothing, so PpuDrawWholeLine,
+ * PpuDrawBackgrounds and PpuDrawSprites all fold into ppu_runLine, and the
+ * profile can only report that 5.6 KB blob as one 14.7% line. Diagnostic builds
+ * only: forcing the calls costs a little, and what it buys is attribution. */
+#if defined(SNES_PPU_SPLIT) && SNES_PPU_SPLIT
+#define PPU_SPLIT_NOINLINE __attribute__((noinline))
+#else
+#define PPU_SPLIT_NOINLINE
+#endif
+
+PPU_SPLIT_NOINLINE static void PpuDrawSprites(Ppu *ppu, uint y, uint sub, bool clear_backdrop) {
   int layer = 4;
   if (!IS_SCREEN_ENABLED(ppu, sub, layer))
     return;  // layer is completely hidden
@@ -1523,7 +1535,7 @@ static void PpuDrawSprites(Ppu *ppu, uint y, uint sub, bool clear_backdrop) {
   }
 }
 
-static void PpuDrawBackgrounds(Ppu *ppu, int y, bool sub) {
+PPU_SPLIT_NOINLINE static void PpuDrawBackgrounds(Ppu *ppu, int y, bool sub) {
   // Top 4 bits contain the prio level, and bottom 4 bits the layer type.
   // SPRITE_PRIO_TO_PRIO can be used to convert from obj prio to this prio.
   //  15: BG3 tiles with priority 1 if bit 3 of $2105 is set
@@ -1650,7 +1662,7 @@ static void PpuRebuildMathFixed(Ppu *ppu, uint32_t key) {
 
 #endif
 
-static NOINLINE void PpuDrawWholeLine(Ppu *ppu, uint y) {
+PPU_SPLIT_NOINLINE static NOINLINE void PpuDrawWholeLine(Ppu *ppu, uint y) {
 #ifdef PPU_RGB565
   bool palette_was_dirty = ppu->paletteDirty;
   if (palette_was_dirty)
@@ -1784,7 +1796,67 @@ static NOINLINE void PpuDrawWholeLine(Ppu *ppu, uint y) {
       math_enabled_cur |= ppu->addSubscreen << 8 | ppu->subtractColor << 9;
       // Need to check for each pixel whether to use math or not based on the main screen layer.
       uint32 i = left;
-      do {
+/* SNES_PPU_PAIR: OFF, by device measurement, and the reason is worth keeping.
+ *
+ * The no-math branch above pairs its pixels and wins; doing the same here for
+ * the pixels that bypass the blend LOSES: Zelda 3's rain, the deterministic
+ * 900-frame window from a savestate, three runs each -- 50.39 fps without,
+ * 47.99 with. -4.8%%. No pixel changes either way (framebuffer, state and audio
+ * hashes identical on the rig), so this is purely what the extra per-pixel
+ * tests cost when the pair does NOT qualify, which in a translucent scene is
+ * most of them.
+ *
+ * The host rig had already said so -- +1.1%% instructions on ALttP's first 400
+ * frames -- and I discounted it because that scene has little colour math. The
+ * rig was measuring the right thing: this loop is sensitive to added branches,
+ * not to store width. Any future attempt here should REMOVE work rather than
+ * add a test that has to be paid before it can pay off. */
+#ifndef SNES_PPU_PAIR
+#define SNES_PPU_PAIR 0
+#endif
+#if defined(PPU_RGB565) && defined(SNES_PPU_DIRECT_MATH) && SNES_PPU_PAIR
+      /* Two pixels per iteration while BOTH of them bypass the blend.
+       *
+       * The no-math branch above already pairs its pixels -- one 32-bit load of
+       * two z-entries, one 32-bit store of two RGB565 pixels -- and this branch
+       * did not, although the pixels reaching it are overwhelmingly the same
+       * shape: a translucency effect covers part of a scanline, not all of it,
+       * so most pixels on a colour-math line still take the one-lookup bypass
+       * below. That is not a guess about typical content -- on the device, in
+       * Zelda 3's rain, PpuDrawWholeLine is 7.4%% of the frame and this is the
+       * loop it is in.
+       *
+       * A pair is taken only when both pixels qualify. The moment one does not,
+       * the scalar body handles that single pixel and pairing resumes on the
+       * next -- so the fast path never has to reproduce the blend, and a fully
+       * translucent line pays one extra test per pixel instead. */
+      const PpuZbufType *mrow = ppu->bgBuffers[0].data;
+      const PpuZbufType *srow = ppu->bgBuffers[1].data;
+      const uint32 pair_sub = math_enabled_cur & 0x100;   /* addSubscreen */
+      /* dst and both z rows must agree in their low two address bits or a
+       * 32-bit access would be unaligned on one of them. Checked once, not per
+       * pixel; when it fails the scalar body does the whole span as before. */
+      const bool pair_aligned =
+          ((((uintptr_t)dst ^ (uintptr_t)&mrow[i]) |
+            ((uintptr_t)&mrow[i] ^ (uintptr_t)&srow[i])) & 3) == 0;
+#endif
+      while (i < right) {
+#if defined(PPU_RGB565) && defined(SNES_PPU_DIRECT_MATH) && SNES_PPU_PAIR
+        if (pair_aligned && i + 1 < right && !((uintptr_t)dst & 3)) {
+          uint32 mm = *(const uint32 *)&mrow[i];
+          uint32 l0 = (mm >> 8) & 0xf, l1 = (mm >> 24) & 0xf;
+          if (l0 < 6 && l1 < 6) {
+            uint32 ss = pair_sub ? *(const uint32 *)&srow[i] : 0;
+            if ((!(math_enabled_cur & (1u << l0)) || !pair_sub || !(ss & 0xff)) &&
+                (!(math_enabled_cur & (1u << l1)) || !pair_sub || !(ss & 0xff0000))) {
+              *(uint32 *)dst = (uint32)math_fixed[mm & 0xfff] |
+                               (uint32)math_fixed[(mm >> 16) & 0xfff] << 16;
+              dst += 2, i += 2;
+              continue;
+            }
+          }
+        }
+#endif
         PpuZbufType main_z = ppu->bgBuffers[0].data[i];
         uint8 main_layer = (main_z >> 8) & 0xf;
         /* Fixed-color, transparent-subscreen AND math-disabled-layer pixels are
@@ -1801,6 +1873,7 @@ static NOINLINE void PpuDrawWholeLine(Ppu *ppu, uint y) {
             (!(math_enabled_cur & (1 << main_layer)) ||
              !ppu->addSubscreen || (ppu->bgBuffers[1].data[i] & 0xff) == 0)) {
           dst[0] = math_fixed[main_z & 0xfff];
+          dst++, i++;
           continue;
         }
         uint32 color = ppu->cgram[main_z & 0xff], color2;
@@ -1833,7 +1906,8 @@ static NOINLINE void PpuDrawWholeLine(Ppu *ppu, uint y) {
 #else
         dst[0] = color_map[b] | color_map[g] << 8 | color_map[r] << 16;
 #endif
-      } while (dst++, ++i < right);
+        dst++, i++;
+      }
     }
   } while (cw_clip_math >>= 1, ++windex < cwin.nr);
 

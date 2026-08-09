@@ -262,6 +262,19 @@ int cpu_runOpcode(Cpu* cpu) {
     cpu_doOpcode(cpu, (uint8_t)r);
   return cpu->cyclesUsed;
 }
+
+/* Finish an opcode the engine's run-mode entry (snes_thumb2_run) fetched but
+ * cannot execute. cpu_doOpcode is static, so the assembly needs a door; this is
+ * the same shape as the cpu_thumb2_read/write bridges above. The byte comes in
+ * as an argument precisely because it is ALREADY fetched and pc already
+ * advanced -- refetching here would run the operand as an opcode. */
+#ifdef SNES_BUS_IN_ITCM
+__attribute__((section(".itcm_snes_interp.thumb2.bus")))
+#endif
+int cpu_thumb2_fallback(Cpu* cpu, uint32_t opcode) {
+  cpu_doOpcode(cpu, (uint8_t)opcode);
+  return cpu->cyclesUsed;
+}
 #endif
 
 static uint8_t cpu_readOpcode(Cpu* cpu) {

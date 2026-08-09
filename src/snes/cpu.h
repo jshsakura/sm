@@ -77,6 +77,16 @@ int snes_thumb2_try(Cpu* cpu, uint8_t opcode);
    handled, or the opcode byte (0..255) if unsupported — the caller then calls
    cpu_doOpcode on that already-fetched byte with no second fetch or cycle charge. */
 int snes_thumb2_step(Cpu* cpu);
+/* Stage 4 whole-opcode entry: cpu_runOpcode's pre-work AND the fetch-dispatch
+   in one frame, returning cyclesUsed exactly as cpu_runOpcode does. Anything
+   the fast path does not model tail-branches to cpu_runOpcode before the fetch,
+   so the two are interchangeable at every call site. Use CPU_RUN_OPCODE rather
+   than naming it: a build without the engine has no such symbol. */
+int snes_thumb2_run(Cpu* cpu);
+int cpu_thumb2_fallback(Cpu* cpu, uint32_t opcode);
+#define CPU_RUN_OPCODE(cpu) snes_thumb2_run(cpu)
+#else
+#define CPU_RUN_OPCODE(cpu) cpu_runOpcode(cpu)
 #endif
 uint8_t cpu_getFlags(Cpu *cpu);
 void cpu_setFlags(Cpu *cpu, uint8_t val);
