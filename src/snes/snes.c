@@ -619,8 +619,20 @@ void snes_write(Snes* snes, uint32_t adr, uint8_t val) {
 __attribute__((section(".itcm_snes_interp.thumb2.bus")))
 #endif
 uint8_t snes_cpuRead(Snes* snes, uint32_t adr) {
+  /* Count the access; do NOT charge for it here.
+   *
+   * Every bus access used to do cpuCyclesLeft += 8 as well, and the caller then
+   * did cpuCyclesLeft += (cycles - memOps) * 6 once the opcode was over. The sum
+   * of those is 6*cycles + 2*memOps, which the caller can compute on its own --
+   * so the load, add and store on every single memory access were buying a
+   * number nobody read until the opcode ended. Nothing inside an opcode reads
+   * cpuCyclesLeft (the scheduler only looks at it between opcodes), and it
+   * cannot overflow the uint8 on the way: it starts each opcode at 0 and the
+   * worst opcode charges about 62.
+   *
+   * This is a removal, not a test that skips work -- the shape that keeps
+   * losing on this chip. See docs/SNES_LAST_MILE.md. */
   snes->cpuMemOps++;
-  snes->cpuCyclesLeft += 8;
 #ifdef RIG_CALL_PROFILE
   extern uint64_t g_cpuRead_calls, g_win_cpuRead_calls, g_cpuRead_slow, g_cpuRead_romhit, g_cpuRead_wram;
   g_cpuRead_calls++; g_win_cpuRead_calls++;
@@ -688,8 +700,7 @@ uint8_t snes_cpuRead(Snes* snes, uint32_t adr) {
 __attribute__((section(".itcm_snes_interp.thumb2.bus")))
 #endif
 void snes_cpuWrite(Snes* snes, uint32_t adr, uint8_t val) {
-  snes->cpuMemOps++;
-  snes->cpuCyclesLeft += 8;
+  snes->cpuMemOps++;   /* charged once per opcode by the caller; see snes_cpuRead */
 #ifdef RIG_CALL_PROFILE
   extern uint64_t g_cpuWrite_calls, g_cpuWrite_slow;
   g_cpuWrite_calls++;

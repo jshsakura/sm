@@ -108,9 +108,8 @@
         ldrb    r2, [r0, #SNES_CPUMEMOPS]       @ HIT: cpuMemOps++
         adds    r2, r2, #1
         strb    r2, [r0, #SNES_CPUMEMOPS]
-        ldrb    r2, [r0, #SNES_CPUCYCLESLEFT]   @ cpuCyclesLeft += 8
-        adds    r2, r2, #8
-        strb    r2, [r0, #SNES_CPUCYCLESLEFT]
+        @ No cpuCyclesLeft charge here: the caller charges 6*cycles + 2*memOps
+        @ once per opcode, which is the same total. Mirrors snes_cpuRead.
         ldr     r3, [r0, #SNES_ROMPAGEBASE]
         ubfx    r2, r1, #0, #13                 @ adr & 0x1fff
         ldrb    r0, [r3, r2]                    @ byte from cached ROM page
