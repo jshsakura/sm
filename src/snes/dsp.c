@@ -301,6 +301,23 @@ static void dsp_cycleChannel(Dsp* dsp, int ch, bool needSample) {
 #else
 static void dsp_cycleChannel(Dsp* dsp, int ch) {
 #endif
+  /* Fast path: truly idle voice (released + gain 0). Output is 0 regardless of
+   * decode state. Key-on (handled in dsp_writeReg for MY_CHANGES=1) resets
+   * decodeOffset/previousFlags/decodeBuffer, so freezing BRR state while idle
+   * is harmless. Pitch counter must still advance for correct sample timing
+   * when key-on fires. sampleOut=0 keeps pitch-modulation for ch+1 correct. */
+  if (dsp->channel[ch].gain == 0 && dsp->channel[ch].adsrState == 4 && !dsp->reset) {
+    uint16_t pitch = dsp->channel[ch].pitch;
+    if (ch > 0 && dsp->channel[ch].pitchModulation) {
+      int factor = (dsp->channel[ch - 1].sampleOut >> 4) + 0x400;
+      pitch = (pitch * factor) >> 10;
+      if (pitch > 0x3fff) pitch = 0x3fff;
+    }
+    dsp->channel[ch].pitchCounter += pitch;
+    dsp->channel[ch].sampleOut = 0;
+    return;
+  }
+
   // handle pitch counter
   uint16_t pitch = dsp->channel[ch].pitch;
   if(ch > 0 && dsp->channel[ch].pitchModulation) {

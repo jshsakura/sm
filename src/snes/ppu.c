@@ -790,20 +790,100 @@ static bool PpuLineCacheChanged(const uint32_t *dep, int words,
 /* Compare PpuLineCacheState excluding oamAdr (write-only pointer, no visual
  * effect) and m7matrix (only relevant in mode 7; games write dummy values
  * every frame in other modes).  Probe-validated: this unlocks ~96.6% cache
- * hit rate during ALttP gameplay with 0 false positives. */
+ * hit rate during ALttP gameplay with 0 false positives.
+ *
+ * Word-wise compare (uint32_t stride). Safe because Capture() memsets the
+ * struct to 0 before field assignment, so padding bytes are zero on both
+ * sides. m7matrix spans whole words (int16[8] = 16 B = 4 words) and is
+ * skipped entirely when mode!=7. oamAdr is a single byte inside a word that
+ * also holds objPriority/objSize/objInterlace — masked out, not skipped. */
+_Static_assert(sizeof(PpuLineCacheState) % 4 == 0,
+               "PpuLineCacheState must be word-sized for word-wise compare");
 static bool PpuLineCacheRegsMatch(const PpuLineCacheState *a, const PpuLineCacheState *b) {
-  const uint8_t *pa = (const uint8_t *)a;
-  const uint8_t *pb = (const uint8_t *)b;
-  size_t oamAdr_off = offsetof(PpuLineCacheState, oamAdr);
-  size_t oamAdr_end = oamAdr_off + sizeof(a->oamAdr);
-  size_t m7_off = offsetof(PpuLineCacheState, m7matrix);
-  size_t m7_end = m7_off + sizeof(a->m7matrix);
+  const uint32_t *wa = (const uint32_t *)a;
+  const uint32_t *wb = (const uint32_t *)b;
+  size_t m7_w0 = offsetof(PpuLineCacheState, m7matrix) / 4;
+  size_t m7_wn = m7_w0 + sizeof(a->m7matrix) / 4;
+  size_t oam_w = offsetof(PpuLineCacheState, oamAdr) / 4;
+  uint32_t oam_mask = ~(0xFFu << (8 * (offsetof(PpuLineCacheState, oamAdr) % 4)));
+  size_t nwords = sizeof(PpuLineCacheState) / 4;
   bool skip_m7 = (a->mode != 7 && b->mode != 7);
-  for (size_t i = 0; i < sizeof(PpuLineCacheState); i++) {
-    if (i >= oamAdr_off && i < oamAdr_end) continue;
-    if (skip_m7 && i >= m7_off && i < m7_end) continue;
-    if (pa[i] != pb[i]) return false;
+  for (size_t i = 0; i < nwords; i++) {
+    if (skip_m7 && i >= m7_w0 && i < m7_wn) continue;
+    uint32_t xa = wa[i], xb = wb[i];
+    if (i == oam_w) { xa &= oam_mask; xb &= oam_mask; }
+    if (xa != xb) return false;
   }
+  return true;
+}
+
+/* Direct field-by-field comparison of live PPU state against the stored cache
+ * entry, WITHOUT capturing into a temp PpuLineCacheState first.
+ *
+ * On cache-HIT lines (96.6%), this avoids:
+ *   - memset(s, 0, sizeof(*s))        — 120 bytes zeroed
+ *   - 5 memcpy()s for bgLayer/m7matrix/mathEnabled/screenEnabled/screenWindowed
+ *   - ~30 scalar field assignments
+ * Total ~250 bytes of memory writes skipped per hit line.
+ *
+ * Compares the SAME fields as PpuLineCacheCapture + PpuLineCacheRegsMatch, with
+ * the SAME exclusions: oamAdr (write-only OAM pointer, no visual effect) is
+ * never compared, m7matrix is skipped when mode!=7 (ALttP writes dummy values
+ * every frame). Probe-validated exclusion — see the word-wise variant above.
+ *
+ * Field order mirrors Capture() exactly. Returns true if all compared fields
+ * match. */
+static bool PpuLineCacheMatchPpu(const Ppu *p, const PpuLineCacheState *s) {
+  /* bgLayer[4] */
+  if (memcmp(p->bgLayer, s->bgLayer, sizeof(s->bgLayer)) != 0) return false;
+  /* m7matrix[8] — skip when mode!=7 (game writes dummy values every frame) */
+  if (p->mode == 7 && memcmp(p->m7matrix, s->m7matrix, sizeof(s->m7matrix)) != 0) return false;
+  /* mathEnabled[6] */
+  if (memcmp(p->mathEnabled, s->mathEnabled, sizeof(s->mathEnabled)) != 0) return false;
+  /* screenEnabled[6] */
+  if (memcmp(p->screenEnabled, s->screenEnabled, sizeof(s->screenEnabled)) != 0) return false;
+  /* screenWindowed[6] */
+  if (memcmp(p->screenWindowed, s->screenWindowed, sizeof(s->screenWindowed)) != 0) return false;
+  /* Scalar fields — grouped for readability, order matches Capture */
+  if (p->windowsel != s->windowsel) return false;
+  if (p->objTileAdr1 != s->objTileAdr1) return false;
+  if (p->objTileAdr2 != s->objTileAdr2) return false;
+  if (p->objPriority != s->objPriority) return false;
+  if (p->objSize != s->objSize) return false;
+  if (p->objInterlace != s->objInterlace) return false;
+  /* oamAdr: SKIPPED — write-only OAM write pointer, PPU reads all 128 entries
+   * via ppu_evaluateSprites, oamAdr is irrelevant to rendered pixels. */
+  if (p->mosaicSize != s->mosaicSize) return false;
+  if (p->mosaicStartLine != s->mosaicStartLine) return false;
+  if (p->mosaicEnabled != s->mosaicEnabled) return false;
+  if (p->window1left != s->window1left) return false;
+  if (p->window1right != s->window1right) return false;
+  if (p->window2left != s->window2left) return false;
+  if (p->window2right != s->window2right) return false;
+  if (p->clipMode != s->clipMode) return false;
+  if (p->preventMathMode != s->preventMathMode) return false;
+  if (p->addSubscreen != s->addSubscreen) return false;
+  if (p->subtractColor != s->subtractColor) return false;
+  if (p->halfColor != s->halfColor) return false;
+  if (p->fixedColorR != s->fixedColorR) return false;
+  if (p->fixedColorG != s->fixedColorG) return false;
+  if (p->fixedColorB != s->fixedColorB) return false;
+  if (p->forcedBlank != s->forcedBlank) return false;
+  if (p->brightness != s->brightness) return false;
+  if (p->mode != s->mode) return false;
+  if (p->bg3priority != s->bg3priority) return false;
+  if (p->pseudoHires != s->pseudoHires) return false;
+  if (p->directColor != s->directColor) return false;
+  if (p->m7largeField != s->m7largeField) return false;
+  if (p->m7charFill != s->m7charFill) return false;
+  if (p->m7xFlip != s->m7xFlip) return false;
+  if (p->m7yFlip != s->m7yFlip) return false;
+  if (p->m7extBg != s->m7extBg) return false;
+  if (p->extraLeftCur != s->extraLeftCur) return false;
+  if (p->extraRightCur != s->extraRightCur) return false;
+  if (p->extraLeftRight != s->extraLeftRight) return false;
+  if (p->lineHasSprites != s->lineHasSprites) return false;
+  if (p->objInterlace && p->evenFrame != s->evenFrameWhenObjInterlace) return false;
   return true;
 }
 
@@ -965,8 +1045,17 @@ void ppu_runLine(Ppu* ppu, int line) {
 #endif
     if (!ppu->objBufferClean)
       ClearBackdrop(&ppu->objBuffer);
-    ppu->lineHasSprites = !ppu->forcedBlank && ppu_evaluateSprites(ppu, line - 1);
-    ppu->objBufferClean = !ppu->lineHasSprites;
+#ifdef SNES_LINE_CACHE
+    if (cache_eligible && ppu->objCacheValid &&
+        (ppu->objLineCand[line - 1][0] | ppu->objLineCand[line - 1][1] |
+         ppu->objLineCand[line - 1][2] | ppu->objLineCand[line - 1][3]) == 0) {
+      ppu->lineHasSprites = false;
+    } else
+#endif
+    {
+      ppu->lineHasSprites = !ppu->forcedBlank && ppu_evaluateSprites(ppu, line - 1);
+      ppu->objBufferClean = !ppu->lineHasSprites;
+    }
 
     if (g_ppu_skip_render)
       return;   /* frameskip: the flags above still matter, the pixels below do not */

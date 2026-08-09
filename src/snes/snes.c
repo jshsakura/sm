@@ -45,6 +45,7 @@ Snes* snes_init(uint8_t *ram) {
    * garbage pointer. Set it here as well as in snes_reset(). */
   snes->romPageTag = ~(uint32_t)0;
   snes->romPageBase = NULL;
+  snes->apuDotsAccum = 0;
   snes->cpu = cpu_init(snes, 0);
 #if defined(TARGET_GNW) && !defined(GNW_SNES_CORE)
   /* The Super Metroid port has no reference emulator on the device: the SPC700
@@ -131,6 +132,7 @@ void snes_reset(Snes* snes, bool hard) {
   snes->cpuCyclesLeft = 52; // 5 reads (8) + 2 IntOp (6)
   snes->cpuMemOps = 0;
   snes->apuCatchupCycles = 0.0;
+  snes->apuDotsAccum = 0;
   snes->hIrqEnabled = false;
   snes->vIrqEnabled = false;
   snes->nmiEnabled = false;
@@ -294,9 +296,23 @@ void snes_run_line(Snes *snes) {
 
 #define IS_ADR(x) (x == 0xfffff)
 
+/* (32040*32)/(1364*262*60) — APU clock / master clock ratio. Kept here (not in
+ * main_snes.c) because snes_catchupApu is the single conversion point for the
+ * integer dot accumulator. main_snes.c just does apuDotsAccum += step per dot. */
+#define APU_CYCLES_PER_MASTER ((32040.0 * 32.0) / (1364.0 * 262.0 * 60.0))
+
 void snes_catchupApu(Snes* snes) {
   if (snes->apu == NULL)
     return;
+  /* Flush accumulated integer dots to double. By distributivity this is
+   * mathematically identical to per-dot accumulation; the <1 ULP rounding
+   * difference is far below the integer truncation below. snes_run_line (sm
+   * core) still accumulates apuCatchupCycles directly — its apuDotsAccum is
+   * always 0, so this is a no-op for sm. */
+  if (snes->apuDotsAccum) {
+    snes->apuCatchupCycles += (double)snes->apuDotsAccum * APU_CYCLES_PER_MASTER;
+    snes->apuDotsAccum = 0;
+  }
   if (snes->apuCatchupCycles > 10000)
     snes->apuCatchupCycles = 10000;
 
@@ -594,9 +610,21 @@ void snes_write(Snes* snes, uint32_t adr, uint8_t val) {
  * chain. Anything with a side effect (B-bus/MMIO) or in ROM/SRAM keeps the slow
  * path, so behaviour is unchanged (state hash identical). Standard emulator
  * page-fast-path, minus the page table. */
+/* Put the bus accessors in ITCM beside the engine that calls them. ITCM is at
+ * 0x00000000 and the overlay at 0x24000000 -- past BL's +-16 MB -- so every read
+ * from the Thumb-2 engine went through a linker veneer, an extra jump on the
+ * hottest path in the emulator. The device profile showed the veneer alone at
+ * 2.7% of the frame. The two functions are 244 bytes and ITCM has ~7 KB spare. */
+#ifdef SNES_BUS_IN_ITCM
+__attribute__((section(".itcm_snes_interp.thumb2.bus")))
+#endif
 uint8_t snes_cpuRead(Snes* snes, uint32_t adr) {
   snes->cpuMemOps++;
   snes->cpuCyclesLeft += 8;
+#ifdef RIG_CALL_PROFILE
+  extern uint64_t g_cpuRead_calls, g_win_cpuRead_calls, g_cpuRead_slow, g_cpuRead_romhit, g_cpuRead_wram;
+  g_cpuRead_calls++; g_win_cpuRead_calls++;
+#endif
   /* Fetch-page cache. The ROM fast path below already collapsed the mapper to
    * one AND, but every single byte still re-ran the whole classification
    * chain above it -- two bank compares, the WRAM range test, the >=0x8000
@@ -613,14 +641,26 @@ uint8_t snes_cpuRead(Snes* snes, uint32_t adr) {
    * 2^n-1 with n >= 13 for any real cart), so base+offset stays linear for
    * the whole page. The tag holds the page-aligned address, so the sentinel
    * below (low bits set, and beyond the 24-bit bus) can never collide. */
-  if((adr & ~(uint32_t)0x1fff) == snes->romPageTag)
+  if((adr & ~(uint32_t)0x1fff) == snes->romPageTag) {
+#ifdef RIG_CALL_PROFILE
+    g_cpuRead_romhit++;
+#endif
     return snes->romPageBase[adr & 0x1fff];
+  }
   uint8_t bank = adr >> 16;
   uint16_t off = (uint16_t)adr;
-  if(bank == 0x7e || bank == 0x7f)
+  if(bank == 0x7e || bank == 0x7f) {
+#ifdef RIG_CALL_PROFILE
+    g_cpuRead_wram++;
+#endif
     return snes->ram[((bank & 1) << 16) | off];
-  if(off < 0x2000 && (bank < 0x40 || (bank >= 0x80 && bank < 0xc0)))
+  }
+  if(off < 0x2000 && (bank < 0x40 || (bank >= 0x80 && bank < 0xc0))) {
+#ifdef RIG_CALL_PROFILE
+    g_cpuRead_wram++;
+#endif
     return snes->ram[off];
+  }
   /* ROM fast path — the opcode/operand fetch that is ~77% of CPU reads. adr>=0x8000
    * is always ROM in LoROM/HiROM (SRAM/MMIO are all <0x8000), so only the mapper
    * index differs. Power-of-2 ROMs (romMask set = the common case) index with one
@@ -633,18 +673,34 @@ uint8_t snes_cpuRead(Snes* snes, uint32_t adr) {
       : (((uint32_t)((page >> 16) & 0x3f) << 16) | (page & 0xffff)); /* HiROM */
     snes->romPageBase = cart->rom + (pidx & cart->romMask);
     snes->romPageTag = page;
+#ifdef RIG_CALL_PROFILE
+    g_cpuRead_romhit++;
+#endif
     return snes->romPageBase[adr & 0x1fff];
   }
+#ifdef RIG_CALL_PROFILE
+  g_cpuRead_slow++;
+#endif
   return snes_read(snes, adr);
 }
 
+#ifdef SNES_BUS_IN_ITCM
+__attribute__((section(".itcm_snes_interp.thumb2.bus")))
+#endif
 void snes_cpuWrite(Snes* snes, uint32_t adr, uint8_t val) {
   snes->cpuMemOps++;
   snes->cpuCyclesLeft += 8;
+#ifdef RIG_CALL_PROFILE
+  extern uint64_t g_cpuWrite_calls, g_cpuWrite_slow;
+  g_cpuWrite_calls++;
+#endif
   uint8_t bank = adr >> 16;
   uint16_t off = (uint16_t)adr;
   if(bank == 0x7e || bank == 0x7f) { snes->ram[((bank & 1) << 16) | off] = val; return; }
   if(off < 0x2000 && (bank < 0x40 || (bank >= 0x80 && bank < 0xc0))) { snes->ram[off] = val; return; }
+#ifdef RIG_CALL_PROFILE
+  g_cpuWrite_slow++;
+#endif
   snes_write(snes, adr, val);
 }
 

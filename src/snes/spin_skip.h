@@ -68,7 +68,7 @@ typedef struct {
 
   /* auto-gate */
   bool     gate_on;
-  uint32_t win_frames, win_virt_snap;
+  uint32_t win_frames, win_virt_snap, win_real_snap;
   uint32_t park_frames;
 
   /* stats */

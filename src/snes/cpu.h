@@ -52,9 +52,15 @@ bool HookedFunctionRts(int is_long);
 Cpu* cpu_init(void* mem, int memType);
 void cpu_free(Cpu* cpu);
 void cpu_reset(Cpu* cpu);
+#ifdef SNES_BUS_IN_ITCM
+__attribute__((section(".itcm_snes_interp.thumb2.bus")))
+#endif
 int cpu_runOpcode(Cpu* cpu);
 #ifdef SNES_THUMB2_CPU
 /* The C interpreter exposed as oracle/fallback for the Thumb-2 dispatcher. */
+#ifdef SNES_BUS_IN_ITCM
+__attribute__((section(".itcm_snes_interp.thumb2.bus")))
+#endif
 int cpu_runOpcode_c(Cpu* cpu);
 /* Thumb-2 fast path. The caller (try path) has already fetched the opcode and
    charged cyclesPerOpcode[opcode]; the step path fetches it itself. Either way,

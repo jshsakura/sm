@@ -60,8 +60,12 @@ void spin_note(Cpu *cpu, uint32_t pc24, uint8_t charge, int dispatched) {
 
   /* keep an adopted pattern honest against real execution */
   if (s->on) {
-    if (dispatched || pc24 != s->pc[s->idx]) s->on = false;
-    else s->idx = (s->idx + 1) % s->len;
+    if (dispatched || pc24 != s->pc[s->idx])
+      s->on = false;          /* pattern broken — fall through to WATCH */
+    else {
+      s->idx = (s->idx + 1) % s->len;
+      return;                 /* pattern alive — WATCH ring + scan are wasted work */
+    }
   }
   if (!s->gate_on) return;
 
@@ -130,6 +134,7 @@ void spin_frame_tick(void) {
       s->gate_on = g_spin_whitelist;
       s->win_frames = 0;
       s->win_virt_snap = (uint32_t)s->ops_virtual;
+      s->win_real_snap = (uint32_t)s->ops_real;
     }
     return;
   }
@@ -137,9 +142,26 @@ void spin_frame_tick(void) {
   /* win_virt_snap holds (truncated) ops_virtual at window start; the delta over
    * 600 frames always fits 32 bits. */
   uint32_t replayed = (uint32_t)s->ops_virtual - s->win_virt_snap;
+  uint32_t real = (uint32_t)s->ops_real - s->win_real_snap;
   s->win_frames = 0;
   s->win_virt_snap = (uint32_t)s->ops_virtual;
-  if (replayed < SPIN_WIN_FRAMES * 3u) {   /* < ~3 replayed ops/frame: not a spinner */
+  s->win_real_snap = (uint32_t)s->ops_real;
+  /* Park unless the learner skipped at least as many opcodes as it charged for.
+   *
+   * The old test was "did it replay more than ~3 ops a frame", which asks only
+   * whether the game spins at all. A device profile answered the question it
+   * was standing in for: Zelda 3 replays 25% of its opcodes and is still a NET
+   * LOSS -- turning the learner off is worth +2.1 fps there -- while SMW at 53%
+   * wants it. The tax is per REAL opcode and the benefit is per REPLAYED one,
+   * so the honest comparison is between those two counts, and breakeven sits
+   * between 25% and 53%. Requiring replayed >= real puts it at 50%: Zelda parks,
+   * SMW keeps it, and neither is named in a table.
+   *
+   * The per-ROM table stays as an override for a game that measures badly, but
+   * it is no longer what decides the common case -- it could not be, since it
+   * matches on a ROM hash and the dump in the user's hand was not the one in
+   * the table, which is exactly how Zelda ended up paying this tax all along. */
+  if (replayed < real) {
     s->gate_on = false;
     s->phase = 0;
     /* Drop the adopted pattern too, or the park is not actually free. An

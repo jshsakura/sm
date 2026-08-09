@@ -191,6 +191,10 @@ void dma_write(Dma* dma, uint16_t adr, uint8_t val) {
 extern bool g_fail;
 
 void dma_doDma(Dma* dma) {
+#ifdef RIG_CALL_PROFILE
+  extern uint64_t g_dma_doDma_calls;
+  g_dma_doDma_calls++;
+#endif
   // figure out first channel that is active
   int i = 0;
   for(i = 0; i < 8; i++) {
@@ -294,6 +298,10 @@ void dma_initHdma(Dma* dma) {
 }
 
 void dma_doHdma(Dma* dma) {
+#ifdef RIG_CALL_PROFILE
+  extern uint64_t g_dma_doHdma_calls;
+  g_dma_doHdma_calls++;
+#endif
   dma->hdmaTimer = 0;
   bool hdmaHappened = false;
   for(int i = 0; i < 8; i++) {
@@ -354,11 +362,21 @@ static void dma_transferByte(Dma* dma, uint16_t aAdr, uint8_t aBank, uint8_t bAd
 }
 
 bool dma_cycle(Dma* dma) {
+#ifdef RIG_CALL_PROFILE
+  extern uint64_t g_dma_cycle_calls, g_dma_cycle_true, g_win_dma_cycle_calls;
+  g_dma_cycle_calls++; g_win_dma_cycle_calls++;
+#endif
   if(dma->hdmaTimer > 0) {
     dma->hdmaTimer -= 2;
+#ifdef RIG_CALL_PROFILE
+    g_dma_cycle_true++;
+#endif
     return true;
   } else if(dma->dmaBusy) {
     dma_doDma(dma);
+#ifdef RIG_CALL_PROFILE
+    g_dma_cycle_true++;
+#endif
     return true;
   }
   return false;

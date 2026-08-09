@@ -46,6 +46,7 @@ struct Snes {
   uint8_t cpuMemOps;
   uint8_t padpad[2];
   double apuCatchupCycles;
+  uint32_t apuDotsAccum;   /* integer dot accumulator — converted to double in snes_catchupApu to avoid per-dot VCVT+VMUL */
   // nmi / irq
   bool hIrqEnabled;
   bool vIrqEnabled;

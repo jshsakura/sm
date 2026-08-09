@@ -111,6 +111,9 @@ static void cpu_write(Cpu* cpu, uint32_t adr, uint8_t val) {
  * IMM_FETCH_BYTE), exactly as cpu_adrDp uses cpu_readOpcode (cpu_read_raw).
  * Non-static + unreferenced from C: the BL from .S resolves the symbol at link;
  * -Wunused-function does not fire for extern linkage. */
+#ifdef SNES_BUS_IN_ITCM
+__attribute__((section(".itcm_snes_interp.thumb2.bus")))
+#endif
 uint8_t cpu_thumb2_read(Cpu* cpu, uint32_t adr) {
 #ifdef SNES_SPIN_SKIP
   if(g_spin.phase) spin_hook_read(cpu, adr);
@@ -118,6 +121,9 @@ uint8_t cpu_thumb2_read(Cpu* cpu, uint32_t adr) {
   return snes_cpuRead((Snes*) cpu->mem, adr);
 }
 
+#ifdef SNES_BUS_IN_ITCM
+__attribute__((section(".itcm_snes_interp.thumb2.bus")))
+#endif
 void cpu_thumb2_write(Cpu* cpu, uint32_t adr, uint8_t val) {
 #ifdef SNES_SPIN_SKIP
   if(g_spin.phase) spin_hook_write();
@@ -178,6 +184,12 @@ void cpu_saveload(Cpu *cpu, SaveLoadFunc *func, void *ctx) {
 #  define SNES_RUNOPCODE_IMPL cpu_runOpcode_c
 #else
 #  define SNES_RUNOPCODE_IMPL cpu_runOpcode
+#endif
+/* Also in ITCM: this is the wrapper that calls the engine, and it lives in the
+ * overlay while the engine lives in ITCM, so the BL between them went through a
+ * veneer -- 2.1% of the frame by device profile, on every opcode. 188 bytes. */
+#ifdef SNES_BUS_IN_ITCM
+__attribute__((section(".itcm_snes_interp.thumb2.bus")))
 #endif
 int SNES_RUNOPCODE_IMPL(Cpu* cpu) {
   cpu->cyclesUsed = 0;
