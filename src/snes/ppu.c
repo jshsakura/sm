@@ -1634,25 +1634,54 @@ static void PpuRebuildMathFixed(Ppu *ppu, uint32_t key) {
    * loop). Otherwise fixed-color half math uses brightnessMultHalf. */
   uint8_t *math_map = ppu->halfColor && !ppu->addSubscreen ?
       ppu->brightnessMultHalf : ppu->brightnessMult;
+  /* 3,072 entries, but only FOUR of the twelve rows are ever distinct: `layer`
+   * enters the body solely through `do_math = mathEnabled[layer]`, and
+   * everything else is a function of (clip, index). Two of those four rows are
+   * free besides:
+   *
+   *   [clip=1][do_math=0] is bit-for-bit palette565[] -- same cgram, same
+   *                       brightnessMult, same packing as PpuRebuildPalette
+   *   [clip=0][do_math=0] is all zeros: mask 0 sends every component to
+   *                       brightnessMult[0], which is 0
+   *
+   * So compute 512 entries and copy the rest. This matters because the rebuild
+   * is not rare: PpuMathFixedKey includes fixedColorR/G/B, so every $2132
+   * COLDATA write triggers it, and COLDATA is a routine HDMA target (gradient
+   * skies, fades, Zelda 3's rain). Worst case that is once per scanline.
+   *
+   * A removal, not a test that skips work -- the shape that keeps losing on
+   * this chip. Bit-identical by construction. */
   for (int clip = 0; clip < 2; clip++) {
     uint32_t mask = clip ? 0x1f : 0;
-    for (int layer = 0; layer < 6; layer++) {
-      bool do_math = ppu->mathEnabled[layer];
+    int math_row = -1;
+    for (int layer = 0; layer < 8; layer++) {
+      uint16_t *row = ppu->mathFixed565[clip][layer];
+      /* Layers 6 and 7 never have colour math -- mathEnabled has six entries
+       * and the compositing loops rely on those rows holding the plain result. */
+      if (layer >= 6 || !ppu->mathEnabled[layer]) {
+        if (clip)
+          memcpy(row, ppu->palette565, sizeof(ppu->palette565));
+        else
+          memset(row, 0, 256 * sizeof(uint16_t));
+        continue;
+      }
+      if (math_row >= 0) {
+        memcpy(row, ppu->mathFixed565[clip][math_row], 256 * sizeof(uint16_t));
+        continue;
+      }
+      math_row = layer;
       for (int index = 0; index < 256; index++) {
         uint32_t color = ppu->cgram[index];
         uint32_t r = color & mask, g = color >> 5 & mask, b = color >> 10 & mask;
-        uint8_t *color_map = ppu->brightnessMult;
-        if (do_math) {
-          color_map = math_map;
-          if (ppu->subtractColor) {
-            r = r >= r2 ? r - r2 : 0;
-            g = g >= g2 ? g - g2 : 0;
-            b = b >= b2 ? b - b2 : 0;
-          } else {
-            r += r2, g += g2, b += b2;
-          }
+        uint8_t *color_map = math_map;
+        if (ppu->subtractColor) {
+          r = r >= r2 ? r - r2 : 0;
+          g = g >= g2 ? g - g2 : 0;
+          b = b >= b2 ? b - b2 : 0;
+        } else {
+          r += r2, g += g2, b += b2;
         }
-        ppu->mathFixed565[clip][layer][index] =
+        row[index] =
             (color_map[b] >> 3) | (color_map[g] >> 2) << 5 | (color_map[r] >> 3) << 11;
       }
     }
@@ -1779,11 +1808,11 @@ PPU_SPLIT_NOINLINE static NOINLINE void PpuDrawWholeLine(Ppu *ppu, uint y) {
         const uint16_t *direct = &ppu->mathFixed565[clip_color_mask != 0][0][0];
         const PpuZbufType *src = ppu->bgBuffers[0].data;
         uint32 i = left;
+        /* One masked load. Rows 6/7 exist precisely so the old `layer < 6`
+         * test and its alternate arm can go: they hold the same plain-palette
+         * (clip) or zero (clipped) values that arm produced. */
         do {
-          uint32 main_z = src[i];
-          uint32 layer = main_z >> 8 & 0xf;
-          dst[0] = layer < 6 ? direct[(layer << 8) | (main_z & 0xff)] :
-              (clip_color_mask ? ppu->palette565[main_z & 0xff] : 0);
+          dst[0] = direct[src[i] & 0x7ff];
         } while (dst++, ++i < right);
         continue;
       }
@@ -1869,10 +1898,12 @@ PPU_SPLIT_NOINLINE static NOINLINE void PpuDrawWholeLine(Ppu *ppu, uint y) {
          * extract/blend/repack below; it needs the same one lookup the
          * fixed-color case already uses. One lookup replaces component
          * extraction, layer test, add/subtract, clamp and RGB565 packing. */
-        if (main_layer < 6 &&
-            (!(math_enabled_cur & (1 << main_layer)) ||
-             !ppu->addSubscreen || (ppu->bgBuffers[1].data[i] & 0xff) == 0)) {
-          dst[0] = math_fixed[main_z & 0xfff];
+        /* No `main_layer < 6` here either: math_enabled_cur only ever has bits
+         * 0-5, so a layer-6 pixel fails the enable test and takes this bypass,
+         * and row 6 now holds the value it needs. */
+        if (!(math_enabled_cur & (1 << main_layer)) ||
+            !ppu->addSubscreen || (ppu->bgBuffers[1].data[i] & 0xff) == 0) {
+          dst[0] = math_fixed[main_z & 0x7ff];
           dst++, i++;
           continue;
         }

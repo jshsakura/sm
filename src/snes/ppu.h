@@ -223,7 +223,12 @@ struct Ppu {
    * for both color-window clip states and all six SNES layers. Subscreen pixels
    * still use the exact per-pixel path because their second color varies.
    * Kept after pixelbuffer_placeholder, so savestates never serialize it. */
-  uint16_t mathFixed565[2][6][256];
+  /* 8 rows, not 6, and the two extra are load-bearing: the layer nibble in a z
+   * word reaches 6 (BG 0-2, backdrop 5, sprites 4 or 6), so padding to a power
+   * of two lets the compositing loops index with one AND and drop the
+   * `layer < 6` range test they used to need per pixel. Rows 6 and 7 are filled
+   * with the no-math content, which is what those loops computed by hand. */
+  uint16_t mathFixed565[2][8][256];
   uint32_t mathFixedKey;
 #endif
 
