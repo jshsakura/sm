@@ -96,6 +96,9 @@
 @ The NULL-romPageBase guard rejects the un-installed state (base is NULL until
 @ the C path first installs a real page pointer + tag).
         .macro ROM_FETCH_FAST
+#ifdef SNES_T2_NO_ROMCACHE
+        b       .Lrom_miss_\@                    @ measurement arm: never serve inline
+#endif
         ldr     r3, [r0, #SNES_ROMPAGEBASE]     @ base ptr
         cbz     r3, .Lrom_miss_\@                @ NULL → cache not installed → full BL
         ldr     r3, [r0, #SNES_ROMPAGETAG]
@@ -1253,6 +1256,7 @@
 @ links and can pull a stale flag-on object into an incremental flag-off build.
         .section .itcm_snes_interp.thumb2,"ax",%progbits
         .align  2
+
         .global snes_thumb2_try
         .type   snes_thumb2_try,%function
         .thumb_func

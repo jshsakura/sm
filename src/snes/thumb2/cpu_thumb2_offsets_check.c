@@ -37,3 +37,17 @@ CPU_CK(stopped,      CPU_STOPPED);
 CPU_CK(cyclesUsed,   CPU_CYCLESUSED);
 CPU_CK(spBreakpoint, CPU_SPBREAKPOINT);
 CPU_CK(in_emu,       CPU_IN_EMU);
+
+/* The Snes offsets were asserted by nobody. A double added to Snes moved
+ * romPageBase from 108 to 116 and the engine's inline ROM page cache went on
+ * comparing the old word: it missed every time, so 79.5% of all CPU reads --
+ * the ones the cache exists to serve without a call -- fell through to
+ * snes_cpuRead, which the device profile then reported as 10.5% of the frame.
+ * Nothing failed, nothing was slower by any test we had; it just quietly cost
+ * a fifth of the bus path. Assert them. */
+#include "snes/snes.h"
+_Static_assert(offsetof(Snes, romPageBase)   == SNES_ROMPAGEBASE,   "SNES_ROMPAGEBASE stale");
+_Static_assert(offsetof(Snes, romPageTag)    == SNES_ROMPAGETAG,    "SNES_ROMPAGETAG stale");
+_Static_assert(offsetof(Snes, cpuCyclesLeft) == SNES_CPUCYCLESLEFT, "SNES_CPUCYCLESLEFT stale");
+_Static_assert(offsetof(Snes, cpuMemOps)     == SNES_CPUMEMOPS,     "SNES_CPUMEMOPS stale");
+_Static_assert(offsetof(Snes, ram) == SNES_RAM, "SNES_RAM stale");

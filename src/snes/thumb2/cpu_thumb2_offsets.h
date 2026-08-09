@@ -46,7 +46,8 @@
  * and falls through to the rig's snes_cpuRead. */
 #define SNES_CPUCYCLESLEFT  60
 #define SNES_CPUMEMOPS      61
-#define SNES_ROMPAGEBASE   108
-#define SNES_ROMPAGETAG    112
+#define SNES_ROMPAGEBASE   112
+#define SNES_ROMPAGETAG    116
+#define SNES_RAM            44   /* uint8_t *ram, for the WRAM inline path */
 
 #endif
