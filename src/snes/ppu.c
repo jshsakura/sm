@@ -2390,10 +2390,12 @@ static bool ppu_evaluateSprites(Ppu* ppu, int line) {
                  * DEFAULT OFF: implemented and rig-verified (hashes identical on
                  * ALttP 400f; +626 insn/frame there, which is the test being paid
                  * with nothing to skip because the rig draws every frame), but
-                 * NEVER MEASURED ON THE DEVICE -- the console was asleep when it
-                 * was written. Nothing ships from this project unmeasured. Build
-                 * SNES_SPRITE_SKIP_DRAW=1 and A/B it against the 52.36 fps
-                 * baseline; one build and three benches settles it. */
+                 * MEASURED, AND IT IS NOTHING: 52.29 / 52.36 / 52.21 fps against
+                 * a 52.36 baseline, Zelda 3 rain, 900 deterministic frames. The
+                 * arithmetic said ~1.4% of instructions; at this chip's observed
+                 * transfer ratio that is ~0.25 fps, and it did not show. Sprite
+                 * pixels are simply not enough of the frame here -- the census
+                 * counts 5.46 slivers per line against a limit of 34. Left off. */
 #if SNES_SPRITE_SKIP_DRAW
                 if (g_ppu_skip_render)
                   continue;
