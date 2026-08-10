@@ -2716,7 +2716,7 @@ static void ppu_rebuildSpriteLineCache(Ppu *ppu) {
   ppu->objCacheValid = 1;
 }
 
-#if SNES_SPRITE_CENSUS
+#if SNES_SPRITE_CENSUS || SNES_RENDER_CENSUS
 /* How much sprite work a scene actually has, read over SWD. The reverse-draw
  * lever removes one load per sprite PIXEL, so "is this scene sprite-heavy" is
  * not a matter of opinion -- it is slivers per frame, and nobody had counted. */
@@ -2762,7 +2762,7 @@ static bool ppu_evaluateSprites(Ppu* ppu, int line) {
             spritesFound++;
             if(spritesFound > 32) {
               ppu->rangeOver = true;
-#if SNES_SPRITE_CENSUS
+#if SNES_SPRITE_CENSUS || SNES_RENDER_CENSUS
               g_sprite_over32++;
 #endif
               goto done;
@@ -2784,12 +2784,12 @@ static bool ppu_evaluateSprites(Ppu* ppu, int line) {
                 tilesFound++;
                 if(tilesFound > 34) {
                   ppu->timeOver = true;
-#if SNES_SPRITE_CENSUS
+#if SNES_SPRITE_CENSUS || SNES_RENDER_CENSUS
                   g_sprite_over34++;
 #endif
                   goto done;
                 }
-#if SNES_SPRITE_CENSUS
+#if SNES_SPRITE_CENSUS || SNES_RENDER_CENSUS
                 g_sprite_slivers++;
 #endif
                 // figure out which tile this uses, looping within 16x16 pages, and get it's data
@@ -2855,7 +2855,7 @@ static bool ppu_evaluateSprites(Ppu* ppu, int line) {
     }
   }
 done:
-#if SNES_SPRITE_CENSUS
+#if SNES_SPRITE_CENSUS || SNES_RENDER_CENSUS
   g_sprite_lines++;
 #endif
   return tilesFound != 0;
