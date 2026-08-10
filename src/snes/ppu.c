@@ -1373,7 +1373,7 @@ static void PpuDrawBackground_4bpp(Ppu *ppu, uint y, bool sub, uint layer, PpuZb
    * what it skips is two cache-missing loads, not three instructions, which is
    * the same reason the DSP idle fast paths were worth keeping. The device
    * decides. */
-  uint32 memo_key = ~0u, memo_bits = 0;
+  uint32 memo_key = 0x10000u, memo_bits = 0;   /* 0x10000 is not a 16-bit tile word */
 #endif
   for (size_t windex = 0; windex < win.nr; windex++) {
     if (win.bits & (1 << windex))
@@ -1394,13 +1394,16 @@ static void PpuDrawBackground_4bpp(Ppu *ppu, uint y, bool sub, uint layer, PpuZb
       int ta = (tile & 0x8000) ? tileadr1 : tileadr0;
       PpuZbufType z = (tile & 0x2000) ? zhi : zlo;
 #if SNES_PPU_TILE_MEMO
-      uint32 memo_k = ((uint32)ta << 10) | (tile & 0x3ff);
+      /* Compare the raw tilemap word, not a constructed key. `ta` is chosen by
+       * bit 15 of that same word and `tile & 0x3ff` is its low bits, so equal
+       * words mean the same row of the same tile -- and the word is already in a
+       * register. One compare, no shift, no or. */
       uint32 bits;
-      if (memo_k == memo_key) {
+      if (tile == memo_key) {
         bits = memo_bits;
       } else {
         bits = READ_BITS(ta, tile & 0x3ff);
-        memo_key = memo_k, memo_bits = bits;
+        memo_key = tile, memo_bits = bits;
       }
 #else
       uint32 bits = READ_BITS(ta, tile & 0x3ff);
@@ -1456,13 +1459,16 @@ static void PpuDrawBackground_4bpp(Ppu *ppu, uint y, bool sub, uint layer, PpuZb
       int ta = (tile & 0x8000) ? tileadr1 : tileadr0;
       PpuZbufType z = (tile & 0x2000) ? zhi : zlo;
 #if SNES_PPU_TILE_MEMO
-      uint32 memo_k = ((uint32)ta << 10) | (tile & 0x3ff);
+      /* Compare the raw tilemap word, not a constructed key. `ta` is chosen by
+       * bit 15 of that same word and `tile & 0x3ff` is its low bits, so equal
+       * words mean the same row of the same tile -- and the word is already in a
+       * register. One compare, no shift, no or. */
       uint32 bits;
-      if (memo_k == memo_key) {
+      if (tile == memo_key) {
         bits = memo_bits;
       } else {
         bits = READ_BITS(ta, tile & 0x3ff);
-        memo_key = memo_k, memo_bits = bits;
+        memo_key = tile, memo_bits = bits;
       }
 #else
       uint32 bits = READ_BITS(ta, tile & 0x3ff);
@@ -1493,13 +1499,16 @@ static void PpuDrawBackground_4bpp(Ppu *ppu, uint y, bool sub, uint layer, PpuZb
       int ta = (tile & 0x8000) ? tileadr1 : tileadr0;
       PpuZbufType z = (tile & 0x2000) ? zhi : zlo;
 #if SNES_PPU_TILE_MEMO
-      uint32 memo_k = ((uint32)ta << 10) | (tile & 0x3ff);
+      /* Compare the raw tilemap word, not a constructed key. `ta` is chosen by
+       * bit 15 of that same word and `tile & 0x3ff` is its low bits, so equal
+       * words mean the same row of the same tile -- and the word is already in a
+       * register. One compare, no shift, no or. */
       uint32 bits;
-      if (memo_k == memo_key) {
+      if (tile == memo_key) {
         bits = memo_bits;
       } else {
         bits = READ_BITS(ta, tile & 0x3ff);
-        memo_key = memo_k, memo_bits = bits;
+        memo_key = tile, memo_bits = bits;
       }
 #else
       uint32 bits = READ_BITS(ta, tile & 0x3ff);
@@ -1616,7 +1625,7 @@ static void PpuDrawBackground_2bpp(Ppu *ppu, uint y, bool sub, uint layer, PpuZb
   const uint16 *addr;
 #if SNES_PPU_TILE_MEMO
   /* Same one-entry tile memo as the 4bpp drawer; see the comment there. */
-  uint32 memo_key = ~0u, memo_bits = 0;
+  uint32 memo_key = 0x10000u, memo_bits = 0;   /* 0x10000 is not a 16-bit tile word */
 #endif
   for (size_t windex = 0; windex < win.nr; windex++) {
     if (win.bits & (1 << windex))
@@ -1638,13 +1647,16 @@ static void PpuDrawBackground_2bpp(Ppu *ppu, uint y, bool sub, uint layer, PpuZb
       int ta = (tile & 0x8000) ? tileadr1 : tileadr0;
       PpuZbufType z = (tile & 0x2000) ? zhi : zlo;
 #if SNES_PPU_TILE_MEMO
-      uint32 memo_k = ((uint32)ta << 10) | (tile & 0x3ff);
+      /* Compare the raw tilemap word, not a constructed key. `ta` is chosen by
+       * bit 15 of that same word and `tile & 0x3ff` is its low bits, so equal
+       * words mean the same row of the same tile -- and the word is already in a
+       * register. One compare, no shift, no or. */
       uint32 bits;
-      if (memo_k == memo_key) {
+      if (tile == memo_key) {
         bits = memo_bits;
       } else {
         bits = READ_BITS(ta, tile & 0x3ff);
-        memo_key = memo_k, memo_bits = bits;
+        memo_key = tile, memo_bits = bits;
       }
 #else
       uint32 bits = READ_BITS(ta, tile & 0x3ff);
@@ -1676,13 +1688,16 @@ static void PpuDrawBackground_2bpp(Ppu *ppu, uint y, bool sub, uint layer, PpuZb
       int ta = (tile & 0x8000) ? tileadr1 : tileadr0;
       PpuZbufType z = (tile & 0x2000) ? zhi : zlo;
 #if SNES_PPU_TILE_MEMO
-      uint32 memo_k = ((uint32)ta << 10) | (tile & 0x3ff);
+      /* Compare the raw tilemap word, not a constructed key. `ta` is chosen by
+       * bit 15 of that same word and `tile & 0x3ff` is its low bits, so equal
+       * words mean the same row of the same tile -- and the word is already in a
+       * register. One compare, no shift, no or. */
       uint32 bits;
-      if (memo_k == memo_key) {
+      if (tile == memo_key) {
         bits = memo_bits;
       } else {
         bits = READ_BITS(ta, tile & 0x3ff);
-        memo_key = memo_k, memo_bits = bits;
+        memo_key = tile, memo_bits = bits;
       }
 #else
       uint32 bits = READ_BITS(ta, tile & 0x3ff);
@@ -1727,13 +1742,16 @@ static void PpuDrawBackground_2bpp(Ppu *ppu, uint y, bool sub, uint layer, PpuZb
       int ta = (tile & 0x8000) ? tileadr1 : tileadr0;
       PpuZbufType z = (tile & 0x2000) ? zhi : zlo;
 #if SNES_PPU_TILE_MEMO
-      uint32 memo_k = ((uint32)ta << 10) | (tile & 0x3ff);
+      /* Compare the raw tilemap word, not a constructed key. `ta` is chosen by
+       * bit 15 of that same word and `tile & 0x3ff` is its low bits, so equal
+       * words mean the same row of the same tile -- and the word is already in a
+       * register. One compare, no shift, no or. */
       uint32 bits;
-      if (memo_k == memo_key) {
+      if (tile == memo_key) {
         bits = memo_bits;
       } else {
         bits = READ_BITS(ta, tile & 0x3ff);
-        memo_key = memo_k, memo_bits = bits;
+        memo_key = tile, memo_bits = bits;
       }
 #else
       uint32 bits = READ_BITS(ta, tile & 0x3ff);
