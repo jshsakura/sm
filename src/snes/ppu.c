@@ -1104,7 +1104,28 @@ static void PpuWindows_Clear(PpuWindows *win, Ppu *ppu, uint layer) {
   win->bits = 0;
 }
 
+#ifndef SNES_WINDOW_CENSUS
+#define SNES_WINDOW_CENSUS 0
+#endif
+#if SNES_WINDOW_CENSUS
+/* Is the duplicate real? PpuWindows_Calc takes no `sub` argument, so a layer
+ * windowed on BOTH screens computes the identical result twice per line. That is
+ * a removal if it happens, and worth nothing if it does not -- so count before
+ * writing a cache.
+ *
+ * COUNTED, AND IT DOES NOT HAPPEN. Zelda 3 rain, 28,690 rendered lines: 30,319
+ * Calc calls (1.06 per line), of which the subscreen pass accounts for ZERO --
+ * no layer is ever windowed on the sub screen here, so there are no duplicates
+ * to remove. The call is also not a hotspot to begin with: at 1.06 per line it
+ * is essentially just the colour window. Lever closed by a count, before the
+ * cache that would have implemented it was written. */
+uint32_t g_win_calc, g_win_calc_sub, g_win_dup, g_win_lines;
+#endif
+
 static void PpuWindows_Calc(PpuWindows *win, Ppu *ppu, uint layer) {
+#if SNES_WINDOW_CENSUS
+  g_win_calc++;
+#endif
   // Evaluate which spans to render based on the window settings.
   // There are at most 5 windows.
   // Algorithm from Snes9x
@@ -1204,6 +1225,12 @@ static void PpuDrawBackground_4bpp(Ppu *ppu, uint y, bool sub, uint layer, PpuZb
   if (!IS_SCREEN_ENABLED(ppu, sub, layer))
     return;  // layer is completely hidden
   PpuWindows win;
+#if SNES_WINDOW_CENSUS
+  if (sub && IS_SCREEN_WINDOWED(ppu, 1, layer)) {
+    g_win_calc_sub++;
+    if (IS_SCREEN_WINDOWED(ppu, 0, layer)) g_win_dup++;
+  }
+#endif
   IS_SCREEN_WINDOWED(ppu, sub, layer) ? PpuWindows_Calc(&win, ppu, layer) : PpuWindows_Clear(&win, ppu, layer);
   BgLayer *bglayer = &ppu->bgLayer[layer];
   y += bglayer->vScroll;
@@ -1320,6 +1347,12 @@ static void PpuDrawBackground_2bpp(Ppu *ppu, uint y, bool sub, uint layer, PpuZb
   if (!IS_SCREEN_ENABLED(ppu, sub, layer))
     return;  // layer is completely hidden
   PpuWindows win;
+#if SNES_WINDOW_CENSUS
+  if (sub && IS_SCREEN_WINDOWED(ppu, 1, layer)) {
+    g_win_calc_sub++;
+    if (IS_SCREEN_WINDOWED(ppu, 0, layer)) g_win_dup++;
+  }
+#endif
   IS_SCREEN_WINDOWED(ppu, sub, layer) ? PpuWindows_Calc(&win, ppu, layer) : PpuWindows_Clear(&win, ppu, layer);
   BgLayer *bglayer = &ppu->bgLayer[layer];
   y += bglayer->vScroll;
@@ -1433,6 +1466,12 @@ static void PpuDrawBackground_mode7(Ppu *ppu, uint y, bool sub, PpuZbufType z) {
   if (!IS_SCREEN_ENABLED(ppu, sub, layer))
     return;  // layer is completely hidden
   PpuWindows win;
+#if SNES_WINDOW_CENSUS
+  if (sub && IS_SCREEN_WINDOWED(ppu, 1, layer)) {
+    g_win_calc_sub++;
+    if (IS_SCREEN_WINDOWED(ppu, 0, layer)) g_win_dup++;
+  }
+#endif
   IS_SCREEN_WINDOWED(ppu, sub, layer) ? PpuWindows_Calc(&win, ppu, layer) : PpuWindows_Clear(&win, ppu, layer);
 
   // expand 13-bit values to signed values
@@ -1519,6 +1558,12 @@ PPU_SPLIT_NOINLINE static void PpuDrawSprites(Ppu *ppu, uint y, uint sub, bool c
   if (!IS_SCREEN_ENABLED(ppu, sub, layer))
     return;  // layer is completely hidden
   PpuWindows win;
+#if SNES_WINDOW_CENSUS
+  if (sub && IS_SCREEN_WINDOWED(ppu, 1, layer)) {
+    g_win_calc_sub++;
+    if (IS_SCREEN_WINDOWED(ppu, 0, layer)) g_win_dup++;
+  }
+#endif
   IS_SCREEN_WINDOWED(ppu, sub, layer) ? PpuWindows_Calc(&win, ppu, layer) : PpuWindows_Clear(&win, ppu, layer);
   for (size_t windex = 0; windex < win.nr; windex++) {
     if (win.bits & (1 << windex))
@@ -1718,6 +1763,9 @@ PPU_SPLIT_NOINLINE static NOINLINE void PpuDrawWholeLine(Ppu *ppu, uint y) {
     return;
   }
 
+#if SNES_WINDOW_CENSUS
+  g_win_lines++;
+#endif
   // Default background is backdrop
   ClearBackdrop(&ppu->bgBuffers[0]);
 
