@@ -373,6 +373,14 @@ bool g_ppu_skip_render;
 /* Declared here because ppu_runLine reads them and it comes before the rest of
  * the census block. */
 uint32_t g_lc_hit, g_lc_miss;
+/* Is the tile fetch repetitive? The render's whole remaining cost is reading
+ * VRAM -- pixel arithmetic ablates to nothing, and the line-cache tracking that
+ * rode along with the reads is gone. Two halfwords per 4bpp tile, 68 tiles a
+ * line, random access into 64 KB behind a 16 KB cache. If consecutive tiles in a
+ * row repeat, a one-entry memo skips both the read and the decode. The
+ * subscreen's layer is fully opaque and 33 tiles a line; flat areas repeat.
+ * Count it before writing the memo. */
+uint32_t g_tile_same, g_tile_diff;
 #endif
 
 #ifdef TARGET_GNW
@@ -1225,6 +1233,9 @@ static inline uint32 PpuDecode2bpp(uint32 bits) {
 #ifndef SNES_PPU_PREFETCH
 #define SNES_PPU_PREFETCH 0
 #endif
+#ifndef SNES_PPU_TILE_MEMO
+#define SNES_PPU_TILE_MEMO 0
+#endif
 #ifndef SNES_RENDER_CENSUS
 #define SNES_RENDER_CENSUS 0
 #endif
@@ -1345,6 +1356,25 @@ static void PpuDrawBackground_4bpp(Ppu *ppu, uint y, bool sub, uint layer, PpuZb
   int tileadr = ppu->bgLayer[layer].tileAdr, pixel;
   int tileadr1 = tileadr + 7 - (y & 0x7), tileadr0 = tileadr + (y & 0x7);
   const uint16 *addr;
+#if SNES_PPU_TILE_MEMO
+  /* One-entry memo on the tile fetch.
+   *
+   * Ablation says what this loop costs and what it does not: deleting the
+   * decode, the z-compare and the store is worth nothing, while deleting the
+   * VRAM reads as well is worth +4.33 fps. So the read IS the loop. Each 4bpp
+   * tile takes two halfwords sixteen bytes apart -- one 32-byte line -- chosen
+   * by a tilemap entry, i.e. a random index into 64 KB behind a 16 KB cache.
+   *
+   * Consecutive tilemap entries in flat areas repeat, and the subscreen here
+   * draws one fully opaque layer of 33 tiles a line with not a single
+   * transparent tile. When the key repeats, both loads and the decode go.
+   *
+   * This is a test-to-skip, the shape that usually loses on this part -- but
+   * what it skips is two cache-missing loads, not three instructions, which is
+   * the same reason the DSP idle fast paths were worth keeping. The device
+   * decides. */
+  uint32 memo_key = ~0u, memo_bits = 0;
+#endif
   for (size_t windex = 0; windex < win.nr; windex++) {
     if (win.bits & (1 << windex))
       continue;  // layer is disabled for this window part
@@ -1363,8 +1393,22 @@ static void PpuDrawBackground_4bpp(Ppu *ppu, uint y, bool sub, uint layer, PpuZb
       NEXT_TP();
       int ta = (tile & 0x8000) ? tileadr1 : tileadr0;
       PpuZbufType z = (tile & 0x2000) ? zhi : zlo;
+#if SNES_PPU_TILE_MEMO
+      uint32 memo_k = ((uint32)ta << 10) | (tile & 0x3ff);
+      uint32 bits;
+      if (memo_k == memo_key) {
+        bits = memo_bits;
+      } else {
+        bits = READ_BITS(ta, tile & 0x3ff);
+        memo_key = memo_k, memo_bits = bits;
+      }
+#else
       uint32 bits = READ_BITS(ta, tile & 0x3ff);
+#endif
 #if SNES_RENDER_CENSUS
+      { static uint32 prev_key; uint32 key = (ta << 10) | (tile & 0x3ff);
+        if (key == prev_key) g_tile_same++; else g_tile_diff++;
+        prev_key = key; }
       g_bg_tile[sub ? 1 : 0]++;
       if (!bits) g_bg_tile_blank[sub ? 1 : 0]++;
 #endif
@@ -1411,8 +1455,22 @@ static void PpuDrawBackground_4bpp(Ppu *ppu, uint y, bool sub, uint layer, PpuZb
 #endif
       int ta = (tile & 0x8000) ? tileadr1 : tileadr0;
       PpuZbufType z = (tile & 0x2000) ? zhi : zlo;
+#if SNES_PPU_TILE_MEMO
+      uint32 memo_k = ((uint32)ta << 10) | (tile & 0x3ff);
+      uint32 bits;
+      if (memo_k == memo_key) {
+        bits = memo_bits;
+      } else {
+        bits = READ_BITS(ta, tile & 0x3ff);
+        memo_key = memo_k, memo_bits = bits;
+      }
+#else
       uint32 bits = READ_BITS(ta, tile & 0x3ff);
+#endif
 #if SNES_RENDER_CENSUS
+      { static uint32 prev_key; uint32 key = (ta << 10) | (tile & 0x3ff);
+        if (key == prev_key) g_tile_same++; else g_tile_diff++;
+        prev_key = key; }
       g_bg_tile[sub ? 1 : 0]++;
       if (!bits) g_bg_tile_blank[sub ? 1 : 0]++;
 #endif
@@ -1434,8 +1492,22 @@ static void PpuDrawBackground_4bpp(Ppu *ppu, uint y, bool sub, uint layer, PpuZb
       uint32 tile = PPU_PROBE_VRAM_PTR(ppu, tp);
       int ta = (tile & 0x8000) ? tileadr1 : tileadr0;
       PpuZbufType z = (tile & 0x2000) ? zhi : zlo;
+#if SNES_PPU_TILE_MEMO
+      uint32 memo_k = ((uint32)ta << 10) | (tile & 0x3ff);
+      uint32 bits;
+      if (memo_k == memo_key) {
+        bits = memo_bits;
+      } else {
+        bits = READ_BITS(ta, tile & 0x3ff);
+        memo_key = memo_k, memo_bits = bits;
+      }
+#else
       uint32 bits = READ_BITS(ta, tile & 0x3ff);
+#endif
 #if SNES_RENDER_CENSUS
+      { static uint32 prev_key; uint32 key = (ta << 10) | (tile & 0x3ff);
+        if (key == prev_key) g_tile_same++; else g_tile_diff++;
+        prev_key = key; }
       g_bg_tile[sub ? 1 : 0]++;
       if (!bits) g_bg_tile_blank[sub ? 1 : 0]++;
 #endif
@@ -1542,6 +1614,10 @@ static void PpuDrawBackground_2bpp(Ppu *ppu, uint y, bool sub, uint layer, PpuZb
   int tileadr1 = tileadr + 7 - (y & 0x7), tileadr0 = tileadr + (y & 0x7);
 
   const uint16 *addr;
+#if SNES_PPU_TILE_MEMO
+  /* Same one-entry tile memo as the 4bpp drawer; see the comment there. */
+  uint32 memo_key = ~0u, memo_bits = 0;
+#endif
   for (size_t windex = 0; windex < win.nr; windex++) {
     if (win.bits & (1 << windex))
       continue;  // layer is disabled for this window part
@@ -1561,8 +1637,22 @@ static void PpuDrawBackground_2bpp(Ppu *ppu, uint y, bool sub, uint layer, PpuZb
       NEXT_TP();
       int ta = (tile & 0x8000) ? tileadr1 : tileadr0;
       PpuZbufType z = (tile & 0x2000) ? zhi : zlo;
+#if SNES_PPU_TILE_MEMO
+      uint32 memo_k = ((uint32)ta << 10) | (tile & 0x3ff);
+      uint32 bits;
+      if (memo_k == memo_key) {
+        bits = memo_bits;
+      } else {
+        bits = READ_BITS(ta, tile & 0x3ff);
+        memo_key = memo_k, memo_bits = bits;
+      }
+#else
       uint32 bits = READ_BITS(ta, tile & 0x3ff);
+#endif
 #if SNES_RENDER_CENSUS
+      { static uint32 prev_key; uint32 key = (ta << 10) | (tile & 0x3ff);
+        if (key == prev_key) g_tile_same++; else g_tile_diff++;
+        prev_key = key; }
       g_bg_tile[sub ? 1 : 0]++;
       if (!bits) g_bg_tile_blank[sub ? 1 : 0]++;
 #endif
@@ -1585,8 +1675,22 @@ static void PpuDrawBackground_2bpp(Ppu *ppu, uint y, bool sub, uint layer, PpuZb
       NEXT_TP();
       int ta = (tile & 0x8000) ? tileadr1 : tileadr0;
       PpuZbufType z = (tile & 0x2000) ? zhi : zlo;
+#if SNES_PPU_TILE_MEMO
+      uint32 memo_k = ((uint32)ta << 10) | (tile & 0x3ff);
+      uint32 bits;
+      if (memo_k == memo_key) {
+        bits = memo_bits;
+      } else {
+        bits = READ_BITS(ta, tile & 0x3ff);
+        memo_key = memo_k, memo_bits = bits;
+      }
+#else
       uint32 bits = READ_BITS(ta, tile & 0x3ff);
+#endif
 #if SNES_RENDER_CENSUS
+      { static uint32 prev_key; uint32 key = (ta << 10) | (tile & 0x3ff);
+        if (key == prev_key) g_tile_same++; else g_tile_diff++;
+        prev_key = key; }
       g_bg_tile[sub ? 1 : 0]++;
       if (!bits) g_bg_tile_blank[sub ? 1 : 0]++;
 #endif
@@ -1622,8 +1726,22 @@ static void PpuDrawBackground_2bpp(Ppu *ppu, uint y, bool sub, uint layer, PpuZb
       uint32 tile = PPU_PROBE_VRAM_PTR(ppu, tp);
       int ta = (tile & 0x8000) ? tileadr1 : tileadr0;
       PpuZbufType z = (tile & 0x2000) ? zhi : zlo;
+#if SNES_PPU_TILE_MEMO
+      uint32 memo_k = ((uint32)ta << 10) | (tile & 0x3ff);
+      uint32 bits;
+      if (memo_k == memo_key) {
+        bits = memo_bits;
+      } else {
+        bits = READ_BITS(ta, tile & 0x3ff);
+        memo_key = memo_k, memo_bits = bits;
+      }
+#else
       uint32 bits = READ_BITS(ta, tile & 0x3ff);
+#endif
 #if SNES_RENDER_CENSUS
+      { static uint32 prev_key; uint32 key = (ta << 10) | (tile & 0x3ff);
+        if (key == prev_key) g_tile_same++; else g_tile_diff++;
+        prev_key = key; }
       g_bg_tile[sub ? 1 : 0]++;
       if (!bits) g_bg_tile_blank[sub ? 1 : 0]++;
 #endif
@@ -2013,7 +2131,14 @@ PPU_SPLIT_NOINLINE static NOINLINE void PpuDrawWholeLine(Ppu *ppu, uint y) {
   g_render_lines++;
 #endif
   // Default background is backdrop
+#if SNES_ABLATE_BG == 3
+  /* ABLATION, WRONG OUTPUT. ClearBackdrop fell through BOTH earlier ablations --
+   * =1 returns at the top of the layer drawer and =2 empties the pixel macros,
+   * and this call is in neither -- so its 1 KB of stores per line (two buffers,
+   * 224 lines, every drawn frame) has never been priced. Diagnostic only. */
+#else
   ClearBackdrop(&ppu->bgBuffers[0]);
+#endif
 
   // Render main screen
   PpuDrawBackgrounds(ppu, y, false);
@@ -2026,7 +2151,9 @@ PPU_SPLIT_NOINLINE static NOINLINE void PpuDrawWholeLine(Ppu *ppu, uint y) {
   // Render also the subscreen?
   bool rendered_subscreen = false;
   if (ppu->preventMathMode != 3 && ppu->addSubscreen && math_enabled) {
+#if SNES_ABLATE_BG != 3
     ClearBackdrop(&ppu->bgBuffers[1]);
+#endif
     if (ppu->screenEnabled[1] != 0) {
 #if SNES_RENDER_CENSUS
       g_sub_lines++;

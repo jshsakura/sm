@@ -68,7 +68,18 @@ void apu_saveload(Apu *apu, SaveLoadFunc *func, void *ctx) {
 
 bool g_debug_apu_cycles;
 
+#ifndef SNES_ABLATE_APU
+#define SNES_ABLATE_APU 0
+#endif
 void apu_cycle(Apu* apu) {
+#if SNES_ABLATE_APU
+  /* ABLATION, WRONG OUTPUT ON PURPOSE. Deletes the SPC700 and the DSP so the
+   * device can price the whole APU chain the same way the background draw was
+   * priced. Audio is silence and the emulated machine loses its sound CPU; the
+   * frame counter is the only valid reading. Diagnostic, never shippable. */
+  (void)apu;
+  return;
+#endif
   if(apu->cpuCyclesLeft == 0) {
     if (g_debug_apu_cycles) {
       char line[80];
