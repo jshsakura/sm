@@ -1206,6 +1206,9 @@ static inline uint32 PpuDecode2bpp(uint32 bits) {
          PpuSpreadByteToNibbles(bits >> 8) << 1;
 }
 
+#ifndef SNES_ABLATE_BG
+#define SNES_ABLATE_BG 0
+#endif
 #ifndef SNES_RENDER_CENSUS
 #define SNES_RENDER_CENSUS 0
 #endif
@@ -1265,6 +1268,30 @@ static void PpuDrawBackground_4bpp(Ppu *ppu, uint y, bool sub, uint layer, PpuZb
   enum { kPaletteShift = 6 };
   if (!IS_SCREEN_ENABLED(ppu, sub, layer))
     return;  // layer is completely hidden
+#if SNES_ABLATE_BG
+  /* ABLATION, WRONG OUTPUT ON PURPOSE. Not an optimisation -- it deletes the
+   * entire background layer draw (tilemap walk, VRAM fetch, decode, z-compare,
+   * store) so the device can price the ceiling of ever rewriting that inner
+   * loop. If "BG rendering is free" is worth little, the hand-written assembly
+   * project behind it is worth less, and nobody has to spend days finding out.
+   * The screen shows backdrop; the frame counter is the only valid reading.
+   *
+   * MEASURED: **59.54 fps against a 52.36 baseline -- +7.18, +13.7%.** Zelda 3
+   * rain, 900 deterministic frames, three runs. That is the ceiling of making
+   * background tile rendering free, and it is 3.5x everything else won on this
+   * core in a day of A/Bs.
+   *
+   * Note what this says about the profile: PC sampling scored
+   * PpuDrawBackground_4bpp at 6.1% of the frame, and deleting it is worth 13.7%.
+   * Sampling puts a stall on whichever instruction is retiring, so work that is
+   * mostly waiting on memory reads lighter than it is. Price a candidate by
+   * ablation, not by its share of the histogram.
+   *
+   * What a rewrite could actually capture is less than 7.18: this deletes the
+   * tilemap walk and VRAM fetch too, which SIMD does not touch. Say a third to a
+   * half of it. Still the largest number on the board. */
+  return;
+#endif
 #if SNES_RENDER_CENSUS
   g_bg_pass[sub ? 1 : 0]++;
   if (sub) { if (IS_SCREEN_ENABLED(ppu, 0, layer)) g_sub_also_main++; else g_sub_only++; }
@@ -1403,6 +1430,30 @@ static void PpuDrawBackground_2bpp(Ppu *ppu, uint y, bool sub, uint layer, PpuZb
   enum { kPaletteShift = 8 };
   if (!IS_SCREEN_ENABLED(ppu, sub, layer))
     return;  // layer is completely hidden
+#if SNES_ABLATE_BG
+  /* ABLATION, WRONG OUTPUT ON PURPOSE. Not an optimisation -- it deletes the
+   * entire background layer draw (tilemap walk, VRAM fetch, decode, z-compare,
+   * store) so the device can price the ceiling of ever rewriting that inner
+   * loop. If "BG rendering is free" is worth little, the hand-written assembly
+   * project behind it is worth less, and nobody has to spend days finding out.
+   * The screen shows backdrop; the frame counter is the only valid reading.
+   *
+   * MEASURED: **59.54 fps against a 52.36 baseline -- +7.18, +13.7%.** Zelda 3
+   * rain, 900 deterministic frames, three runs. That is the ceiling of making
+   * background tile rendering free, and it is 3.5x everything else won on this
+   * core in a day of A/Bs.
+   *
+   * Note what this says about the profile: PC sampling scored
+   * PpuDrawBackground_4bpp at 6.1% of the frame, and deleting it is worth 13.7%.
+   * Sampling puts a stall on whichever instruction is retiring, so work that is
+   * mostly waiting on memory reads lighter than it is. Price a candidate by
+   * ablation, not by its share of the histogram.
+   *
+   * What a rewrite could actually capture is less than 7.18: this deletes the
+   * tilemap walk and VRAM fetch too, which SIMD does not touch. Say a third to a
+   * half of it. Still the largest number on the board. */
+  return;
+#endif
 #if SNES_RENDER_CENSUS
   g_bg_pass[sub ? 1 : 0]++;
   if (sub) { if (IS_SCREEN_ENABLED(ppu, 0, layer)) g_sub_also_main++; else g_sub_only++; }
@@ -1538,6 +1589,30 @@ static void PpuDrawBackground_mode7(Ppu *ppu, uint y, bool sub, PpuZbufType z) {
   int layer = 0;
   if (!IS_SCREEN_ENABLED(ppu, sub, layer))
     return;  // layer is completely hidden
+#if SNES_ABLATE_BG
+  /* ABLATION, WRONG OUTPUT ON PURPOSE. Not an optimisation -- it deletes the
+   * entire background layer draw (tilemap walk, VRAM fetch, decode, z-compare,
+   * store) so the device can price the ceiling of ever rewriting that inner
+   * loop. If "BG rendering is free" is worth little, the hand-written assembly
+   * project behind it is worth less, and nobody has to spend days finding out.
+   * The screen shows backdrop; the frame counter is the only valid reading.
+   *
+   * MEASURED: **59.54 fps against a 52.36 baseline -- +7.18, +13.7%.** Zelda 3
+   * rain, 900 deterministic frames, three runs. That is the ceiling of making
+   * background tile rendering free, and it is 3.5x everything else won on this
+   * core in a day of A/Bs.
+   *
+   * Note what this says about the profile: PC sampling scored
+   * PpuDrawBackground_4bpp at 6.1% of the frame, and deleting it is worth 13.7%.
+   * Sampling puts a stall on whichever instruction is retiring, so work that is
+   * mostly waiting on memory reads lighter than it is. Price a candidate by
+   * ablation, not by its share of the histogram.
+   *
+   * What a rewrite could actually capture is less than 7.18: this deletes the
+   * tilemap walk and VRAM fetch too, which SIMD does not touch. Say a third to a
+   * half of it. Still the largest number on the board. */
+  return;
+#endif
 #if SNES_RENDER_CENSUS
   g_bg_pass[sub ? 1 : 0]++;
   if (sub) { if (IS_SCREEN_ENABLED(ppu, 0, layer)) g_sub_also_main++; else g_sub_only++; }
@@ -1634,6 +1709,30 @@ PPU_SPLIT_NOINLINE static void PpuDrawSprites(Ppu *ppu, uint y, uint sub, bool c
   int layer = 4;
   if (!IS_SCREEN_ENABLED(ppu, sub, layer))
     return;  // layer is completely hidden
+#if SNES_ABLATE_BG
+  /* ABLATION, WRONG OUTPUT ON PURPOSE. Not an optimisation -- it deletes the
+   * entire background layer draw (tilemap walk, VRAM fetch, decode, z-compare,
+   * store) so the device can price the ceiling of ever rewriting that inner
+   * loop. If "BG rendering is free" is worth little, the hand-written assembly
+   * project behind it is worth less, and nobody has to spend days finding out.
+   * The screen shows backdrop; the frame counter is the only valid reading.
+   *
+   * MEASURED: **59.54 fps against a 52.36 baseline -- +7.18, +13.7%.** Zelda 3
+   * rain, 900 deterministic frames, three runs. That is the ceiling of making
+   * background tile rendering free, and it is 3.5x everything else won on this
+   * core in a day of A/Bs.
+   *
+   * Note what this says about the profile: PC sampling scored
+   * PpuDrawBackground_4bpp at 6.1% of the frame, and deleting it is worth 13.7%.
+   * Sampling puts a stall on whichever instruction is retiring, so work that is
+   * mostly waiting on memory reads lighter than it is. Price a candidate by
+   * ablation, not by its share of the histogram.
+   *
+   * What a rewrite could actually capture is less than 7.18: this deletes the
+   * tilemap walk and VRAM fetch too, which SIMD does not touch. Say a third to a
+   * half of it. Still the largest number on the board. */
+  return;
+#endif
 #if SNES_RENDER_CENSUS
   g_bg_pass[sub ? 1 : 0]++;
   if (sub) { if (IS_SCREEN_ENABLED(ppu, 0, layer)) g_sub_also_main++; else g_sub_only++; }
