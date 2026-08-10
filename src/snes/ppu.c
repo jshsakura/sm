@@ -369,6 +369,11 @@ void ppu_handleVblank(Ppu* ppu) {
 #define SNES_SPRITE_CENSUS 0
 #endif
 bool g_ppu_skip_render;
+#if SNES_RENDER_CENSUS
+/* Declared here because ppu_runLine reads them and it comes before the rest of
+ * the census block. */
+uint32_t g_lc_hit, g_lc_miss;
+#endif
 
 #ifdef TARGET_GNW
 void (*g_ppu_line_cb)(unsigned y, const uint16_t *line);
@@ -1066,6 +1071,14 @@ void ppu_runLine(Ppu* ppu, int line) {
     if (g_new_ppu) {
 #ifdef SNES_LINE_CACHE
       bool reused = PpuLineCacheCanReuse(ppu, line, cache_eligible);
+#if SNES_RENDER_CENSUS
+      /* Does the line cache earn the tracking it charges? Every VRAM access in
+       * the tile loops calls PpuLineCacheVram -- a global load, a branch, two
+       * shifts and a read-modify-write on a bitmap -- roughly 200 times a line.
+       * That is paid whether or not a line is ever reused, and the reuse rate
+       * has only ever been measured on the attract screen. */
+      if (reused) g_lc_hit++; else g_lc_miss++;
+#endif
       if (!reused) {
 #endif
 #ifdef SNES_LINE_REUSE_PROBE
@@ -1209,6 +1222,9 @@ static inline uint32 PpuDecode2bpp(uint32 bits) {
 #ifndef SNES_ABLATE_BG
 #define SNES_ABLATE_BG 0
 #endif
+#ifndef SNES_PPU_PREFETCH
+#define SNES_PPU_PREFETCH 0
+#endif
 #ifndef SNES_RENDER_CENSUS
 #define SNES_RENDER_CENSUS 0
 #endif
@@ -1252,6 +1268,18 @@ uint32_t g_sub_also_main, g_sub_only;
 
 // Draw a whole line of a 4bpp background layer into bgBuffers
 static void PpuDrawBackground_4bpp(Ppu *ppu, uint y, bool sub, uint layer, PpuZbufType zhi, PpuZbufType zlo) {
+/* SNES_ABLATE_BG=2: keep the tilemap walk and the VRAM fetch, delete only the
+ * decode, the z-compare and the store. That is exactly the part a Thumb-2
+ * rewrite of this loop could reach -- =1 also deletes the walk and the fetch,
+ * which it could not -- so the two ablations bracket what the project is worth.
+ * With the pixel macros empty, `chunky` is dead and gcc removes the decode too.
+ * WRONG OUTPUT, frame counter only. */
+#if SNES_ABLATE_BG == 2
+#define DO_PIXEL(i)              do { (void)bits; } while (0)
+#define DO_PIXEL_HFLIP(i)        do { (void)bits; } while (0)
+#define DO_CHUNKY_PIXEL(i)       do { } while (0)
+#define DO_CHUNKY_PIXEL_HFLIP(i) do { } while (0)
+#else
 #define DO_PIXEL(i) do { \
   pixel = (bits >> i) & 1 | (bits >> (7 + i)) & 2 | (bits >> (14 + i)) & 4 | (bits >> (21 + i)) & 8; \
   if (pixel && z > dstz[i]) dstz[i] = z + pixel; } while (0)
@@ -1264,11 +1292,12 @@ static void PpuDrawBackground_4bpp(Ppu *ppu, uint y, bool sub, uint layer, PpuZb
 #define DO_CHUNKY_PIXEL_HFLIP(i) do { \
   pixel = (chunky >> (4 * (7 - i))) & 0xf; \
   if (pixel && z > dstz[i]) dstz[i] = z + pixel; } while (0)
+#endif
 #define READ_BITS(ta, tile) (PPU_PROBE_VRAM_ADR((ta) + (tile) * 16), addr = &ppu->vram[((ta) + (tile) * 16) & 0x7fff], addr[0] | addr[8] << 16)
   enum { kPaletteShift = 6 };
   if (!IS_SCREEN_ENABLED(ppu, sub, layer))
     return;  // layer is completely hidden
-#if SNES_ABLATE_BG
+#if SNES_ABLATE_BG == 1
   /* ABLATION, WRONG OUTPUT ON PURPOSE. Not an optimisation -- it deletes the
    * entire background layer draw (tilemap walk, VRAM fetch, decode, z-compare,
    * store) so the device can price the ceiling of ever rewriting that inner
@@ -1356,6 +1385,30 @@ static void PpuDrawBackground_4bpp(Ppu *ppu, uint y, bool sub, uint layer, PpuZb
     while (w >= 8) {
       uint32 tile = PPU_PROBE_VRAM_PTR(ppu, tp);
       NEXT_TP();
+#if SNES_PPU_PREFETCH
+      /* Start the NEXT tile's bitplane read now, and process this one while it
+       * is in flight.
+       *
+       * Ablation says where this loop's time goes: deleting the decode, the
+       * z-compare and the store is worth nothing (52.23 vs 52.36), while
+       * deleting the tilemap walk and the VRAM fetch as well is worth +7.18 fps.
+       * The arithmetic in here is free; the reads are the frame. VRAM is 64 KB
+       * of AXI SRAM behind a 16 KB D-cache, and a 4bpp tile needs two halfwords
+       * sixteen bytes apart -- two lines, both likely cold.
+       *
+       * `tp` already points at the next tilemap entry after NEXT_TP(), so the
+       * next tile word is one dependent load away and its bitplane address
+       * follows. PLD it and let the pixel work below overlap the miss. This
+       * removes stall rather than instructions, which is the only kind of
+       * removal that has paid on this part. */
+      {
+        uint32 ntile = *tp;
+        const uint16 *na = &ppu->vram[((ntile & 0x8000 ? tileadr1 : tileadr0)
+                                       + (ntile & 0x3ff) * 16) & 0x7fff];
+        __builtin_prefetch(na);
+        __builtin_prefetch(na + 8);
+      }
+#endif
       int ta = (tile & 0x8000) ? tileadr1 : tileadr0;
       PpuZbufType z = (tile & 0x2000) ? zhi : zlo;
       uint32 bits = READ_BITS(ta, tile & 0x3ff);
@@ -1408,6 +1461,15 @@ static void PpuDrawBackground_4bpp(Ppu *ppu, uint y, bool sub, uint layer, PpuZb
 // path -- valid only when this layer's high priority tops every z drawn so
 // far (mode 1 BG3). Pass 0 when it does not (mode 0), forcing the z test.
 static void PpuDrawBackground_2bpp(Ppu *ppu, uint y, bool sub, uint layer, PpuZbufType zhi, PpuZbufType zlo, uint16 top_mask) {
+#if SNES_ABLATE_BG == 2
+/* Same bracket for the 2bpp layers; see the 4bpp block. */
+#define DO_PIXEL(i)                  do { (void)bits; } while (0)
+#define DO_PIXEL_HFLIP(i)            do { (void)bits; } while (0)
+#define DO_CHUNKY_PIXEL(i)           do { } while (0)
+#define DO_CHUNKY_PIXEL_HFLIP(i)     do { } while (0)
+#define DO_TOP_CHUNKY_PIXEL(i)       do { } while (0)
+#define DO_TOP_CHUNKY_PIXEL_HFLIP(i) do { } while (0)
+#else
 #define DO_PIXEL(i) do { \
   pixel = (bits >> i) & 1 | (bits >> (7 + i)) & 2; \
   if (pixel && z > dstz[i]) dstz[i] = z + pixel; } while (0)
@@ -1426,11 +1488,12 @@ static void PpuDrawBackground_2bpp(Ppu *ppu, uint y, bool sub, uint layer, PpuZb
 #define DO_TOP_CHUNKY_PIXEL_HFLIP(i) do { \
   pixel = (chunky >> (4 * (7 - i))) & 3; \
   if (pixel) dstz[i] = z + pixel; } while (0)
+#endif
 #define READ_BITS(ta, tile) (PPU_PROBE_VRAM_ADR((ta) + (tile) * 8), addr = &ppu->vram[(ta) + (tile) * 8 & 0x7fff], addr[0])
   enum { kPaletteShift = 8 };
   if (!IS_SCREEN_ENABLED(ppu, sub, layer))
     return;  // layer is completely hidden
-#if SNES_ABLATE_BG
+#if SNES_ABLATE_BG == 1
   /* ABLATION, WRONG OUTPUT ON PURPOSE. Not an optimisation -- it deletes the
    * entire background layer draw (tilemap walk, VRAM fetch, decode, z-compare,
    * store) so the device can price the ceiling of ever rewriting that inner
@@ -1589,7 +1652,7 @@ static void PpuDrawBackground_mode7(Ppu *ppu, uint y, bool sub, PpuZbufType z) {
   int layer = 0;
   if (!IS_SCREEN_ENABLED(ppu, sub, layer))
     return;  // layer is completely hidden
-#if SNES_ABLATE_BG
+#if SNES_ABLATE_BG == 1
   /* ABLATION, WRONG OUTPUT ON PURPOSE. Not an optimisation -- it deletes the
    * entire background layer draw (tilemap walk, VRAM fetch, decode, z-compare,
    * store) so the device can price the ceiling of ever rewriting that inner
@@ -1709,7 +1772,7 @@ PPU_SPLIT_NOINLINE static void PpuDrawSprites(Ppu *ppu, uint y, uint sub, bool c
   int layer = 4;
   if (!IS_SCREEN_ENABLED(ppu, sub, layer))
     return;  // layer is completely hidden
-#if SNES_ABLATE_BG
+#if SNES_ABLATE_BG == 1
   /* ABLATION, WRONG OUTPUT ON PURPOSE. Not an optimisation -- it deletes the
    * entire background layer draw (tilemap walk, VRAM fetch, decode, z-compare,
    * store) so the device can price the ceiling of ever rewriting that inner
