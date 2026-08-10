@@ -1206,6 +1206,33 @@ static inline uint32 PpuDecode2bpp(uint32 bits) {
          PpuSpreadByteToNibbles(bits >> 8) << 1;
 }
 
+#ifndef SNES_RENDER_CENSUS
+#define SNES_RENDER_CENSUS 0
+#endif
+#if SNES_RENDER_CENSUS
+/* What the 17.65 ms of render is actually made of. The frame histogram gives the
+ * total; the PC profile gives symbols; neither says how many layer passes a line
+ * runs, how many of those are the SUB screen (the pass that only exists because
+ * colour math is on), or how many tiles in a pass are transparent and skipped.
+ * Count all four before designing anything. Read over SWD.
+ *
+ * COUNTED, Zelda 3 rain, 339,259 rendered lines:
+ *
+ *                     main      sub
+ *   layer passes/line  2.29     1.00     sub runs on 100% of lines
+ *   tiles/line        65.1     33.0
+ *   blank tiles        46%       0%      main skips nearly half for free
+ *   decoded/line      35.2     33.0      <- SUB IS 48% OF ALL TILE DECODE
+ *
+ * The subscreen exists only because colour math is on, draws a single layer,
+ * and that layer is fully opaque -- not one tile of it is transparent, so
+ * nothing is skipped. It costs as much decoding as the entire main screen.
+ * That is the render's shape, and any structural work on the renderer should
+ * start there rather than in the compositing loop, which pairing and range-test
+ * deletion have already been through. */
+uint32_t g_bg_pass[2], g_bg_tile[2], g_bg_tile_blank[2], g_spr_pass, g_render_lines, g_sub_lines;
+#endif
+
 // Draw a whole line of a 4bpp background layer into bgBuffers
 static void PpuDrawBackground_4bpp(Ppu *ppu, uint y, bool sub, uint layer, PpuZbufType zhi, PpuZbufType zlo) {
 #define DO_PIXEL(i) do { \
@@ -1224,6 +1251,9 @@ static void PpuDrawBackground_4bpp(Ppu *ppu, uint y, bool sub, uint layer, PpuZb
   enum { kPaletteShift = 6 };
   if (!IS_SCREEN_ENABLED(ppu, sub, layer))
     return;  // layer is completely hidden
+#if SNES_RENDER_CENSUS
+  g_bg_pass[sub ? 1 : 0]++;
+#endif
   PpuWindows win;
 #if SNES_WINDOW_CENSUS
   if (sub && IS_SCREEN_WINDOWED(ppu, 1, layer)) {
@@ -1263,6 +1293,10 @@ static void PpuDrawBackground_4bpp(Ppu *ppu, uint y, bool sub, uint layer, PpuZb
       int ta = (tile & 0x8000) ? tileadr1 : tileadr0;
       PpuZbufType z = (tile & 0x2000) ? zhi : zlo;
       uint32 bits = READ_BITS(ta, tile & 0x3ff);
+#if SNES_RENDER_CENSUS
+      g_bg_tile[sub ? 1 : 0]++;
+      if (!bits) g_bg_tile_blank[sub ? 1 : 0]++;
+#endif
       if (bits) {
         z += ((tile & 0x1c00) >> kPaletteShift);
         if (tile & 0x4000) {
@@ -1283,6 +1317,10 @@ static void PpuDrawBackground_4bpp(Ppu *ppu, uint y, bool sub, uint layer, PpuZb
       int ta = (tile & 0x8000) ? tileadr1 : tileadr0;
       PpuZbufType z = (tile & 0x2000) ? zhi : zlo;
       uint32 bits = READ_BITS(ta, tile & 0x3ff);
+#if SNES_RENDER_CENSUS
+      g_bg_tile[sub ? 1 : 0]++;
+      if (!bits) g_bg_tile_blank[sub ? 1 : 0]++;
+#endif
       if (bits) {
         uint32 chunky = PpuDecode4bpp(bits);
         z += ((tile & 0x1c00) >> kPaletteShift);
@@ -1302,6 +1340,10 @@ static void PpuDrawBackground_4bpp(Ppu *ppu, uint y, bool sub, uint layer, PpuZb
       int ta = (tile & 0x8000) ? tileadr1 : tileadr0;
       PpuZbufType z = (tile & 0x2000) ? zhi : zlo;
       uint32 bits = READ_BITS(ta, tile & 0x3ff);
+#if SNES_RENDER_CENSUS
+      g_bg_tile[sub ? 1 : 0]++;
+      if (!bits) g_bg_tile_blank[sub ? 1 : 0]++;
+#endif
       if (bits) {
         z += ((tile & 0x1c00) >> kPaletteShift);
         if (tile & 0x4000) {
@@ -1346,6 +1388,9 @@ static void PpuDrawBackground_2bpp(Ppu *ppu, uint y, bool sub, uint layer, PpuZb
   enum { kPaletteShift = 8 };
   if (!IS_SCREEN_ENABLED(ppu, sub, layer))
     return;  // layer is completely hidden
+#if SNES_RENDER_CENSUS
+  g_bg_pass[sub ? 1 : 0]++;
+#endif
   PpuWindows win;
 #if SNES_WINDOW_CENSUS
   if (sub && IS_SCREEN_WINDOWED(ppu, 1, layer)) {
@@ -1387,6 +1432,10 @@ static void PpuDrawBackground_2bpp(Ppu *ppu, uint y, bool sub, uint layer, PpuZb
       int ta = (tile & 0x8000) ? tileadr1 : tileadr0;
       PpuZbufType z = (tile & 0x2000) ? zhi : zlo;
       uint32 bits = READ_BITS(ta, tile & 0x3ff);
+#if SNES_RENDER_CENSUS
+      g_bg_tile[sub ? 1 : 0]++;
+      if (!bits) g_bg_tile_blank[sub ? 1 : 0]++;
+#endif
       if (bits) {
         z += ((tile & 0x1c00) >> kPaletteShift);
         if (tile & 0x4000) {
@@ -1407,6 +1456,10 @@ static void PpuDrawBackground_2bpp(Ppu *ppu, uint y, bool sub, uint layer, PpuZb
       int ta = (tile & 0x8000) ? tileadr1 : tileadr0;
       PpuZbufType z = (tile & 0x2000) ? zhi : zlo;
       uint32 bits = READ_BITS(ta, tile & 0x3ff);
+#if SNES_RENDER_CENSUS
+      g_bg_tile[sub ? 1 : 0]++;
+      if (!bits) g_bg_tile_blank[sub ? 1 : 0]++;
+#endif
       if (bits) {
         uint32 chunky = PpuDecode2bpp(bits);
         z += ((tile & 0x1c00) >> kPaletteShift);
@@ -1440,6 +1493,10 @@ static void PpuDrawBackground_2bpp(Ppu *ppu, uint y, bool sub, uint layer, PpuZb
       int ta = (tile & 0x8000) ? tileadr1 : tileadr0;
       PpuZbufType z = (tile & 0x2000) ? zhi : zlo;
       uint32 bits = READ_BITS(ta, tile & 0x3ff);
+#if SNES_RENDER_CENSUS
+      g_bg_tile[sub ? 1 : 0]++;
+      if (!bits) g_bg_tile_blank[sub ? 1 : 0]++;
+#endif
       if (bits) {
         z += ((tile & 0x1c00) >> kPaletteShift);
         if (tile & 0x4000) {
@@ -1465,6 +1522,9 @@ static void PpuDrawBackground_mode7(Ppu *ppu, uint y, bool sub, PpuZbufType z) {
   int layer = 0;
   if (!IS_SCREEN_ENABLED(ppu, sub, layer))
     return;  // layer is completely hidden
+#if SNES_RENDER_CENSUS
+  g_bg_pass[sub ? 1 : 0]++;
+#endif
   PpuWindows win;
 #if SNES_WINDOW_CENSUS
   if (sub && IS_SCREEN_WINDOWED(ppu, 1, layer)) {
@@ -1557,6 +1617,9 @@ PPU_SPLIT_NOINLINE static void PpuDrawSprites(Ppu *ppu, uint y, uint sub, bool c
   int layer = 4;
   if (!IS_SCREEN_ENABLED(ppu, sub, layer))
     return;  // layer is completely hidden
+#if SNES_RENDER_CENSUS
+  g_bg_pass[sub ? 1 : 0]++;
+#endif
   PpuWindows win;
 #if SNES_WINDOW_CENSUS
   if (sub && IS_SCREEN_WINDOWED(ppu, 1, layer)) {
@@ -1766,6 +1829,9 @@ PPU_SPLIT_NOINLINE static NOINLINE void PpuDrawWholeLine(Ppu *ppu, uint y) {
 #if SNES_WINDOW_CENSUS
   g_win_lines++;
 #endif
+#if SNES_RENDER_CENSUS
+  g_render_lines++;
+#endif
   // Default background is backdrop
   ClearBackdrop(&ppu->bgBuffers[0]);
 
@@ -1782,6 +1848,9 @@ PPU_SPLIT_NOINLINE static NOINLINE void PpuDrawWholeLine(Ppu *ppu, uint y) {
   if (ppu->preventMathMode != 3 && ppu->addSubscreen && math_enabled) {
     ClearBackdrop(&ppu->bgBuffers[1]);
     if (ppu->screenEnabled[1] != 0) {
+#if SNES_RENDER_CENSUS
+      g_sub_lines++;
+#endif
       PpuDrawBackgrounds(ppu, y, true);
       rendered_subscreen = true;
     }
