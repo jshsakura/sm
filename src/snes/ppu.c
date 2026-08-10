@@ -2373,6 +2373,31 @@ static bool ppu_evaluateSprites(Ppu* ppu, int line) {
                 int usedTile = ((((oam1 & 0xff) >> 4) + (row >> 3)) << 4) | (((oam1 & 0xf) + (usedCol >> 3)) & 0xf);
                 uint16 *addr = &ppu->vram[(objAdr + usedTile * 16 + (row & 0x7)) & 0x7fff];
                 PPU_PROBE_VRAM_ADR(objAdr + usedTile * 16 + (row & 0x7));
+                /* On a frameskipped frame nobody ever reads objBuffer -- the
+                 * compositing that consumes it is behind the g_ppu_skip_render
+                 * return in ppu_runLine, whose comment says "the pixels below do
+                 * not [matter]". These pixels are ABOVE that line and did not
+                 * matter either: three frames in four were decoding and writing
+                 * sprite pixels into a buffer that was then thrown away.
+                 *
+                 * The scan itself must still run in full -- the 32-sprite and
+                 * 34-sliver limits set rangeOver/timeOver, which games read at
+                 * $213E -- and so must the VRAM probe above, which feeds the line
+                 * cache's dependency tracking. Only the decode and the pixel
+                 * loops go. One test per sliver (5.46 per line, measured) removes
+                 * eight pixel iterations each.
+                 *
+                 * DEFAULT OFF: implemented and rig-verified (hashes identical on
+                 * ALttP 400f; +626 insn/frame there, which is the test being paid
+                 * with nothing to skip because the rig draws every frame), but
+                 * NEVER MEASURED ON THE DEVICE -- the console was asleep when it
+                 * was written. Nothing ships from this project unmeasured. Build
+                 * SNES_SPRITE_SKIP_DRAW=1 and A/B it against the 52.36 fps
+                 * baseline; one build and three benches settles it. */
+#if SNES_SPRITE_SKIP_DRAW
+                if (g_ppu_skip_render)
+                  continue;
+#endif
                 uint32 plane = addr[0] | addr[8] << 16;
                 uint32 chunky = PpuDecode4bpp(plane);
                 // go over each pixel
