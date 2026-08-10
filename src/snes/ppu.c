@@ -1231,6 +1231,20 @@ static inline uint32 PpuDecode2bpp(uint32 bits) {
  * start there rather than in the compositing loop, which pairing and range-test
  * deletion have already been through. */
 uint32_t g_bg_pass[2], g_bg_tile[2], g_bg_tile_blank[2], g_spr_pass, g_render_lines, g_sub_lines;
+/* The one that decides whether a shared decode is even possible: when the sub
+ * pass draws layer N, was layer N also drawn on the main screen? hScroll and
+ * vScroll live on the layer, not the screen, so the same layer fetches and
+ * decodes IDENTICAL tiles in both passes -- only the destination buffer and the
+ * window differ. If this is high, half the tile decode is literally duplicate
+ * work. If it is zero, the sub screen draws something the main screen does not
+ * and there is nothing to share.
+ *
+ * COUNTED: 42,191 sub passes, of which **0** draw a layer the main screen also
+ * draws. The sub screen is never a second pass over the same content -- it is a
+ * different layer entirely. So the "single-pass main+sub" idea has nothing to
+ * collapse, and the subscreen's 33 tiles per line are irreducible work in this
+ * design, not duplication. Closed before it was written. */
+uint32_t g_sub_also_main, g_sub_only;
 #endif
 
 // Draw a whole line of a 4bpp background layer into bgBuffers
@@ -1253,6 +1267,7 @@ static void PpuDrawBackground_4bpp(Ppu *ppu, uint y, bool sub, uint layer, PpuZb
     return;  // layer is completely hidden
 #if SNES_RENDER_CENSUS
   g_bg_pass[sub ? 1 : 0]++;
+  if (sub) { if (IS_SCREEN_ENABLED(ppu, 0, layer)) g_sub_also_main++; else g_sub_only++; }
 #endif
   PpuWindows win;
 #if SNES_WINDOW_CENSUS
@@ -1390,6 +1405,7 @@ static void PpuDrawBackground_2bpp(Ppu *ppu, uint y, bool sub, uint layer, PpuZb
     return;  // layer is completely hidden
 #if SNES_RENDER_CENSUS
   g_bg_pass[sub ? 1 : 0]++;
+  if (sub) { if (IS_SCREEN_ENABLED(ppu, 0, layer)) g_sub_also_main++; else g_sub_only++; }
 #endif
   PpuWindows win;
 #if SNES_WINDOW_CENSUS
@@ -1524,6 +1540,7 @@ static void PpuDrawBackground_mode7(Ppu *ppu, uint y, bool sub, PpuZbufType z) {
     return;  // layer is completely hidden
 #if SNES_RENDER_CENSUS
   g_bg_pass[sub ? 1 : 0]++;
+  if (sub) { if (IS_SCREEN_ENABLED(ppu, 0, layer)) g_sub_also_main++; else g_sub_only++; }
 #endif
   PpuWindows win;
 #if SNES_WINDOW_CENSUS
@@ -1619,6 +1636,7 @@ PPU_SPLIT_NOINLINE static void PpuDrawSprites(Ppu *ppu, uint y, uint sub, bool c
     return;  // layer is completely hidden
 #if SNES_RENDER_CENSUS
   g_bg_pass[sub ? 1 : 0]++;
+  if (sub) { if (IS_SCREEN_ENABLED(ppu, 0, layer)) g_sub_also_main++; else g_sub_only++; }
 #endif
   PpuWindows win;
 #if SNES_WINDOW_CENSUS
