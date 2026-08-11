@@ -1280,7 +1280,12 @@ static inline uint32 PpuDecode2bpp(uint32 bits) {
 #ifndef SNES_ABLATE_ADDR
 #define SNES_ABLATE_ADDR 0
 #endif
-#if SNES_ABLATE_BG == 4
+#if SNES_ABLATE_BG == 6
+#define PPU_ABLATE_KEEP_BITS(b) do { g_ppu_ablate_sink = (b); } while (0)
+#else
+#define PPU_ABLATE_KEEP_BITS(b) do { } while (0)
+#endif
+#if SNES_ABLATE_BG == 4 || SNES_ABLATE_BG == 6
 /* The setup ablation computes the per-call setup and then throws it away, which
  * is exactly the shape gcc deletes. Everything it wants to keep is summed into
  * this volatile, so the arm measures the setup rather than an empty call. */
@@ -1344,7 +1349,23 @@ static void PpuDrawBackground_4bpp(Ppu *ppu, uint y, bool sub, uint layer, PpuZb
  * which it could not -- so the two ablations bracket what the project is worth.
  * With the pixel macros empty, `chunky` is dead and gcc removes the decode too.
  * WRONG OUTPUT, frame counter only. */
-#if SNES_ABLATE_BG == 2
+#if SNES_ABLATE_BG == 6
+/* ABLATION, WRONG OUTPUT ON PURPOSE, and the one =2 was supposed to be.
+ *
+ * =2 empties the pixel macros and calls itself "decode, z-compare and store
+ * deleted, walk and fetch kept". In the middle loop that is not what it
+ * compiles to: DO_CHUNKY_PIXEL touches neither `chunky` nor `bits`, so `bits`
+ * is dead, so READ_BITS is dead, and BOTH VRAM loads and the tilemap load go
+ * with them -- =2 quietly becomes =1. Measured today, and that is exactly what
+ * it does: 59.94, against =1's 59.80 and =4's 59.73.
+ *
+ * Here the fetch is kept alive by one volatile store per tile, the cheapest
+ * thing a compiler may not delete. So this really is the pixel work alone. */
+#define DO_PIXEL(i)              do { g_ppu_ablate_sink = bits; } while (0)
+#define DO_PIXEL_HFLIP(i)        do { g_ppu_ablate_sink = bits; } while (0)
+#define DO_CHUNKY_PIXEL(i)       do { } while (0)
+#define DO_CHUNKY_PIXEL_HFLIP(i) do { } while (0)
+#elif SNES_ABLATE_BG == 2
 #define DO_PIXEL(i)              do { (void)bits; } while (0)
 #define DO_PIXEL_HFLIP(i)        do { (void)bits; } while (0)
 #define DO_CHUNKY_PIXEL(i)       do { } while (0)
@@ -1388,6 +1409,7 @@ static void PpuDrawBackground_4bpp(Ppu *ppu, uint y, bool sub, uint layer, PpuZb
 #endif
 #define PPU_PIPE_DRAW_4BPP(tile_, bits_) do {                                  \
     if (bits_) {                                                               \
+      PPU_ABLATE_KEEP_BITS(bits_);                                             \
       uint32 chunky = PpuDecode4bpp(bits_);                                    \
       PpuZbufType z = (((tile_) & 0x2000) ? zhi : zlo)                         \
                     + (((tile_) & 0x1c00) >> kPaletteShift);                   \
@@ -1564,24 +1586,24 @@ static void PpuDrawBackground_4bpp(Ppu *ppu, uint y, bool sub, uint layer, PpuZb
     }
     // Handle full tiles in the middle
 #if SNES_PPU_PIPELINE
-    /* Software-pipelined: the NEXT tile's whole fetch chain is issued before the
-     * current tile's pixel work, so the two overlap instead of queueing.
+    /* RETRACTED DIAGNOSIS, kept because the arms are worth more than the wrong
+     * conclusion was. These were built to break a "pointer chase" that turned
+     * out not to be the cost:
      *
-     * What made this the candidate: ablation, four ways. Returning before this
-     * loop is worth +4.16 fps; deleting the pixel work inside it is worth
-     * nothing; deleting the tilemap walk is worth nothing; and replacing the
-     * bitplane load with ALU arithmetic on the same inputs is worth +3.04, which
-     * is 73% of the loop. So the loop is its POINTER CHASE -- the tilemap word is
-     * loaded, its bits pick an address, that address is loaded, and `if (bits)`
-     * branches on the result immediately -- and not its arithmetic, not its
-     * walk, and not the memory system: all 64 KB of VRAM in zero-wait DTCM
-     * measured zero, as did a PLD of the same address and a memo that skipped
-     * 80% of the fetches.
+     *   depth 1  55.53   depth 2  55.33   two-pass batched  55.46
+     *   against a 55.57 baseline -- all three nothing.
      *
-     * A latency that neither a cache nor a prefetch can touch is a use-latency,
-     * and the only way to pay it is to have something else to do. The pixel work
-     * is exactly that something -- ablation prices it at zero, which is another
-     * way of saying the CPU is standing idle through it. */
+     * They measure nothing because the fetch they reorder is nearly free. What
+     * misled them was SNES_ABLATE_FETCH (+3.04) and SNES_ABLATE_ADDR (+2.09),
+     * and both are contaminated: they change `bits`, which changes how many
+     * tiles are blank and how many pixels are non-zero, so they move the PIXEL
+     * work while claiming to price the fetch.
+     *
+     * SNES_ABLATE_BG=6 settles it -- fetch kept alive by a volatile store, only
+     * the decode and the eight compare-and-stores deleted: 59.96, the whole
+     * 4.4 fps. The rig agrees to the instruction: the pixel work is 663,322 of
+     * the layer draw's 685,758 instructions a frame. It is not stalled, it is
+     * not a chain, it is ordinary work in ordinary quantity. */
     if (w >= 8) {
       uint n = w >> 3;
       w -= n << 3;
@@ -1604,12 +1626,41 @@ static void PpuDrawBackground_4bpp(Ppu *ppu, uint y, bool sub, uint layer, PpuZb
       }
       PPU_PIPE_DRAW_4BPP(tile, bits);
       dstz += 8;
+#elif SNES_PPU_PIPELINE == 3
+      /* Two passes over the span instead of one interleaved loop.
+       *
+       * Pass 1 is nothing but the chase, and -- this is the whole point -- each
+       * iteration is independent of the last. Tile i's tilemap read does not
+       * wait on tile i-1's bitplane read, so three or four chases can be in
+       * flight at once with only two live values to keep, which is few enough
+       * that the register allocator has no reason to spill. Pass 2 then touches
+       * no VRAM at all.
+       *
+       * This is also the decisive probe for the hand-written Thumb-2 loop: if
+       * independent chases cannot overlap even with the pressure removed, then
+       * scheduling them by hand cannot help either, and that project is dead
+       * before it starts.
+       *
+       * The buffers are sized by the span: kPpuXPixels is 256 and
+       * kPpuExtraLeftRight is 0, so a window span is at most 256 pixels and n is
+       * at most 32. */
+      uint32 bitsbuf[34];
+      uint16 tilebuf[34];
+      for (uint i = 0; i < n; i++) {
+        uint32 t = PPU_PROBE_VRAM_PTR(ppu, tp);
+        NEXT_TP();
+        tilebuf[i] = t;
+        bitsbuf[i] = READ_BITS((t & 0x8000) ? tileadr1 : tileadr0, t & 0x3ff);
+      }
+      for (uint i = 0; i < n; i++) {
+        uint32 t = tilebuf[i];
+        PPU_PIPE_DRAW_4BPP(t, bitsbuf[i]);
+        dstz += 8;
+      }
 #else
-      /* Depth 2, which is what the ablations actually ask for. Each iteration
-       * loads the tilemap word for tile i+2, the bitplanes for tile i+1 -- whose
-       * word was loaded a whole iteration ago -- and draws tile i. Every link of
-       * the chase then has an iteration of other work standing between the load
-       * and its use, which is the only currency a use-latency accepts. */
+      /* Depth 2: every link of the chase separated by a full iteration. It
+       * cost 5,186 instructions a frame in spills and bought nothing, for the
+       * reason above -- the chase was never the cost. */
       uint32 tA = PPU_PROBE_VRAM_PTR(ppu, tp);
       NEXT_TP();
       uint32 tB = tA;
@@ -1687,6 +1738,7 @@ static void PpuDrawBackground_4bpp(Ppu *ppu, uint y, bool sub, uint layer, PpuZb
       if (!bits) g_bg_tile_blank[sub ? 1 : 0]++;
 #endif
       if (bits) {
+        PPU_ABLATE_KEEP_BITS(bits);
         uint32 chunky = PpuDecode4bpp(bits);
         z += ((tile & 0x1c00) >> kPaletteShift);
         if (tile & 0x4000) {
@@ -1750,7 +1802,15 @@ static void PpuDrawBackground_4bpp(Ppu *ppu, uint y, bool sub, uint layer, PpuZb
 // path -- valid only when this layer's high priority tops every z drawn so
 // far (mode 1 BG3). Pass 0 when it does not (mode 0), forcing the z test.
 static void PpuDrawBackground_2bpp(Ppu *ppu, uint y, bool sub, uint layer, PpuZbufType zhi, PpuZbufType zlo, uint16 top_mask) {
-#if SNES_ABLATE_BG == 2
+#if SNES_ABLATE_BG == 6
+/* See the 4bpp drawer. */
+#define DO_PIXEL(i)                  do { g_ppu_ablate_sink = bits; } while (0)
+#define DO_PIXEL_HFLIP(i)            do { g_ppu_ablate_sink = bits; } while (0)
+#define DO_CHUNKY_PIXEL(i)           do { } while (0)
+#define DO_CHUNKY_PIXEL_HFLIP(i)     do { } while (0)
+#define DO_TOP_CHUNKY_PIXEL(i)       do { } while (0)
+#define DO_TOP_CHUNKY_PIXEL_HFLIP(i) do { } while (0)
+#elif SNES_ABLATE_BG == 2
 /* Same bracket for the 2bpp layers; see the 4bpp block. */
 #define DO_PIXEL(i)                  do { (void)bits; } while (0)
 #define DO_PIXEL_HFLIP(i)            do { (void)bits; } while (0)
@@ -1954,6 +2014,7 @@ static void PpuDrawBackground_2bpp(Ppu *ppu, uint y, bool sub, uint layer, PpuZb
       if (!bits) g_bg_tile_blank[sub ? 1 : 0]++;
 #endif
       if (bits) {
+        PPU_ABLATE_KEEP_BITS(bits);
         uint32 chunky = PpuDecode2bpp(bits);
         z += ((tile & 0x1c00) >> kPaletteShift);
         /* In mode 1 this renderer is BG3, whose high priority (0xf2) is above
