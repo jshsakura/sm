@@ -407,6 +407,36 @@ void ppu_handleVblank(Ppu* ppu) {
 #define SNES_SPRITE_CENSUS 0
 #endif
 bool g_ppu_skip_render;
+#ifndef SNES_ABLATE_MATHFIXED
+#define SNES_ABLATE_MATHFIXED 0
+#endif
+#ifndef SNES_MATHFIXED_CENSUS
+#define SNES_MATHFIXED_CENSUS 0
+#endif
+#if SNES_MATHFIXED_CENSUS
+uint32_t g_mathfixed_lines, g_mathfixed_rebuilds;
+#endif
+#ifndef SNES_SKIP_SPRITE_EVAL_ON_SKIP
+#define SNES_SKIP_SPRITE_EVAL_ON_SKIP 0
+#endif
+#if SNES_SKIP_SPRITE_EVAL_ON_SKIP
+/* Three frames in four are thrown away by the overload guard, and all three of
+ * them were evaluating sprites for a buffer nobody reads.
+ *
+ * Everything the evaluation leaves behind on a skipped line is either
+ * unobservable or recomputed before its next use: objBuffer is consumed only by
+ * the compositing, which is already behind the g_ppu_skip_render return;
+ * lineHasSprites is written before every use on a drawn line; objBufferClean
+ * still describes the buffer correctly, because a skipped line does not write
+ * it. That leaves rangeOver/timeOver, whose only reader in the entire emulator
+ * is $213E -- so gate the skip on whether this game has ever read it.
+ *
+ * Measured on the DRAW RATE, not on fps: fps counts emulated frames, and making
+ * a skipped frame cheaper lets the pacing guard draw more, which moves the
+ * player's picture without moving that number. */
+static bool g_stat77_read;
+#endif
+
 #if SNES_RENDER_CENSUS
 /* Declared here because ppu_runLine reads them and it comes before the rest of
  * the census block. */
@@ -1097,7 +1127,34 @@ void ppu_runLine(Ppu* ppu, int line) {
     if (cache_eligible)
       memset(g_line_cache_cur_vram, 0, sizeof(g_line_cache_cur_vram));
 #endif
-    if (!ppu->objBufferClean)
+#if SNES_SKIP_SPRITE_EVAL_ON_SKIP
+    if (g_ppu_skip_render && !g_stat77_read)
+      return;
+#endif
+#if SNES_ABLATE_SKIPSPR
+    /* ABLATION. On a frameskipped line, return BEFORE the sprite work instead of
+     * after it. The overload guard draws one frame in four, so three quarters of
+     * every second's OAM scans (128 entries x 224 lines) and objBuffer wipes are
+     * done for pixels that are thrown away.
+     *
+     * WRONG OUTPUT is possible here in a way the rig cannot see: the rig renders
+     * every frame, so it never takes this path at all. ppu_evaluateSprites also
+     * sets the range/time-over flags a game can read at $213E, and lineHasSprites
+     * feeds the next drawn line. This prices the idea; it does not implement it. */
+    if (g_ppu_skip_render)
+      return;
+#endif
+#if SNES_SPRITE_SKIP_DRAW
+    /* With the sprite pixel emission compiled out on a frameskipped line,
+     * nothing writes objBuffer on that line -- so wiping it is a wipe of
+     * something already clean, and objBufferClean must not be updated either or
+     * the next drawn line would trust a flag describing a line that never drew.
+     * 512 bytes a line, three lines in four. */
+    const bool obj_untouched = g_ppu_skip_render;
+#else
+    const bool obj_untouched = false;
+#endif
+    if (!ppu->objBufferClean && !obj_untouched)
       ClearBackdrop(&ppu->objBuffer);
 #ifdef SNES_LINE_CACHE
     if (cache_eligible && ppu->objCacheValid &&
@@ -1108,7 +1165,8 @@ void ppu_runLine(Ppu* ppu, int line) {
 #endif
     {
       ppu->lineHasSprites = !ppu->forcedBlank && ppu_evaluateSprites(ppu, line - 1);
-      ppu->objBufferClean = !ppu->lineHasSprites;
+      if (!obj_untouched)
+        ppu->objBufferClean = !ppu->lineHasSprites;
     }
 
     if (g_ppu_skip_render)
@@ -1267,6 +1325,83 @@ static inline uint32 PpuDecode2bpp(uint32 bits) {
 
 #ifndef SNES_ABLATE_BG
 #define SNES_ABLATE_BG 0
+#endif
+#ifndef SNES_PPU_BLEND_LUT
+#define SNES_PPU_BLEND_LUT 0
+#endif
+#if SNES_PPU_BLEND_LUT && defined(PPU_RGB565)
+/* The blend is 97.4% of compositing pixels here, and it was paying for six
+ * component extracts and three shifts it does not need.
+ *
+ * Counted on the device, Zelda 3 rain, in the same window everything else is
+ * measured in: 8,547,757 blended pixels against 227,411 bypassed -- 249.4 of
+ * every 256 on a colour-math line. The source comment above the pair experiment
+ * assumed the opposite ("most pixels on a colour-math line still take the
+ * one-lookup bypass"); that was true of the scene it was written for, not this
+ * one. The same census also says brightness is 15 on 100% of those lines and the
+ * subscreen pixel is NEVER backdrop, so `color_map` inside the blend is
+ * loop-invariant -- always the half map.
+ *
+ * So: keep each CGRAM colour pre-split into three 11-bit-spaced fields. Two
+ * spread entries ADD in one instruction with no carry between fields (62 < 2048),
+ * and three tables turn each channel sum straight into its positioned RGB565
+ * bits, clamping included -- the same clamp brightnessMult already does by
+ * holding 31 extra entries. Component extraction, the three shifts and the
+ * per-channel clamp all go.
+ *
+ * Derived state only, rebuilt from cgram/brightness/halfColor, so it lives in
+ * statics rather than in Ppu -- a savestate is a raw struct dump and this must
+ * not be in it. */
+static uint32_t g_cgram_spread[256];
+static uint32_t g_sub_spread[256];
+static uint16_t g_blend_r565[64], g_blend_g565[64], g_blend_b565[64];
+static uint32_t g_blend_key = 0xffffffffu;
+/* Three 5-bit channels at bits 0, 11 and 22 leave bits 28-31 free, and the two
+ * conditions that send a pixel down the bypass are folded into them:
+ *
+ *   sub index 0  -> g_sub_spread[0] carries kBlendBypass
+ *   layer >= 6   -> tested once, on the main z, and OR'd in the same way
+ *
+ * so the add that combines the two colours also combines the two tests, and the
+ * loop asks one question instead of two. Bit 22 + 62 tops out at bit 27, so
+ * nothing the colours do can reach the flag. */
+enum { kBlendBypass = 1u << 30 };
+#define PPU_SPREAD(c) (((c) & 0x1f) | ((((c) >> 5) & 0x1f) << 11) | ((((c) >> 10) & 0x1f) << 22))
+static void PpuRebuildBlendLut(Ppu *ppu) {
+  for (int i = 0; i < 256; i++) {
+    uint32 c = ppu->cgram[i];
+    g_cgram_spread[i] = PPU_SPREAD(c);
+    g_sub_spread[i] = PPU_SPREAD(c);
+  }
+  /* A subscreen pixel of index 0 is the backdrop: the SNES does not blend it, it
+   * falls back to the fixed colour, which is what math_fixed already holds. */
+  g_sub_spread[0] |= kBlendBypass;
+  const uint8_t *map = ppu->halfColor ? ppu->brightnessMultHalf : ppu->brightnessMult;
+  for (int x = 0; x < 64; x++) {
+    uint32 v = map[x];
+    g_blend_r565[x] = (uint16_t)((v >> 3) << 11);
+    g_blend_g565[x] = (uint16_t)((v >> 2) << 5);
+    g_blend_b565[x] = (uint16_t)(v >> 3);
+  }
+}
+#endif
+#ifndef SNES_COMP_CENSUS
+#define SNES_COMP_CENSUS 0
+#endif
+#if SNES_COMP_CENSUS
+/* Which way do the compositing pixels actually go in the scene being measured?
+ * The bypass is one table lookup; the blend is two palette loads, six extracts,
+ * three clamped adds and three brightness lookups. Everything about how to
+ * attack this loop depends on the ratio, and the source comment's guess ("most
+ * pixels on a colour-math line still take the bypass") was made for a different
+ * scene than the one the device is benchmarked in. */
+uint32_t g_comp_bypass, g_comp_blend, g_comp_subzero, g_comp_lines, g_comp_bright;
+#endif
+#ifndef SNES_ABLATE_SKIPSPR
+#define SNES_ABLATE_SKIPSPR 0
+#endif
+#ifndef SNES_ABLATE_COMPOSITE
+#define SNES_ABLATE_COMPOSITE 0
 #endif
 #ifndef SNES_PPU_VIRGIN_Z
 #define SNES_PPU_VIRGIN_Z 0
@@ -1941,6 +2076,8 @@ static void PpuDrawBackground_4bpp(Ppu *ppu, uint y, bool sub, uint layer, PpuZb
     }
   }
 #undef PPU_PIPE_DRAW_4BPP
+#undef DO_TOP_CHUNKY_PIXEL_HFLIP
+#undef DO_TOP_CHUNKY_PIXEL
 #undef READ_BITS
 #undef DO_CHUNKY_PIXEL_HFLIP
 #undef DO_CHUNKY_PIXEL
@@ -2588,8 +2725,30 @@ PPU_SPLIT_NOINLINE static NOINLINE void PpuDrawWholeLine(Ppu *ppu, uint y) {
   if (palette_was_dirty)
     PpuRebuildPalette(ppu);   /* cgram or brightness moved since the last line */
   uint32_t math_fixed_key = PpuMathFixedKey(ppu);
+#if SNES_MATHFIXED_CENSUS
+  g_mathfixed_lines++;
+  if (palette_was_dirty || math_fixed_key != ppu->mathFixedKey) g_mathfixed_rebuilds++;
+#endif
+#if !SNES_ABLATE_MATHFIXED
   if (palette_was_dirty || math_fixed_key != ppu->mathFixedKey)
     PpuRebuildMathFixed(ppu, math_fixed_key);
+#else
+  /* ABLATION, WRONG OUTPUT. The table is 3,072 entries and its key includes
+   * fixedColorR/G/B, so every $2132 COLDATA write invalidates it -- and COLDATA
+   * is a routine HDMA target (gradient skies, fades, Zelda 3's rain), which the
+   * comment on PpuRebuildMathFixed says can mean once per scanline. With
+   * SNES_PPU_BLEND_LUT in, only the 2.6% of pixels that bypass the blend still
+   * read the table, so a per-line rebuild would be almost pure waste.
+   *
+   * COUNTED, AND IT DOES NOT HAPPEN HERE: 27 rebuilds in 124,768 rendered lines
+   * (SNES_MATHFIXED_CENSUS). The worry is real for some scene; it is not this
+   * one. Lever closed by a count before anything was built for it. */
+  ppu->mathFixedKey = math_fixed_key;
+#endif
+#if SNES_PPU_BLEND_LUT
+  { uint32_t bk = (uint32_t)ppu->brightness << 1 | (ppu->halfColor ? 1u : 0u);
+    if (palette_was_dirty || bk != g_blend_key) { PpuRebuildBlendLut(ppu); g_blend_key = bk; } }
+#endif
 #endif
   if (ppu->forcedBlank) {
     uint8 *dst = &ppu->renderBuffer[(y - 1) * ppu->renderPitch];
@@ -2673,6 +2832,19 @@ PPU_SPLIT_NOINLINE static NOINLINE void PpuDrawWholeLine(Ppu *ppu, uint y) {
 
   dst += (ppu->extraLeftRight - ppu->extraLeftCur);
 
+#if SNES_ABLATE_COMPOSITE
+  /* ABLATION, WRONG OUTPUT ON PURPOSE. Deletes the whole compositing pass --
+   * the colour window walk, the per-pixel main/sub selection, the colour maths
+   * and the palette lookup -- and writes a flat line instead.
+   *
+   * Why it needs pricing: the layer draw is 4.4 fps, which at 1 frame drawn in 4
+   * is about 5.4 ms of the 17.65 ms a drawn frame costs. The other 12 ms has
+   * never been ablated, and this pass is most of it: 256 pixels a line with a
+   * palette lookup each, against the layer draw's 65 tiles. */
+  { size_t n = (size_t)(256 + ppu->extraLeftRight * 2);
+    for (size_t i = 0; i < n; i++) dst[i] = (uint16_t)(y * 3);
+  }
+#else
   uint32 windex = 0;
   do {
     uint32 left = cwin.edges[windex] + kPpuExtraLeftRight, right = cwin.edges[windex + 1] + kPpuExtraLeftRight;
@@ -2736,6 +2908,10 @@ PPU_SPLIT_NOINLINE static NOINLINE void PpuDrawWholeLine(Ppu *ppu, uint y) {
         continue;
       }
 #endif
+#if SNES_COMP_CENSUS
+      g_comp_lines++;
+      if (ppu->brightness == 15) g_comp_bright++;
+#endif
       uint8 *half_color_map = ppu->halfColor ? ppu->brightnessMultHalf : ppu->brightnessMult;
       /* The z word already stores [layer:4][CGRAM index:8] in its low 12 bits,
        * exactly matching the last two dimensions of mathFixed565. */
@@ -2744,6 +2920,65 @@ PPU_SPLIT_NOINLINE static NOINLINE void PpuDrawWholeLine(Ppu *ppu, uint y) {
       math_enabled_cur |= ppu->addSubscreen << 8 | ppu->subtractColor << 9;
       // Need to check for each pixel whether to use math or not based on the main screen layer.
       uint32 i = left;
+#if SNES_PPU_BLEND_LUT && defined(PPU_RGB565)
+      /* The shape this scene actually is: add-subscreen, no subtract, no clip.
+       * Everything variable inside the blend collapses to two table reads, one
+       * add and three positioned lookups. The bypass test stays -- it is 2.6% of
+       * pixels here but it is not free to be wrong about. */
+      if ((math_enabled_cur & 0x300) == 0x100 && clip_color_mask == 0x1f) {
+        const PpuZbufType *mrow = ppu->bgBuffers[0].data;
+        const PpuZbufType *srow = ppu->bgBuffers[1].data;
+        /* When every layer has maths enabled -- which is what a full-screen
+         * translucency looks like -- the per-pixel layer test is a shift, an AND
+         * and a branch that can never fail. Hoist it: the buffers only ever hold
+         * layers 0-5 plus the backdrop's own 0x05, and 0x05's bit is inside the
+         * mask too, so the whole test is redundant and only the subscreen
+         * emptiness check remains. */
+        if ((math_enabled_cur & 0x3f) == 0x3f) {
+          /* Pairing the loads and the store was tried here and LOSES: 57.03
+           * against 57.60 on the device, the same -0.6 the older SNES_PPU_PAIR
+           * experiment cost, and the rig said so too (+4,706 instructions a
+           * frame). It does not remove work, it reshapes it, and this loop does
+           * not reward that. Everything that has won today removed work that
+           * was provably unnecessary. */
+          while (i < right) {
+            uint32 main_z = mrow[i], sub_z = srow[i];
+            /* Folding both bypass tests into a sentinel bit carried by the
+             * sub table was tried and measured 57.53 against 57.60: it does not
+             * delete either test, it adds an OR. The sentinel stays in the table
+             * because it costs nothing there; the loop asks plainly.
+             * The blue field needs no mask -- it is the top field, and 62 at
+             * bit 22 cannot reach bit 28. */
+            uint32 sum = g_cgram_spread[main_z & 0xff] + g_sub_spread[sub_z & 0xff];
+            if ((sum & kBlendBypass) || ((main_z >> 8) & 0xf) >= 6) {
+              dst[0] = math_fixed[main_z & 0x7ff];
+            } else {
+              dst[0] = g_blend_r565[sum & 63]
+                     | g_blend_g565[(sum >> 11) & 63]
+                     | g_blend_b565[sum >> 22];
+            }
+            dst++, i++;
+          }
+          continue;
+        }
+        while (i < right) {
+          uint32 main_z = mrow[i], sub_z = srow[i];
+          if (!(math_enabled_cur & (1u << ((main_z >> 8) & 0xf))) || (sub_z & 0xff) == 0) {
+            dst[0] = math_fixed[main_z & 0x7ff];
+          } else {
+            uint32 sum = g_cgram_spread[main_z & 0xff] + g_cgram_spread[sub_z & 0xff];
+            /* Field order follows the SNES word: bits 0-4 red, 5-9 green,
+             * 10-14 blue -- so the spread keeps red at 0, green at 11, blue at
+             * 22, and the three tables must be read in that same order. */
+            dst[0] = g_blend_r565[sum & 63]
+                   | g_blend_g565[(sum >> 11) & 63]
+                   | g_blend_b565[(sum >> 22) & 63];
+          }
+          dst++, i++;
+        }
+        continue;
+      }
+#endif
 /* SNES_PPU_PAIR: OFF, by device measurement, and the reason is worth keeping.
  *
  * The no-math branch above pairs its pixels and wins; doing the same here for
@@ -2822,10 +3057,18 @@ PPU_SPLIT_NOINLINE static NOINLINE void PpuDrawWholeLine(Ppu *ppu, uint y) {
          * and row 6 now holds the value it needs. */
         if (!(math_enabled_cur & (1 << main_layer)) ||
             !ppu->addSubscreen || (ppu->bgBuffers[1].data[i] & 0xff) == 0) {
+#if SNES_COMP_CENSUS
+          g_comp_bypass++;
+          if (ppu->addSubscreen && (math_enabled_cur & (1 << main_layer)) &&
+              (ppu->bgBuffers[1].data[i] & 0xff) == 0) g_comp_subzero++;
+#endif
           dst[0] = math_fixed[main_z & 0x7ff];
           dst++, i++;
           continue;
         }
+#if SNES_COMP_CENSUS
+        g_comp_blend++;
+#endif
         uint32 color = ppu->cgram[main_z & 0xff], color2;
         uint32 r = color & clip_color_mask;
         uint32 g = (color >> 5) & clip_color_mask;
@@ -2860,6 +3103,7 @@ PPU_SPLIT_NOINLINE static NOINLINE void PpuDrawWholeLine(Ppu *ppu, uint y) {
       }
     }
   } while (cw_clip_math >>= 1, ++windex < cwin.nr);
+#endif
 
 #ifdef TARGET_GNW
   if (g_ppu_line_cb)
@@ -3462,6 +3706,13 @@ uint8_t ppu_read(Ppu* ppu, uint8_t adr) {
     case 0x3e: {
       uint8_t val = 0x1; // ppu1 version (4 bit)
       val |= ppu->ppu1openBus & 0x10;
+#if SNES_SKIP_SPRITE_EVAL_ON_SKIP
+      /* The only reader of rangeOver/timeOver in the whole emulator. Until a
+       * game has asked for them, sprite evaluation on a frameskipped line has no
+       * observable effect at all and can be skipped outright; from the first read
+       * onward this latches and the evaluation is exact again, for ever. */
+      g_stat77_read = true;
+#endif
       val |= ppu->rangeOver << 6;
       val |= ppu->timeOver << 7;
       ppu->ppu1openBus = val;
