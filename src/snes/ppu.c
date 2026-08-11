@@ -1640,6 +1640,7 @@ uint32_t g_bg_pass[2], g_bg_tile[2], g_bg_tile_blank[2], g_spr_pass, g_render_li
  * skip. Counted for the 4bpp drawer, which is where the pixels are. */
 uint32_t g_tile_full[2], g_tile_mixed[2];
 uint32_t g_tile_flat[2], g_tile_opq_z[2];
+uint32_t g_t2_full[2], g_t2_mixed[2];
 uint64_t g_tile_opaque_px[2];
 /* The one that decides whether a shared decode is even possible: when the sub
  * pass draws layer N, was layer N also drawn on the main screen? hScroll and
@@ -1731,6 +1732,14 @@ static void PpuDrawBackground_4bpp(Ppu *ppu, uint y, bool sub, uint layer, PpuZb
 #ifndef SNES_PPU_OPAQUE_TILE
 #define SNES_PPU_OPAQUE_TILE 0
 #endif
+/* CLOSED, with the number: the same opaque-tile path in the 2bpp drawer (BG3 in
+ * mode 1) measured **56.90 against 56.95** on hardware, three runs each -- fully
+ * inside the spread. The rig had already said why: BG3 is not enabled in the
+ * window it runs and every 2bpp census counter reads zero, so there was no
+ * stimulus to price. In a loop where an unexecuted branch costs 0.8 fps, a path
+ * that measures nothing is a liability rather than a neutral, so it is not
+ * carried. g_t2_full/g_t2_mixed remain under SNES_RENDER_CENSUS for whoever
+ * finds a scene that does drive BG3. */
 #if SNES_PPU_OPAQUE_TILE && (SNES_ABLATE_BG || SNES_PPU_SIMD_PIXELS)
 #error "SNES_PPU_OPAQUE_TILE changes the pixel loop an ablation is trying to hold still"
 #endif
@@ -2426,6 +2435,10 @@ static void PpuDrawBackground_2bpp(Ppu *ppu, uint y, bool sub, uint layer, PpuZb
         prev_key = key; }
       g_bg_tile[sub ? 1 : 0]++;
       if (!bits) g_bg_tile_blank[sub ? 1 : 0]++;
+      else {
+        uint32 c2 = PpuDecode2bpp(bits), n2 = (c2 | c2 >> 1) & 0x11111111u;
+        if (n2 == 0x11111111u) g_t2_full[sub ? 1 : 0]++; else g_t2_mixed[sub ? 1 : 0]++;
+      }
 #endif
       if (bits) {
         PPU_ABLATE_KEEP_BITS(bits);
