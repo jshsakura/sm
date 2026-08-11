@@ -1372,7 +1372,15 @@ static void PpuDrawBackground_4bpp(Ppu *ppu, uint y, bool sub, uint layer, PpuZb
    * This is a test-to-skip, the shape that usually loses on this part -- but
    * what it skips is two cache-missing loads, not three instructions, which is
    * the same reason the DSP idle fast paths were worth keeping. The device
-   * decides. */
+   * decides.
+   *
+   * IT DECIDED: NOTHING. Six runs each against six baseline runs, back to back
+   * -- memo 55.60, baseline 55.58. And the 80% hit rate explains why rather than
+   * contradicting it: consecutive identical tilemap entries read the SAME 32-byte
+   * cache line again immediately, which the D-cache already serves at full speed.
+   * The memo removes an L1 hit, not a miss. Whatever the ablation's +4.33 fps is,
+   * it lives in the 20% of tiles that are genuinely different -- cold lines -- and
+   * in the tilemap walk, and no memo reaches either. Left off. */
   uint32 memo_key = 0x10000u, memo_bits = 0;   /* 0x10000 is not a 16-bit tile word */
 #endif
   for (size_t windex = 0; windex < win.nr; windex++) {
@@ -2153,7 +2161,12 @@ PPU_SPLIT_NOINLINE static NOINLINE void PpuDrawWholeLine(Ppu *ppu, uint y) {
   /* ABLATION, WRONG OUTPUT. ClearBackdrop fell through BOTH earlier ablations --
    * =1 returns at the top of the layer drawer and =2 empties the pixel macros,
    * and this call is in neither -- so its 1 KB of stores per line (two buffers,
-   * 224 lines, every drawn frame) has never been priced. Diagnostic only. */
+   * 224 lines, every drawn frame) has never been priced. Diagnostic only.
+   *
+   * PRICED: nothing. 55.59 against a 55.58 baseline. A kilobyte of sequential
+   * stores per line does not show up in this frame budget -- which is the same
+   * lesson the tile memo taught from the other side. On this part sequential
+   * writes are cheap; what costs is reading a cold line at a random address. */
 #else
   ClearBackdrop(&ppu->bgBuffers[0]);
 #endif
