@@ -117,8 +117,46 @@ Ppu* ppu_init(Snes* snes) {
    * array out of the SM overlay (which also compiles ppu.o for shared symbols
    * but has its own PPU and its own tight BSS budget). */
   static uint16_t g_ppu_vram[0x8000];
-  if (ppu->vram == NULL)
+  if (ppu->vram == NULL) {
+#if SNES_VRAM_IN_DTCM
+    /* VRAM is the only thing measured as expensive on this part: 64 KB in AXI
+     * SRAM, read at an address the tilemap picks, behind a 16 KB D-cache.
+     * Ablating those reads is worth +4.33 fps, and nothing that keeps them in
+     * that memory has recovered any of it -- not a memo at an 80% hit rate, not
+     * a prefetch, not removing the framebuffer's cache pollution. So move the
+     * memory instead of trying to cache it better.
+     *
+     * DTCM is zero-wait and needs no cache at all. It is not free space: the
+     * stdlib heap takes whatever DTCM is left over, and it is shared with the
+     * launcher and every other core. But the heap's high-water mark measured on
+     * the device during SNES play is 11,336 B of 90,336 -- 79 KB idle -- so 64 KB
+     * fits with room to spare, and taking it from the heap at run time costs the
+     * other cores nothing because they never run this line.
+     *
+     * If the allocation fails the static below is still there and nothing
+     * changes; a slower emulator is a better failure than one that does not
+     * start.
+     *
+     * MEASURED: NOTHING. 55.43 fps against a 55.46 baseline, four runs each back
+     * to back, with ppu->vram read over SWD as 0x20006a70 to prove the
+     * allocation succeeded rather than falling back.
+     *
+     * That closes the memory theory entirely. Four separate attacks on VRAM read
+     * cost -- an 80%-hit memo, a prefetch, removing the framebuffer's cache
+     * pollution, and finally putting the whole 64 KB in zero-wait DTCM -- all
+     * measure zero, while deleting the layer draw outright is worth +4.33 fps.
+     * The cost is not the reads. It is the loop that makes them: the tilemap
+     * walk, the window-span arithmetic and the per-layer call, 68 times a line.
+     * Left off; it costs the shared DTCM heap 64 KB for no return. */
+    extern void *malloc(size_t);
+    uint16_t *dtcm = (uint16_t *)malloc(0x8000 * sizeof(uint16_t));
+    if (dtcm) {
+      memset(dtcm, 0, 0x8000 * sizeof(uint16_t));
+      ppu->vram = dtcm;
+    } else
+#endif
     ppu->vram = g_ppu_vram;
+  }
 #else
   /* Other GNW overlays (SM etc.): VRAM in ITCM as before. */
   if (ppu->vram == NULL)
@@ -1232,6 +1270,9 @@ static inline uint32 PpuDecode2bpp(uint32 bits) {
 #endif
 #ifndef SNES_PPU_PREFETCH
 #define SNES_PPU_PREFETCH 0
+#endif
+#ifndef SNES_VRAM_IN_DTCM
+#define SNES_VRAM_IN_DTCM 0
 #endif
 #ifndef SNES_PPU_TILE_MEMO
 #define SNES_PPU_TILE_MEMO 0
