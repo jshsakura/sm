@@ -407,6 +407,18 @@ void ppu_handleVblank(Ppu* ppu) {
 #define SNES_SPRITE_CENSUS 0
 #endif
 bool g_ppu_skip_render;
+#ifndef SNES_ABLATE_OBJWIPE
+#define SNES_ABLATE_OBJWIPE 0
+#endif
+#ifndef SNES_ABLATE_SPRITE_MERGE
+#define SNES_ABLATE_SPRITE_MERGE 0
+#endif
+#ifndef SNES_ABLATE_SPRITE_PIX
+#define SNES_ABLATE_SPRITE_PIX 0
+#endif
+#ifndef SNES_ABLATE_SPRITES
+#define SNES_ABLATE_SPRITES 0
+#endif
 #ifndef SNES_ABLATE_MATHFIXED
 #define SNES_ABLATE_MATHFIXED 0
 #endif
@@ -415,6 +427,7 @@ bool g_ppu_skip_render;
 #endif
 #if SNES_MATHFIXED_CENSUS
 uint32_t g_mathfixed_lines, g_mathfixed_rebuilds;
+uint32_t g_objcache_rebuilds, g_objeval_lines, g_sprite_visits, g_sprite_cols;
 #endif
 #ifndef SNES_SKIP_SPRITE_EVAL_ON_SKIP
 #define SNES_SKIP_SPRITE_EVAL_ON_SKIP 0
@@ -1127,6 +1140,21 @@ void ppu_runLine(Ppu* ppu, int line) {
     if (cache_eligible)
       memset(g_line_cache_cur_vram, 0, sizeof(g_line_cache_cur_vram));
 #endif
+#if SNES_ABLATE_SPRITES
+    /* ABLATION, WRONG OUTPUT -- AND NOT THE ONE ITS NAME CLAIMS. This `return`
+     * leaves ppu_runLine before the rendering as well as before the sprites, so
+     * its 60.08 fps against 56.93 prices THE WHOLE REMAINING RENDER at 3.15 fps,
+     * not the sprite path. Kept, renamed in spirit, because that is a useful
+     * number: it is the ceiling on everything the renderer has left.
+     *
+     * The sprite path itself was then priced piece by piece and is nearly free:
+     * pixel emission 0 (SNES_ABLATE_SPRITE_PIX, 56.67), objBuffer wipe 0
+     * (SNES_ABLATE_OBJWIPE, 56.90), merge into the bg buffer +0.33
+     * (SNES_ABLATE_SPRITE_MERGE, 57.26), and the scan visits 0.93 sprites and
+     * 1.64 columns PER LINE by census -- there is nothing there to remove. */
+    ppu->lineHasSprites = false;
+    return;
+#endif
 #if SNES_SKIP_SPRITE_EVAL_ON_SKIP
     if (g_ppu_skip_render && !g_stat77_read)
       return;
@@ -1154,8 +1182,14 @@ void ppu_runLine(Ppu* ppu, int line) {
 #else
     const bool obj_untouched = false;
 #endif
+#if SNES_ABLATE_OBJWIPE
+    /* ABLATION, WRONG OUTPUT. 512 bytes a line to erase what 5.46 slivers -- about
+     * 44 pixels -- actually dirtied. */
+    (void)0;
+#else
     if (!ppu->objBufferClean && !obj_untouched)
       ClearBackdrop(&ppu->objBuffer);
+#endif
 #ifdef SNES_LINE_CACHE
     if (cache_eligible && ppu->objCacheValid &&
         (ppu->objLineCand[line - 1][0] | ppu->objLineCand[line - 1][1] |
@@ -1164,6 +1198,9 @@ void ppu_runLine(Ppu* ppu, int line) {
     } else
 #endif
     {
+#if SNES_MATHFIXED_CENSUS
+      g_objeval_lines++;
+#endif
       ppu->lineHasSprites = !ppu->forcedBlank && ppu_evaluateSprites(ppu, line - 1);
       if (!obj_untouched)
         ppu->objBufferClean = !ppu->lineHasSprites;
@@ -2505,6 +2542,13 @@ static void PpuDrawBackground_mode7(Ppu *ppu, uint y, bool sub, PpuZbufType z) {
 #endif
 
 PPU_SPLIT_NOINLINE static void PpuDrawSprites(Ppu *ppu, uint y, uint sub, bool clear_backdrop) {
+#if SNES_ABLATE_SPRITE_MERGE
+  /* ABLATION, WRONG OUTPUT. Only the merge of objBuffer into the bg z-buffer.
+   * With clear_backdrop it is a 512-byte memcpy per line per screen -- over a
+   * buffer ClearBackdrop just filled with the same backdrop value the objBuffer
+   * holds everywhere a sprite is not. */
+  (void)y; (void)sub; (void)clear_backdrop; return;
+#endif
   int layer = 4;
   if (!IS_SCREEN_ENABLED(ppu, sub, layer))
     return;  // layer is completely hidden
@@ -3437,6 +3481,9 @@ static bool ppu_getWindowState(Ppu* ppu, int layer, int x) {
  * hardware's 32-sprite/34-tile limits are still applied per line, in the
  * exact order of the full scan, so the output is bit-identical. */
 static void ppu_rebuildSpriteLineCache(Ppu *ppu) {
+#if SNES_MATHFIXED_CENSUS
+  g_objcache_rebuilds++;
+#endif
   memset(ppu->objLineCand, 0, sizeof(ppu->objLineCand));
   for (int s = 0; s < 128; s++) {
     uint8_t index = (uint8_t)(s * 2);
@@ -3482,6 +3529,9 @@ static bool ppu_evaluateSprites(Ppu* ppu, int line) {
       while (bits) {
         int s = w * 32 + __builtin_ctz(bits);
         bits &= bits - 1;
+#if SNES_MATHFIXED_CENSUS
+        g_sprite_visits++;
+#endif
         uint8_t index = (uint8_t)(s * 2);
         uint8_t y = ppu->oam[index] >> 8;
         // check if the sprite is on this line and get the sprite size
@@ -3515,6 +3565,9 @@ static bool ppu_evaluateSprites(Ppu* ppu, int line) {
             PpuZbufType z = paletteBase + (prio << 8);
 
             for(int col = 0; col < spriteSize; col += 8) {
+#if SNES_MATHFIXED_CENSUS
+              g_sprite_cols++;
+#endif
               if(col + x > -8 && col + x < 256) {
                 // break if we found 34 8*1 slivers already
                 tilesFound++;
@@ -3556,6 +3609,13 @@ static bool ppu_evaluateSprites(Ppu* ppu, int line) {
                  * transfer ratio that is ~0.25 fps, and it did not show. Sprite
                  * pixels are simply not enough of the frame here -- the census
                  * counts 5.46 slivers per line against a limit of 34. Left off. */
+#if SNES_ABLATE_SPRITE_PIX
+                /* ABLATION, WRONG OUTPUT. Keep the whole scan -- the candidate
+                 * walk, the 32/34 limits, rangeOver/timeOver -- and delete only
+                 * the tile decode and the eight pixel writes. Splits the sprite
+                 * path's 3.15 fps into "finding them" and "drawing them". */
+                continue;
+#endif
 #if SNES_SPRITE_SKIP_DRAW
                 if (g_ppu_skip_render)
                   continue;
