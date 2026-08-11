@@ -1268,6 +1268,68 @@ static inline uint32 PpuDecode2bpp(uint32 bits) {
 #ifndef SNES_ABLATE_BG
 #define SNES_ABLATE_BG 0
 #endif
+#ifndef SNES_PPU_VIRGIN_Z
+#define SNES_PPU_VIRGIN_Z 0
+#endif
+#if SNES_PPU_VIRGIN_Z
+/* The first layer written into a z-buffer cannot lose the z test.
+ *
+ * ClearBackdrop fills both bg buffers with 0x0500 at the top of every drawn
+ * line, so until something else has written to that buffer, `z > dstz[i]` is
+ * true for every pixel of any layer whose z floor is above 0x0500 -- which is
+ * every layer in modes 1 and 3-6, and all but the last in mode 0. The load, the
+ * compare and its branch are then three instructions per pixel spent proving
+ * something already known.
+ *
+ * This is worth having because of what the buffer looks like: the main screen
+ * runs 2.29 layer passes a line and the subscreen exactly 1.00, so roughly
+ * three of every 3.29 passes... no: exactly one pass per screen is the first
+ * one, which is 2 of 3.29 -- 61% of all passes, and the first pass is also the
+ * one with the fewest transparent pixels, since it is the base layer.
+ *
+ * The 2bpp drawer already had this store, for a different reason: `top_mask`
+ * marks mode 1's BG3 as above every other priority, so its high-priority tiles
+ * skip the compare. The virgin case just widens when that path is legal.
+ *
+ * Conservative in the safe direction: any pass that is entered marks the buffer
+ * dirty whether or not it writes a pixel, so the flag can only ever say "not
+ * virgin" too early, never too late. */
+static uint8_t g_bg_dirty;
+#define PPU_BUF_MARK(sub)      (g_bg_dirty |= 1u << (sub))
+#define PPU_BUF_CLEAN(sub)     (g_bg_dirty &= ~(1u << (sub)))
+#define PPU_BUF_VIRGIN(sub)    (!(g_bg_dirty & (1u << (sub))))
+enum { kPpuBackdropZ = 0x0500 };
+#else
+#define PPU_BUF_MARK(sub)      ((void)0)
+#define PPU_BUF_CLEAN(sub)     ((void)0)
+#define PPU_BUF_VIRGIN(sub)    0
+#endif
+#ifndef SNES_PPU_COARSE_SKIP
+#define SNES_PPU_COARSE_SKIP 0
+#endif
+#if SNES_PPU_COARSE_SKIP
+/* One test that drops four pixels, instead of four tests that drop one each.
+ *
+ * SNES_ABLATE_BG=6 prices the pixel work at 4.4 fps, and SNES_PPU_SIMD_PIXELS
+ * proved that most of it is not arithmetic: doing all eight pixels
+ * unconditionally, two lanes at a time and branchless, LOSES 7.5 fps, because
+ * the per-pixel test was skipping constantly. So keep the skip and make it
+ * coarser.
+ *
+ * `chunky` holds eight 4-bit pixels, nibble i for pixel i. Its low halfword is
+ * pixels 0-3 and its high halfword pixels 4-7, so a single AND says whether four
+ * consecutive pixels are all transparent -- and when they are, four nibble
+ * extracts, four tests and four branches collapse into one. The flipped drawer
+ * takes its pixels in reverse nibble order, so its halves swap.
+ *
+ * The shape that keeps winning on this chip is a test that skips something
+ * LARGE. Four pixels is large; one pixel was not. */
+#define PPU_IF_LOW4   if (chunky & 0x0000ffffu)
+#define PPU_IF_HIGH4  if (chunky & 0xffff0000u)
+#else
+#define PPU_IF_LOW4
+#define PPU_IF_HIGH4
+#endif
 #ifndef SNES_PPU_SIMD_PIXELS
 #define SNES_PPU_SIMD_PIXELS 0
 #endif
@@ -1444,6 +1506,12 @@ static void PpuDrawBackground_4bpp(Ppu *ppu, uint y, bool sub, uint layer, PpuZb
 #define DO_CHUNKY_PIXEL_HFLIP(i) do { \
   pixel = (chunky >> (4 * (7 - i))) & 0xf; \
   if (pixel && z > dstz[i]) dstz[i] = z + pixel; } while (0)
+#define DO_TOP_CHUNKY_PIXEL(i) do { \
+  pixel = (chunky >> (4 * i)) & 0xf; \
+  if (pixel) dstz[i] = z + pixel; } while (0)
+#define DO_TOP_CHUNKY_PIXEL_HFLIP(i) do { \
+  pixel = (chunky >> (4 * (7 - i))) & 0xf; \
+  if (pixel) dstz[i] = z + pixel; } while (0)
 #endif
 #if SNES_ABLATE_ADDR
 /* ABLATION, WRONG OUTPUT ON PURPOSE. Both loads still happen, at scattered
@@ -1486,6 +1554,12 @@ static void PpuDrawBackground_4bpp(Ppu *ppu, uint y, bool sub, uint layer, PpuZb
   enum { kPaletteShift = 6 };
   if (!IS_SCREEN_ENABLED(ppu, sub, layer))
     return;  // layer is completely hidden
+#if SNES_PPU_VIRGIN_Z
+  const bool no_ztest = PPU_BUF_VIRGIN(sub) && (uint32)zlo > (uint32)kPpuBackdropZ;
+#else
+  const bool no_ztest = false;
+#endif
+  PPU_BUF_MARK(sub);
 #if SNES_ABLATE_BG == 1
   /* ABLATION, WRONG OUTPUT ON PURPOSE. Not an optimisation -- it deletes the
    * entire background layer draw (tilemap walk, VRAM fetch, decode, z-compare,
@@ -1805,12 +1879,24 @@ static void PpuDrawBackground_4bpp(Ppu *ppu, uint y, bool sub, uint layer, PpuZb
 #if SNES_PPU_SIMD_PIXELS
         PPU_SIMD_TILE_4BPP();
 #else
-        if (tile & 0x4000) {
-          DO_CHUNKY_PIXEL(0); DO_CHUNKY_PIXEL(1); DO_CHUNKY_PIXEL(2); DO_CHUNKY_PIXEL(3);
-          DO_CHUNKY_PIXEL(4); DO_CHUNKY_PIXEL(5); DO_CHUNKY_PIXEL(6); DO_CHUNKY_PIXEL(7);
+        if (no_ztest) {
+          /* Buffer still holds nothing but backdrop, and this layer's floor is
+           * above it: the compare cannot fail, so do not make it. The branch is
+           * loop-invariant and perfectly predicted; what it drops is eight loads
+           * and eight compares. */
+          if (tile & 0x4000) {
+            PPU_IF_LOW4  { DO_TOP_CHUNKY_PIXEL(0); DO_TOP_CHUNKY_PIXEL(1); DO_TOP_CHUNKY_PIXEL(2); DO_TOP_CHUNKY_PIXEL(3); }
+            PPU_IF_HIGH4 { DO_TOP_CHUNKY_PIXEL(4); DO_TOP_CHUNKY_PIXEL(5); DO_TOP_CHUNKY_PIXEL(6); DO_TOP_CHUNKY_PIXEL(7); }
+          } else {
+            PPU_IF_HIGH4 { DO_TOP_CHUNKY_PIXEL_HFLIP(0); DO_TOP_CHUNKY_PIXEL_HFLIP(1); DO_TOP_CHUNKY_PIXEL_HFLIP(2); DO_TOP_CHUNKY_PIXEL_HFLIP(3); }
+            PPU_IF_LOW4  { DO_TOP_CHUNKY_PIXEL_HFLIP(4); DO_TOP_CHUNKY_PIXEL_HFLIP(5); DO_TOP_CHUNKY_PIXEL_HFLIP(6); DO_TOP_CHUNKY_PIXEL_HFLIP(7); }
+          }
+        } else if (tile & 0x4000) {
+          PPU_IF_LOW4  { DO_CHUNKY_PIXEL(0); DO_CHUNKY_PIXEL(1); DO_CHUNKY_PIXEL(2); DO_CHUNKY_PIXEL(3); }
+          PPU_IF_HIGH4 { DO_CHUNKY_PIXEL(4); DO_CHUNKY_PIXEL(5); DO_CHUNKY_PIXEL(6); DO_CHUNKY_PIXEL(7); }
         } else {
-          DO_CHUNKY_PIXEL_HFLIP(0); DO_CHUNKY_PIXEL_HFLIP(1); DO_CHUNKY_PIXEL_HFLIP(2); DO_CHUNKY_PIXEL_HFLIP(3);
-          DO_CHUNKY_PIXEL_HFLIP(4); DO_CHUNKY_PIXEL_HFLIP(5); DO_CHUNKY_PIXEL_HFLIP(6); DO_CHUNKY_PIXEL_HFLIP(7);
+          PPU_IF_HIGH4 { DO_CHUNKY_PIXEL_HFLIP(0); DO_CHUNKY_PIXEL_HFLIP(1); DO_CHUNKY_PIXEL_HFLIP(2); DO_CHUNKY_PIXEL_HFLIP(3); }
+          PPU_IF_LOW4  { DO_CHUNKY_PIXEL_HFLIP(4); DO_CHUNKY_PIXEL_HFLIP(5); DO_CHUNKY_PIXEL_HFLIP(6); DO_CHUNKY_PIXEL_HFLIP(7); }
         }
 #endif
       }
@@ -1912,6 +1998,12 @@ static void PpuDrawBackground_2bpp(Ppu *ppu, uint y, bool sub, uint layer, PpuZb
   enum { kPaletteShift = 8 };
   if (!IS_SCREEN_ENABLED(ppu, sub, layer))
     return;  // layer is completely hidden
+#if SNES_PPU_VIRGIN_Z
+  const bool no_ztest = PPU_BUF_VIRGIN(sub) && (uint32)zlo > (uint32)kPpuBackdropZ;
+#else
+  const bool no_ztest = false;
+#endif
+  PPU_BUF_MARK(sub);
 #if SNES_ABLATE_BG == 1
   /* ABLATION, WRONG OUTPUT ON PURPOSE. Not an optimisation -- it deletes the
    * entire background layer draw (tilemap walk, VRAM fetch, decode, z-compare,
@@ -2087,20 +2179,20 @@ static void PpuDrawBackground_2bpp(Ppu *ppu, uint y, bool sub, uint layer, PpuZb
          * TOP store can skip it (top_mask = 0x2000). Mode 0 layers have
          * sprites above them at every priority, so they pass top_mask = 0. */
         if (tile & 0x4000) {
-          if (tile & top_mask) {
-            DO_TOP_CHUNKY_PIXEL(0); DO_TOP_CHUNKY_PIXEL(1); DO_TOP_CHUNKY_PIXEL(2); DO_TOP_CHUNKY_PIXEL(3);
-            DO_TOP_CHUNKY_PIXEL(4); DO_TOP_CHUNKY_PIXEL(5); DO_TOP_CHUNKY_PIXEL(6); DO_TOP_CHUNKY_PIXEL(7);
+          if ((tile & top_mask) || no_ztest) {
+            PPU_IF_LOW4  { DO_TOP_CHUNKY_PIXEL(0); DO_TOP_CHUNKY_PIXEL(1); DO_TOP_CHUNKY_PIXEL(2); DO_TOP_CHUNKY_PIXEL(3); }
+            PPU_IF_HIGH4 { DO_TOP_CHUNKY_PIXEL(4); DO_TOP_CHUNKY_PIXEL(5); DO_TOP_CHUNKY_PIXEL(6); DO_TOP_CHUNKY_PIXEL(7); }
           } else {
-            DO_CHUNKY_PIXEL(0); DO_CHUNKY_PIXEL(1); DO_CHUNKY_PIXEL(2); DO_CHUNKY_PIXEL(3);
-            DO_CHUNKY_PIXEL(4); DO_CHUNKY_PIXEL(5); DO_CHUNKY_PIXEL(6); DO_CHUNKY_PIXEL(7);
+            PPU_IF_LOW4  { DO_CHUNKY_PIXEL(0); DO_CHUNKY_PIXEL(1); DO_CHUNKY_PIXEL(2); DO_CHUNKY_PIXEL(3); }
+            PPU_IF_HIGH4 { DO_CHUNKY_PIXEL(4); DO_CHUNKY_PIXEL(5); DO_CHUNKY_PIXEL(6); DO_CHUNKY_PIXEL(7); }
           }
         } else {
-          if (tile & top_mask) {
-            DO_TOP_CHUNKY_PIXEL_HFLIP(0); DO_TOP_CHUNKY_PIXEL_HFLIP(1); DO_TOP_CHUNKY_PIXEL_HFLIP(2); DO_TOP_CHUNKY_PIXEL_HFLIP(3);
-            DO_TOP_CHUNKY_PIXEL_HFLIP(4); DO_TOP_CHUNKY_PIXEL_HFLIP(5); DO_TOP_CHUNKY_PIXEL_HFLIP(6); DO_TOP_CHUNKY_PIXEL_HFLIP(7);
+          if ((tile & top_mask) || no_ztest) {
+            PPU_IF_HIGH4 { DO_TOP_CHUNKY_PIXEL_HFLIP(0); DO_TOP_CHUNKY_PIXEL_HFLIP(1); DO_TOP_CHUNKY_PIXEL_HFLIP(2); DO_TOP_CHUNKY_PIXEL_HFLIP(3); }
+            PPU_IF_LOW4  { DO_TOP_CHUNKY_PIXEL_HFLIP(4); DO_TOP_CHUNKY_PIXEL_HFLIP(5); DO_TOP_CHUNKY_PIXEL_HFLIP(6); DO_TOP_CHUNKY_PIXEL_HFLIP(7); }
           } else {
-            DO_CHUNKY_PIXEL_HFLIP(0); DO_CHUNKY_PIXEL_HFLIP(1); DO_CHUNKY_PIXEL_HFLIP(2); DO_CHUNKY_PIXEL_HFLIP(3);
-            DO_CHUNKY_PIXEL_HFLIP(4); DO_CHUNKY_PIXEL_HFLIP(5); DO_CHUNKY_PIXEL_HFLIP(6); DO_CHUNKY_PIXEL_HFLIP(7);
+            PPU_IF_HIGH4 { DO_CHUNKY_PIXEL_HFLIP(0); DO_CHUNKY_PIXEL_HFLIP(1); DO_CHUNKY_PIXEL_HFLIP(2); DO_CHUNKY_PIXEL_HFLIP(3); }
+            PPU_IF_LOW4  { DO_CHUNKY_PIXEL_HFLIP(4); DO_CHUNKY_PIXEL_HFLIP(5); DO_CHUNKY_PIXEL_HFLIP(6); DO_CHUNKY_PIXEL_HFLIP(7); }
           }
         }
       }
@@ -2158,6 +2250,7 @@ static void PpuDrawBackground_mode7(Ppu *ppu, uint y, bool sub, PpuZbufType z) {
   int layer = 0;
   if (!IS_SCREEN_ENABLED(ppu, sub, layer))
     return;  // layer is completely hidden
+  PPU_BUF_MARK(sub);
 #if SNES_ABLATE_BG == 1
   /* ABLATION, WRONG OUTPUT ON PURPOSE. Not an optimisation -- it deletes the
    * entire background layer draw (tilemap walk, VRAM fetch, decode, z-compare,
@@ -2278,6 +2371,7 @@ PPU_SPLIT_NOINLINE static void PpuDrawSprites(Ppu *ppu, uint y, uint sub, bool c
   int layer = 4;
   if (!IS_SCREEN_ENABLED(ppu, sub, layer))
     return;  // layer is completely hidden
+  PPU_BUF_MARK(sub);
 #if SNES_ABLATE_BG == 1
   /* ABLATION, WRONG OUTPUT ON PURPOSE. Not an optimisation -- it deletes the
    * entire background layer draw (tilemap walk, VRAM fetch, decode, z-compare,
@@ -2529,8 +2623,10 @@ PPU_SPLIT_NOINLINE static NOINLINE void PpuDrawWholeLine(Ppu *ppu, uint y) {
    * stores per line does not show up in this frame budget -- which is the same
    * lesson the tile memo taught from the other side. On this part sequential
    * writes are cheap; what costs is reading a cold line at a random address. */
+  PPU_BUF_MARK(0);   /* the ablation below leaves the buffer dirty */
 #else
   ClearBackdrop(&ppu->bgBuffers[0]);
+  PPU_BUF_CLEAN(0);
 #endif
 
   // Render main screen
@@ -2546,6 +2642,9 @@ PPU_SPLIT_NOINLINE static NOINLINE void PpuDrawWholeLine(Ppu *ppu, uint y) {
   if (ppu->preventMathMode != 3 && ppu->addSubscreen && math_enabled) {
 #if SNES_ABLATE_BG != 3
     ClearBackdrop(&ppu->bgBuffers[1]);
+    PPU_BUF_CLEAN(1);
+#else
+    PPU_BUF_MARK(1);
 #endif
     if (ppu->screenEnabled[1] != 0) {
 #if SNES_RENDER_CENSUS
