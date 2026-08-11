@@ -271,7 +271,14 @@ int cpu_runOpcode(Cpu* cpu) {
 #ifdef SNES_BUS_IN_ITCM
 __attribute__((section(".itcm_snes_interp.thumb2.bus")))
 #endif
+#if SNES_OP_CENSUS
+uint32_t g_op_total, g_op_fallback, g_op_fbhist[256];
+#endif
 int cpu_thumb2_fallback(Cpu* cpu, uint32_t opcode) {
+#if SNES_OP_CENSUS
+  g_op_fallback++;
+  g_op_fbhist[(uint8_t)opcode]++;
+#endif
   cpu_doOpcode(cpu, (uint8_t)opcode);
   return cpu->cyclesUsed;
 }

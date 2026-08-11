@@ -101,7 +101,51 @@ void dsp_free(Dsp* dsp) {
   free(dsp);
 }
 
+#ifndef SNES_DSP_IDLE_SKIP_VOICE
+#define SNES_DSP_IDLE_SKIP_VOICE 0
+#endif
+#if SNES_DSP_IDLE_SKIP_VOICE
+/* Idle voices leave the loop entirely.
+ *
+ * Census, 700 frames of ALttP: 2,031,589 of 2,990,400 voice-ticks are idle --
+ * 68% -- and ZERO idle voices use pitch modulation. Hoisting the idle test out
+ * of the call (SNES_DSP_IDLE_HOIST) removed the call frame and measured nothing,
+ * because the work itself stayed: the voice is still visited, still loads gain
+ * and adsrState to be told it is idle, and still adds to its pitch counter, 2,902
+ * times a frame.
+ *
+ * All an idle voice does per tick is `pitchCounter += pitch` and `sampleOut = 0`.
+ * It never reaches the overflow test, so it never decodes BRR, so over N ticks
+ * the counter is exactly `pitchCounter + pitch * N` -- and `pitch` cannot move
+ * while idle, because pitch modulation is what would move it and no idle voice
+ * has it. So the voice can be dropped from the loop and reconciled when it wakes.
+ *
+ * The mask is maintained conservatively: a voice can only BECOME idle inside
+ * dsp_cycleChannel, and can only LEAVE idle through a register write or a reset,
+ * both of which clear the whole mask. Register writes are rare against 4,272
+ * voice-ticks a frame, so clearing all eight costs nothing and cannot be wrong.
+ *
+ * Derived state, so it lives in statics rather than in Dsp -- a savestate is a
+ * raw struct dump. dsp_saveload flushes the pending advances first, so what is
+ * written is the same state the per-tick version would have written. */
+static uint8_t g_dsp_idle_mask;
+static uint32_t g_dsp_idle_n[8];
+static inline void dsp_flushIdle(Dsp* dsp, int ch) {
+  uint32_t n = g_dsp_idle_n[ch];
+  if (n) {
+    dsp->channel[ch].pitchCounter += (uint16_t)(dsp->channel[ch].pitch * n);
+    g_dsp_idle_n[ch] = 0;
+  }
+}
+static void dsp_flushIdleAll(Dsp* dsp) {
+  for (int i = 0; i < 8; i++) dsp_flushIdle(dsp, i);
+  g_dsp_idle_mask = 0;
+}
+#endif
 void dsp_reset(Dsp* dsp) {
+#if SNES_DSP_IDLE_SKIP_VOICE
+  dsp_flushIdleAll(dsp);
+#endif
   memset(dsp->ram, 0, sizeof(dsp->ram));
   dsp->ram[0x7c] = 0xff; // set ENDx
   for(int i = 0; i < 8; i++) {
@@ -157,6 +201,9 @@ void dsp_reset(Dsp* dsp) {
 }
 
 void dsp_saveload(Dsp *dsp, SaveLoadFunc *func, void *ctx) {
+#if SNES_DSP_IDLE_SKIP_VOICE
+  dsp_flushIdleAll(dsp);
+#endif
   func(ctx, &dsp->ram, sizeof(Dsp) - offsetof(Dsp, ram));
 }
 
@@ -208,6 +255,10 @@ void dsp_cycle(Dsp* dsp) {
 #endif
 #if !SNES_ABLATE_DSP_VOICES
   for(int i = 0; i < 8; i++) {
+#if SNES_DSP_IDLE_SKIP_VOICE
+    if (g_dsp_idle_mask & (1u << i)) { g_dsp_idle_n[i]++; continue; }
+    dsp_flushIdle(dsp, i);
+#endif
 #if SNES_DSP_IDLE_HOIST
     /* The idle test, moved from the callee to the caller.
      *
@@ -386,6 +437,13 @@ static void dsp_cycleChannel(Dsp* dsp, int ch) {
   } else g_dsp_active++;
 #endif
   if (dsp->channel[ch].gain == 0 && dsp->channel[ch].adsrState == 4 && !dsp->reset) {
+#if SNES_DSP_IDLE_SKIP_VOICE
+    /* Only voices without pitch modulation may leave the loop -- theirs is the
+     * pitch that cannot move while idle. The census says that is all of them
+     * here; the test keeps it true when it is not. */
+    if (!(ch > 0 && dsp->channel[ch].pitchModulation))
+      g_dsp_idle_mask |= (uint8_t)(1u << ch);
+#endif
     uint16_t pitch = dsp->channel[ch].pitch;
     if (ch > 0 && dsp->channel[ch].pitchModulation) {
       int factor = (dsp->channel[ch - 1].sampleOut >> 4) + 0x400;
@@ -684,6 +742,9 @@ uint8_t dsp_read(Dsp* dsp, uint8_t adr) {
 }
 
 void dsp_write(Dsp* dsp, uint8_t adr, uint8_t val) {
+#if SNES_DSP_IDLE_SKIP_VOICE
+  dsp_flushIdleAll(dsp);
+#endif
   int ch = adr >> 4;
   switch(adr) {
     case 0x00: case 0x10: case 0x20: case 0x30: case 0x40: case 0x50: case 0x60: case 0x70: {

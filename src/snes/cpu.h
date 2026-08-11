@@ -84,7 +84,22 @@ int snes_thumb2_step(Cpu* cpu);
    than naming it: a build without the engine has no such symbol. */
 int snes_thumb2_run(Cpu* cpu);
 int cpu_thumb2_fallback(Cpu* cpu, uint32_t opcode);
+#ifndef SNES_OP_CENSUS
+#define SNES_OP_CENSUS 0
+#endif
+#if SNES_OP_CENSUS
+/* How much of the guest's instruction stream does the Thumb-2 engine actually
+ * execute, and what is left? snes_thumb2_run is the single entry per opcode and
+ * cpu_thumb2_fallback the single exit to C, so counting both gives the coverage
+ * rate exactly, and a 256-entry histogram of the fallbacks names what to add. */
+extern uint32_t g_op_total;
+extern uint32_t g_op_fallback;
+extern uint32_t g_op_fbhist[256];
+static inline int snes_thumb2_run_censused(Cpu* cpu) { g_op_total++; return snes_thumb2_run(cpu); }
+#define CPU_RUN_OPCODE(cpu) snes_thumb2_run_censused(cpu)
+#else
 #define CPU_RUN_OPCODE(cpu) snes_thumb2_run(cpu)
+#endif
 #else
 #define CPU_RUN_OPCODE(cpu) cpu_runOpcode(cpu)
 #endif
