@@ -1268,6 +1268,24 @@ static inline uint32 PpuDecode2bpp(uint32 bits) {
 #ifndef SNES_ABLATE_BG
 #define SNES_ABLATE_BG 0
 #endif
+#ifndef SNES_PPU_PIPELINE
+#define SNES_PPU_PIPELINE 0
+#endif
+#ifndef SNES_ABLATE_WALK
+#define SNES_ABLATE_WALK 0
+#endif
+#ifndef SNES_ABLATE_FETCH
+#define SNES_ABLATE_FETCH 0
+#endif
+#ifndef SNES_ABLATE_ADDR
+#define SNES_ABLATE_ADDR 0
+#endif
+#if SNES_ABLATE_BG == 4
+/* The setup ablation computes the per-call setup and then throws it away, which
+ * is exactly the shape gcc deletes. Everything it wants to keep is summed into
+ * this volatile, so the arm measures the setup rather than an empty call. */
+volatile uint32 g_ppu_ablate_sink;
+#endif
 #ifndef SNES_PPU_PREFETCH
 #define SNES_PPU_PREFETCH 0
 #endif
@@ -1345,7 +1363,43 @@ static void PpuDrawBackground_4bpp(Ppu *ppu, uint y, bool sub, uint layer, PpuZb
   pixel = (chunky >> (4 * (7 - i))) & 0xf; \
   if (pixel && z > dstz[i]) dstz[i] = z + pixel; } while (0)
 #endif
+#if SNES_ABLATE_ADDR
+/* ABLATION, WRONG OUTPUT ON PURPOSE. Both loads still happen, at scattered
+ * addresses across the same 64 KB, at the same rate -- but the address no longer
+ * comes from the tilemap word, so the CHASE is broken while the memory traffic
+ * is not. Read against SNES_ABLATE_FETCH, which deletes the loads outright:
+ * equal means the cost is the dependency, not the loads; zero means the cost is
+ * the loads, and the DTCM result needs explaining. */
+#define READ_BITS(ta, tile) (addr = &ppu->vram[(((uintptr_t)dstz * 37u) >> 1) & 0x7ff0], addr[0] | addr[8] << 16)
+#elif SNES_ABLATE_FETCH
+/* ABLATION, WRONG OUTPUT ON PURPOSE. The bitplane read is a POINTER CHASE: the
+ * tilemap word is loaded, its low bits pick an address, and that address is
+ * loaded. Moving all of VRAM into zero-wait DTCM proved the second load never
+ * waits on memory -- but a load that hits L1 still has a use latency, and the
+ * chain is two of them deep per tile with the pixel work hanging off the end.
+ * This keeps `bits` a function of the same inputs, so nothing hoists and every
+ * downstream branch still varies, and computes it in the ALU instead. */
+#define READ_BITS(ta, tile) (addr = ppu->vram, (((uint32)(ta) + (uint32)(tile) * 16u) * 0x00010001u))
+#else
 #define READ_BITS(ta, tile) (PPU_PROBE_VRAM_ADR((ta) + (tile) * 16), addr = &ppu->vram[((ta) + (tile) * 16) & 0x7fff], addr[0] | addr[8] << 16)
+#endif
+#if SNES_PPU_PIPELINE && (SNES_PPU_TILE_MEMO || SNES_PPU_PREFETCH || SNES_RENDER_CENSUS)
+#error "SNES_PPU_PIPELINE does not carry the memo/prefetch/census paths -- all three measured zero and were not duplicated into it"
+#endif
+#define PPU_PIPE_DRAW_4BPP(tile_, bits_) do {                                  \
+    if (bits_) {                                                               \
+      uint32 chunky = PpuDecode4bpp(bits_);                                    \
+      PpuZbufType z = (((tile_) & 0x2000) ? zhi : zlo)                         \
+                    + (((tile_) & 0x1c00) >> kPaletteShift);                   \
+      if ((tile_) & 0x4000) {                                                  \
+        DO_CHUNKY_PIXEL(0); DO_CHUNKY_PIXEL(1); DO_CHUNKY_PIXEL(2); DO_CHUNKY_PIXEL(3); \
+        DO_CHUNKY_PIXEL(4); DO_CHUNKY_PIXEL(5); DO_CHUNKY_PIXEL(6); DO_CHUNKY_PIXEL(7); \
+      } else {                                                                 \
+        DO_CHUNKY_PIXEL_HFLIP(0); DO_CHUNKY_PIXEL_HFLIP(1); DO_CHUNKY_PIXEL_HFLIP(2); DO_CHUNKY_PIXEL_HFLIP(3); \
+        DO_CHUNKY_PIXEL_HFLIP(4); DO_CHUNKY_PIXEL_HFLIP(5); DO_CHUNKY_PIXEL_HFLIP(6); DO_CHUNKY_PIXEL_HFLIP(7); \
+      }                                                                        \
+    }                                                                          \
+  } while (0)
   enum { kPaletteShift = 6 };
   if (!IS_SCREEN_ENABLED(ppu, sub, layer))
     return;  // layer is completely hidden
@@ -1396,6 +1450,22 @@ static void PpuDrawBackground_4bpp(Ppu *ppu, uint y, bool sub, uint layer, PpuZb
   };
   int tileadr = ppu->bgLayer[layer].tileAdr, pixel;
   int tileadr1 = tileadr + 7 - (y & 0x7), tileadr0 = tileadr + (y & 0x7);
+#if SNES_ABLATE_BG == 4
+  /* ABLATION, WRONG OUTPUT ON PURPOSE. Everything above this line stays -- the
+   * enabled/windowed tests, PpuWindows_Calc or _Clear, the tilemap base and the
+   * two row addresses -- and everything below it goes. It prices the PER-CALL
+   * SETUP on its own, against =1 (the whole draw) and =2 (the setup and the walk
+   * and the fetch, without the pixel work). 737 calls a frame at 3.29 layer
+   * passes a line; if that is where the 4.33 fps lives, the target is the caller,
+   * not the inner loop.
+   *
+   * The sink is what keeps it honest: with the results unused, gcc deletes the
+   * setup and the arm measures nothing but the call. */
+  g_ppu_ablate_sink = (uint32)win.nr + (uint32)win.edges[0]
+                    + (uint32)(uintptr_t)tps[0] + (uint32)(uintptr_t)tps[1]
+                    + (uint32)tileadr1 + (uint32)tileadr0;
+  return;
+#endif
   const uint16 *addr;
 #if SNES_PPU_TILE_MEMO
   /* One-entry memo on the tile fetch.
@@ -1433,7 +1503,22 @@ static void PpuDrawBackground_4bpp(Ppu *ppu, uint y, bool sub, uint layer, PpuZb
     const uint16 *tp = tps[x >> 8 & 1] + ((x >> 3) & 0x1f);
     const uint16 *tp_last = tps[x >> 8 & 1] + 31;
     const uint16 *tp_next = tps[(x >> 8 & 1) ^ 1];
+#if SNES_ABLATE_WALK
+/* ABLATION, WRONG OUTPUT ON PURPOSE. `tp` never advances, so every tile in the
+ * span is the same tilemap entry: the decode, the z-compare, the store and both
+ * VRAM loads all still happen, and only the WALK -- the pointer bump, the
+ * end-of-screen compare and its branch -- is gone. Against =2 (which keeps the
+ * walk and deletes the pixel work, and measured nothing) this is the other half
+ * of the same question, and one of the two has to hold the 4.33 fps.
+ *
+ * It does contaminate the read: the same address every time is a guaranteed
+ * cache hit. That is acceptable here only because four independent experiments
+ * have already priced the reads at zero, up to and including moving all 64 KB of
+ * VRAM into zero-wait DTCM. */
+#define NEXT_TP() do { } while (0)
+#else
 #define NEXT_TP() if (tp != tp_last) tp += 1; else tp = tp_next, tp_next = tp_last - 31, tp_last = tp + 31;
+#endif
     // Handle clipped pixels on left side
     if (x & 7) {
       int curw = IntMin(8 - (x & 7), w);
@@ -1478,6 +1563,78 @@ static void PpuDrawBackground_4bpp(Ppu *ppu, uint y, bool sub, uint layer, PpuZb
       }
     }
     // Handle full tiles in the middle
+#if SNES_PPU_PIPELINE
+    /* Software-pipelined: the NEXT tile's whole fetch chain is issued before the
+     * current tile's pixel work, so the two overlap instead of queueing.
+     *
+     * What made this the candidate: ablation, four ways. Returning before this
+     * loop is worth +4.16 fps; deleting the pixel work inside it is worth
+     * nothing; deleting the tilemap walk is worth nothing; and replacing the
+     * bitplane load with ALU arithmetic on the same inputs is worth +3.04, which
+     * is 73% of the loop. So the loop is its POINTER CHASE -- the tilemap word is
+     * loaded, its bits pick an address, that address is loaded, and `if (bits)`
+     * branches on the result immediately -- and not its arithmetic, not its
+     * walk, and not the memory system: all 64 KB of VRAM in zero-wait DTCM
+     * measured zero, as did a PLD of the same address and a memo that skipped
+     * 80% of the fetches.
+     *
+     * A latency that neither a cache nor a prefetch can touch is a use-latency,
+     * and the only way to pay it is to have something else to do. The pixel work
+     * is exactly that something -- ablation prices it at zero, which is another
+     * way of saying the CPU is standing idle through it. */
+    if (w >= 8) {
+      uint n = w >> 3;
+      w -= n << 3;
+#if SNES_PPU_PIPELINE == 1
+      /* Depth 1: the next tile's whole chain is issued before this tile's pixel
+       * work. MEASURED 55.53 against a 55.57 baseline -- NOTHING, and the reason
+       * is that it moved the chain without shortening it: the tilemap load and
+       * the bitplane load that depends on it are still back to back, so the
+       * second still waits on the first. Kept for the record. */
+      uint32 tile = PPU_PROBE_VRAM_PTR(ppu, tp);
+      NEXT_TP();
+      uint32 bits = READ_BITS((tile & 0x8000) ? tileadr1 : tileadr0, tile & 0x3ff);
+      while (--n) {
+        uint32 ntile = PPU_PROBE_VRAM_PTR(ppu, tp);
+        NEXT_TP();
+        uint32 nbits = READ_BITS((ntile & 0x8000) ? tileadr1 : tileadr0, ntile & 0x3ff);
+        PPU_PIPE_DRAW_4BPP(tile, bits);
+        dstz += 8;
+        tile = ntile, bits = nbits;
+      }
+      PPU_PIPE_DRAW_4BPP(tile, bits);
+      dstz += 8;
+#else
+      /* Depth 2, which is what the ablations actually ask for. Each iteration
+       * loads the tilemap word for tile i+2, the bitplanes for tile i+1 -- whose
+       * word was loaded a whole iteration ago -- and draws tile i. Every link of
+       * the chase then has an iteration of other work standing between the load
+       * and its use, which is the only currency a use-latency accepts. */
+      uint32 tA = PPU_PROBE_VRAM_PTR(ppu, tp);
+      NEXT_TP();
+      uint32 tB = tA;
+      if (n > 1) { tB = PPU_PROBE_VRAM_PTR(ppu, tp); NEXT_TP(); }
+      uint32 bA = READ_BITS((tA & 0x8000) ? tileadr1 : tileadr0, tA & 0x3ff);
+      while (n > 2) {
+        uint32 tC = PPU_PROBE_VRAM_PTR(ppu, tp);
+        NEXT_TP();
+        uint32 bB = READ_BITS((tB & 0x8000) ? tileadr1 : tileadr0, tB & 0x3ff);
+        PPU_PIPE_DRAW_4BPP(tA, bA);
+        dstz += 8;
+        tA = tB, bA = bB, tB = tC;
+        n--;
+      }
+      if (n > 1) {
+        uint32 bB = READ_BITS((tB & 0x8000) ? tileadr1 : tileadr0, tB & 0x3ff);
+        PPU_PIPE_DRAW_4BPP(tA, bA);
+        dstz += 8;
+        tA = tB, bA = bB;
+      }
+      PPU_PIPE_DRAW_4BPP(tA, bA);
+      dstz += 8;
+#endif
+    }
+#else
     while (w >= 8) {
       uint32 tile = PPU_PROBE_VRAM_PTR(ppu, tp);
       NEXT_TP();
@@ -1542,6 +1699,7 @@ static void PpuDrawBackground_4bpp(Ppu *ppu, uint y, bool sub, uint layer, PpuZb
       }
       dstz += 8, w -= 8;
     }
+#endif
     // Handle remaining clipped part
     if (w) {
       uint32 tile = PPU_PROBE_VRAM_PTR(ppu, tp);
@@ -1579,6 +1737,7 @@ static void PpuDrawBackground_4bpp(Ppu *ppu, uint y, bool sub, uint layer, PpuZb
       }
     }
   }
+#undef PPU_PIPE_DRAW_4BPP
 #undef READ_BITS
 #undef DO_CHUNKY_PIXEL_HFLIP
 #undef DO_CHUNKY_PIXEL
@@ -1619,7 +1778,12 @@ static void PpuDrawBackground_2bpp(Ppu *ppu, uint y, bool sub, uint layer, PpuZb
   pixel = (chunky >> (4 * (7 - i))) & 3; \
   if (pixel) dstz[i] = z + pixel; } while (0)
 #endif
+#if SNES_ABLATE_FETCH
+/* See the 4bpp drawer: the ALU stands in for the second load of the chase. */
+#define READ_BITS(ta, tile) (addr = ppu->vram, (uint32)(ta) + (uint32)(tile) * 8u)
+#else
 #define READ_BITS(ta, tile) (PPU_PROBE_VRAM_ADR((ta) + (tile) * 8), addr = &ppu->vram[(ta) + (tile) * 8 & 0x7fff], addr[0])
+#endif
   enum { kPaletteShift = 8 };
   if (!IS_SCREEN_ENABLED(ppu, sub, layer))
     return;  // layer is completely hidden
@@ -1670,6 +1834,22 @@ static void PpuDrawBackground_2bpp(Ppu *ppu, uint y, bool sub, uint layer, PpuZb
   };
   int tileadr = ppu->bgLayer[layer].tileAdr, pixel;
   int tileadr1 = tileadr + 7 - (y & 0x7), tileadr0 = tileadr + (y & 0x7);
+#if SNES_ABLATE_BG == 4
+  /* ABLATION, WRONG OUTPUT ON PURPOSE. Everything above this line stays -- the
+   * enabled/windowed tests, PpuWindows_Calc or _Clear, the tilemap base and the
+   * two row addresses -- and everything below it goes. It prices the PER-CALL
+   * SETUP on its own, against =1 (the whole draw) and =2 (the setup and the walk
+   * and the fetch, without the pixel work). 737 calls a frame at 3.29 layer
+   * passes a line; if that is where the 4.33 fps lives, the target is the caller,
+   * not the inner loop.
+   *
+   * The sink is what keeps it honest: with the results unused, gcc deletes the
+   * setup and the arm measures nothing but the call. */
+  g_ppu_ablate_sink = (uint32)win.nr + (uint32)win.edges[0]
+                    + (uint32)(uintptr_t)tps[0] + (uint32)(uintptr_t)tps[1]
+                    + (uint32)tileadr1 + (uint32)tileadr0;
+  return;
+#endif
 
   const uint16 *addr;
 #if SNES_PPU_TILE_MEMO
@@ -1686,7 +1866,22 @@ static void PpuDrawBackground_2bpp(Ppu *ppu, uint y, bool sub, uint layer, PpuZb
     const uint16 *tp_last = tps[x >> 8 & 1] + 31;
     const uint16 *tp_next = tps[(x >> 8 & 1) ^ 1];
 
+#if SNES_ABLATE_WALK
+/* ABLATION, WRONG OUTPUT ON PURPOSE. `tp` never advances, so every tile in the
+ * span is the same tilemap entry: the decode, the z-compare, the store and both
+ * VRAM loads all still happen, and only the WALK -- the pointer bump, the
+ * end-of-screen compare and its branch -- is gone. Against =2 (which keeps the
+ * walk and deletes the pixel work, and measured nothing) this is the other half
+ * of the same question, and one of the two has to hold the 4.33 fps.
+ *
+ * It does contaminate the read: the same address every time is a guaranteed
+ * cache hit. That is acceptable here only because four independent experiments
+ * have already priced the reads at zero, up to and including moving all 64 KB of
+ * VRAM into zero-wait DTCM. */
+#define NEXT_TP() do { } while (0)
+#else
 #define NEXT_TP() if (tp != tp_last) tp += 1; else tp = tp_next, tp_next = tp_last - 31, tp_last = tp + 31;
+#endif
     // Handle clipped pixels on left side
     if (x & 7) {
       int curw = IntMin(8 - (x & 7), w);
