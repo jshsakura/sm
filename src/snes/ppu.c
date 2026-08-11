@@ -1471,6 +1471,18 @@ static uint8_t g_bg_dirty;
 #define PPU_BUF_CLEAN(sub)     (g_bg_dirty &= ~(1u << (sub)))
 #define PPU_BUF_VIRGIN(sub)    (!(g_bg_dirty & (1u << (sub))))
 enum { kPpuBackdropZ = 0x0500 };
+/* Store two z-buffer entries in one word. The address may be odd-halfword
+ * aligned -- a window edge decides it -- which Cortex-M7 permits for word
+ * accesses; only 64-bit ones trap (CLAUDE.md, the Super Metroid STRD). memcpy
+ * says that in C without letting the compiler assume alignment it does not
+ * have -- but gcc does NOT fold a 4-byte memcpy with an unknown-alignment
+ * destination into a str. It emits a CALL, and seven of them landed inside
+ * PpuDrawBackground_4bpp. The branch they sit in never executes in Zelda 3, and
+ * it still cost **4.7 fps on hardware** (52.38 against 57.10, three runs each):
+ * a call in the hottest loop makes the compiler treat every caller-saved
+ * register as clobbered across it, and the loop that has to survive that is the
+ * one that runs tens of thousands of times a frame. An aligned(1) may_alias
+ * store says the same thing to the compiler and compiles to one str. */
 #else
 #define PPU_BUF_MARK(sub)      ((void)0)
 #define PPU_BUF_CLEAN(sub)     ((void)0)
@@ -1620,6 +1632,15 @@ volatile uint32 g_ppu_ablate_sink;
  * start there rather than in the compositing loop, which pairing and range-test
  * deletion have already been through. */
 uint32_t g_bg_pass[2], g_bg_tile[2], g_bg_tile_blank[2], g_spr_pass, g_render_lines, g_sub_lines;
+/* Of the tiles that are NOT blank, how many are FULLY opaque -- every one of the
+ * eight nibbles non-zero. On such a tile the per-pixel `if (pixel)` is provably
+ * true eight times out of eight, so it is work that is ALWAYS useless, which is
+ * the only shape that has ever won on this loop. Two SIMD attempts lost because
+ * they removed a skip that was paying; this asks how often there is nothing to
+ * skip. Counted for the 4bpp drawer, which is where the pixels are. */
+uint32_t g_tile_full[2], g_tile_mixed[2];
+uint32_t g_tile_flat[2], g_tile_opq_z[2];
+uint64_t g_tile_opaque_px[2];
 /* The one that decides whether a shared decode is even possible: when the sub
  * pass draws layer N, was layer N also drawn on the main screen? hScroll and
  * vScroll live on the layer, not the screen, so the same layer fetches and
@@ -1684,6 +1705,34 @@ static void PpuDrawBackground_4bpp(Ppu *ppu, uint y, bool sub, uint layer, PpuZb
 #define DO_TOP_CHUNKY_PIXEL_HFLIP(i) do { \
   pixel = (chunky >> (4 * (7 - i))) & 0xf; \
   if (pixel) dstz[i] = z + pixel; } while (0)
+/* A FULLY OPAQUE tile: every nibble non-zero, so `if (pixel)` is provably true
+ * eight times out of eight. Onto a virgin buffer the z compare cannot fail
+ * either, and the pixel becomes an unconditional store -- no test, no load, no
+ * branch. Counted on the rig, Zelda 3: 38% of main-screen tiles and 86% of
+ * SUB-screen ones, and the subscreen is 65% of all tile decode and runs exactly
+ * one pass a line, so it is virgin whenever the line has no sprites.
+ *
+ * This is the shape that has won on this loop every time and the one that lost
+ * every time it was violated: SNES_PPU_SIMD_PIXELS removed a skip that was
+ * paying (-7.5 fps) and SNES_PPU_COARSE_SKIP tried to predict which pixels were
+ * transparent (+0.22, noise). Here nothing is predicted -- the tile has been
+ * measured, once, in four ALU ops. */
+#define DO_FLAT_CHUNKY_PIXEL(i)       do { \
+  dstz[i] = z + ((chunky >> (4 * i)) & 0xf); } while (0)
+#define DO_FLAT_CHUNKY_PIXEL_HFLIP(i) do { \
+  dstz[i] = z + ((chunky >> (4 * (7 - i))) & 0xf); } while (0)
+#define DO_OPAQUE_CHUNKY_PIXEL(i) do { \
+  pixel = (chunky >> (4 * i)) & 0xf; \
+  if (z > dstz[i]) dstz[i] = z + pixel; } while (0)
+#define DO_OPAQUE_CHUNKY_PIXEL_HFLIP(i) do { \
+  pixel = (chunky >> (4 * (7 - i))) & 0xf; \
+  if (z > dstz[i]) dstz[i] = z + pixel; } while (0)
+#endif
+#ifndef SNES_PPU_OPAQUE_TILE
+#define SNES_PPU_OPAQUE_TILE 0
+#endif
+#if SNES_PPU_OPAQUE_TILE && (SNES_ABLATE_BG || SNES_PPU_SIMD_PIXELS)
+#error "SNES_PPU_OPAQUE_TILE changes the pixel loop an ablation is trying to hold still"
 #endif
 #if SNES_ABLATE_ADDR
 /* ABLATION, WRONG OUTPUT ON PURPOSE. Both loads still happen, at scattered
@@ -2043,6 +2092,15 @@ static void PpuDrawBackground_4bpp(Ppu *ppu, uint y, bool sub, uint layer, PpuZb
         prev_key = key; }
       g_bg_tile[sub ? 1 : 0]++;
       if (!bits) g_bg_tile_blank[sub ? 1 : 0]++;
+      else {
+        /* A nibble is opaque iff any of its four bits is set. OR the word down
+         * by 1,2,3 and keep bit 0 of each nibble: eight flags in one register. */
+        uint32 ch = PpuDecode4bpp(bits);
+        uint32 nz = (ch | ch >> 1 | ch >> 2 | ch >> 3) & 0x11111111u;
+        int opaque = __builtin_popcount(nz);
+        g_tile_opaque_px[sub ? 1 : 0] += opaque;
+        if (opaque == 8) g_tile_full[sub ? 1 : 0]++; else g_tile_mixed[sub ? 1 : 0]++;
+      }
 #endif
       if (bits) {
         PPU_ABLATE_KEEP_BITS(bits);
@@ -2051,6 +2109,31 @@ static void PpuDrawBackground_4bpp(Ppu *ppu, uint y, bool sub, uint layer, PpuZb
 #if SNES_PPU_SIMD_PIXELS
         PPU_SIMD_TILE_4BPP();
 #else
+#if SNES_PPU_OPAQUE_TILE
+        /* Four ALU ops decide it: OR the word down by 1, 2 and 3 and keep bit 0
+         * of every nibble. All eight set means no nibble is zero. */
+        const uint32 nz = (chunky | chunky >> 1 | chunky >> 2 | chunky >> 3) & 0x11111111u;
+        if (nz == 0x11111111u) {
+#if SNES_RENDER_CENSUS
+          if (no_ztest) g_tile_flat[sub ? 1 : 0]++; else g_tile_opq_z[sub ? 1 : 0]++;
+#endif
+          if (no_ztest) {
+            if (tile & 0x4000) {
+              DO_FLAT_CHUNKY_PIXEL(0); DO_FLAT_CHUNKY_PIXEL(1); DO_FLAT_CHUNKY_PIXEL(2); DO_FLAT_CHUNKY_PIXEL(3);
+              DO_FLAT_CHUNKY_PIXEL(4); DO_FLAT_CHUNKY_PIXEL(5); DO_FLAT_CHUNKY_PIXEL(6); DO_FLAT_CHUNKY_PIXEL(7);
+            } else {
+              DO_FLAT_CHUNKY_PIXEL_HFLIP(0); DO_FLAT_CHUNKY_PIXEL_HFLIP(1); DO_FLAT_CHUNKY_PIXEL_HFLIP(2); DO_FLAT_CHUNKY_PIXEL_HFLIP(3);
+              DO_FLAT_CHUNKY_PIXEL_HFLIP(4); DO_FLAT_CHUNKY_PIXEL_HFLIP(5); DO_FLAT_CHUNKY_PIXEL_HFLIP(6); DO_FLAT_CHUNKY_PIXEL_HFLIP(7);
+            }
+          } else if (tile & 0x4000) {
+            DO_OPAQUE_CHUNKY_PIXEL(0); DO_OPAQUE_CHUNKY_PIXEL(1); DO_OPAQUE_CHUNKY_PIXEL(2); DO_OPAQUE_CHUNKY_PIXEL(3);
+            DO_OPAQUE_CHUNKY_PIXEL(4); DO_OPAQUE_CHUNKY_PIXEL(5); DO_OPAQUE_CHUNKY_PIXEL(6); DO_OPAQUE_CHUNKY_PIXEL(7);
+          } else {
+            DO_OPAQUE_CHUNKY_PIXEL_HFLIP(0); DO_OPAQUE_CHUNKY_PIXEL_HFLIP(1); DO_OPAQUE_CHUNKY_PIXEL_HFLIP(2); DO_OPAQUE_CHUNKY_PIXEL_HFLIP(3);
+            DO_OPAQUE_CHUNKY_PIXEL_HFLIP(4); DO_OPAQUE_CHUNKY_PIXEL_HFLIP(5); DO_OPAQUE_CHUNKY_PIXEL_HFLIP(6); DO_OPAQUE_CHUNKY_PIXEL_HFLIP(7);
+          }
+        } else
+#endif
         if (no_ztest) {
           /* Buffer still holds nothing but backdrop, and this layer's floor is
            * above it: the compare cannot fail, so do not make it. The branch is
