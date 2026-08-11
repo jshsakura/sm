@@ -71,6 +71,25 @@ bool g_debug_apu_cycles;
 #ifndef SNES_ABLATE_APU
 #define SNES_ABLATE_APU 0
 #endif
+#ifndef SNES_ABLATE_DSP
+#define SNES_ABLATE_DSP 0
+#endif
+#ifndef SNES_ABLATE_SPC
+#define SNES_ABLATE_SPC 0
+#endif
+#if SNES_ABLATE_DSP || SNES_ABLATE_SPC
+/* SNES_ABLATE_APU=1 cannot be measured: without the SPC700 the game never gets
+ * past the boot handshake and never runs. These two split the chain into the
+ * halves that CAN be measured with a game on screen.
+ *
+ * SNES_ABLATE_DSP deletes only the sample generation. The SPC700 still runs, so
+ * it still answers the ports the game writes to, and the game keeps playing --
+ * silently. That is the DSP's own price.
+ *
+ * SNES_ABLATE_SPC deletes only the opcode execution and leaves the DSP and the
+ * ports. Most games hang on this; it is here so the pair brackets the chain.
+ * WRONG OUTPUT, both. Diagnostic. */
+#endif
 void apu_cycle(Apu* apu) {
 #if SNES_ABLATE_APU
   /* ABLATION, WRONG OUTPUT ON PURPOSE. Deletes the SPC700 and the DSP so the
@@ -86,13 +105,19 @@ void apu_cycle(Apu* apu) {
       getProcessorStateSpc(apu, line);
       puts(line);
     }
+#if SNES_ABLATE_SPC
+    apu->cpuCyclesLeft = 2;
+#else
     apu->cpuCyclesLeft = spc_runOpcode(apu->spc);
+#endif
   }
   apu->cpuCyclesLeft--;
 
   if((apu->cycles & 0x1f) == 0) {
     // every 32 cycles
+#if !SNES_ABLATE_DSP
     dsp_cycle(apu->dsp);
+#endif
   }
 
   // handle timers
@@ -182,7 +207,11 @@ void apu_run(Apu* apu, int cyclesToRun) {
         idle = true;
       } else
 #endif
+#if SNES_ABLATE_SPC
+        apu->cpuCyclesLeft = 2;
+#else
         apu->cpuCyclesLeft = spc_runOpcode(apu->spc);
+#endif
     }
 
     if (!idle) {
@@ -193,8 +222,10 @@ void apu_run(Apu* apu, int cyclesToRun) {
     /* DSP fires when (cycles & 0x1f)==0, tested before the increment — so once for
      * every multiple of 32 in [cycles, cycles+step). */
     uint32_t start = apu->cycles, end = start + (uint32_t)step;
+#if !SNES_ABLATE_DSP
     for (uint32_t m = (start + 31u) & ~31u; m < end; m += 32u)
       dsp_cycle(apu->dsp);
+#endif
 
     /* Each timer counts down; when it passes 0 it reloads to R and, if enabled,
      * advances divider->counter. Over `step` cycles the zero-crossings land at

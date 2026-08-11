@@ -160,16 +160,85 @@ void dsp_saveload(Dsp *dsp, SaveLoadFunc *func, void *ctx) {
   func(ctx, &dsp->ram, sizeof(Dsp) - offsetof(Dsp, ram));
 }
 
+#ifndef SNES_ABLATE_DSP_VOICES
+#define SNES_ABLATE_DSP_VOICES 0
+#endif
+#ifndef SNES_ABLATE_DSP_GAIN
+#define SNES_ABLATE_DSP_GAIN 0
+#endif
+#ifndef SNES_ABLATE_DSP_INTERP
+#define SNES_ABLATE_DSP_INTERP 0
+#endif
+#ifndef SNES_ABLATE_DSP_BRR
+#define SNES_ABLATE_DSP_BRR 0
+#endif
+#ifndef SNES_ABLATE_DSP_ECHO
+#define SNES_ABLATE_DSP_ECHO 0
+#endif
+#ifndef SNES_DSP_CENSUS
+#define SNES_DSP_CENSUS 0
+#endif
+#ifndef SNES_DSP_IDLE_HOIST
+#define SNES_DSP_IDLE_HOIST 0
+#endif
+#if SNES_DSP_CENSUS
+uint32_t g_dsp_ticks, g_dsp_idle, g_dsp_active, g_dsp_pm, g_dsp_brr;
+#endif
 void dsp_cycle(Dsp* dsp) {
   int totalL = 0;
   int totalR = 0;
+#if SNES_ABLATE_DSP_VOICES
+  /* ABLATION, WRONG OUTPUT (silence). The eight voices -- BRR decode, Gaussian
+   * interpolation, ADSR, pitch, echo -- do nothing, but dsp_cycle still runs and
+   * still EMITS a sample every tick.
+   *
+   * That last part is why the coarser ablations were unmeasurable. Deleting the
+   * APU stops the boot handshake and the ROM never starts (22.4 fps, no ROM
+   * running). Deleting dsp_cycle outright keeps the SPC700 answering ports but
+   * stops sample production, and the frame loop -- which paces on the audio
+   * DMA -- spins in its 100,000-WFI guard instead: same 22.4 fps, same dead ROM.
+   * Audio is load-bearing for pacing here, so the only measurable cut is one
+   * that keeps producing samples. */
+#endif
 #ifdef SNES_DSP_MONO
   /* The Game & Watch consumes 266 mono samples per 60 Hz frame. Keep source
    * ticks 0,2,...530; the 32 kHz DSP state and echo delay line still advance
    * on every tick, but the discarded main output is never synthesized. */
   bool emitSample = dsp->sampleOffset < 532 && (dsp->sampleOffset & 1) == 0;
 #endif
+#if !SNES_ABLATE_DSP_VOICES
   for(int i = 0; i < 8; i++) {
+#if SNES_DSP_IDLE_HOIST
+    /* The idle test, moved from the callee to the caller.
+     *
+     * dsp_cycleChannel already opens with exactly this test and returns after
+     * advancing the pitch counter -- but by then the call frame is built and, in
+     * the mono build, `needSample` has been computed from three loads and two
+     * branches for a voice that will not produce a sample. Census, 700 frames of
+     * ALttP: 2,031,589 of 2,990,400 voice-ticks are idle -- 68% -- and ZERO of
+     * them have pitch modulation, so the copied test needs no `ch > 0` arm and
+     * the fold is exact.
+     *
+     * Identical code, one level up: same condition, same pitch advance, same
+     * sampleOut. It removes a call and a needSample for two thirds of all
+     * voice-ticks and changes nothing about what the DSP computes.
+     *
+     * MEASURED, AND IT IS NOTHING: 56.75 against a 57.00 baseline, three runs.
+     * The rig confirms it removes 57,959 instructions a frame (-1.46%) with
+     * STATEHASH and AUDIOHASH both bit-identical -- and that buys nothing. The
+     * DSP voice loop transfers instructions to time at about 0.43 (deleting the
+     * voices outright is -9.76% instructions for +2.37 fps), so 1.46% was worth
+     * ~0.35 fps in theory and did not clear the noise floor. Left off. */
+    {
+      DspChannel *c_ = &dsp->channel[i];
+      if (c_->gain == 0 && c_->adsrState == 4 && !dsp->reset &&
+          !(i > 0 && c_->pitchModulation)) {
+        c_->pitchCounter += c_->pitch;
+        c_->sampleOut = 0;
+        continue;
+      }
+    }
+#endif
 #ifdef SNES_DSP_MONO
     /* A discarded sample remains live if the next voice uses it for pitch
      * modulation or the full-rate echo path writes it back to ARAM. */
@@ -190,6 +259,7 @@ void dsp_cycle(Dsp* dsp) {
     totalR = totalR < -0x8000 ? -0x8000 : (totalR > 0x7fff ? 0x7fff : totalR); // clamp 16-bit
 #endif
   }
+#endif
 #ifdef SNES_DSP_MONO
   if (emitSample) {
     int monoMaster = (int)dsp->masterVolumeL + dsp->masterVolumeR;
@@ -205,7 +275,9 @@ void dsp_cycle(Dsp* dsp) {
 #endif
   /* Echo remains full-rate: its FIR history, feedback and ARAM writes are
    * updated even on main-output ticks that SNES_DSP_MONO discards. */
+#if !SNES_ABLATE_DSP_VOICES && !SNES_ABLATE_DSP_ECHO
   dsp_handleEcho(dsp, &totalL, &totalR);
+#endif
   if(dsp->mute) {
     totalL = 0;
     totalR = 0;
@@ -306,6 +378,13 @@ static void dsp_cycleChannel(Dsp* dsp, int ch) {
    * decodeOffset/previousFlags/decodeBuffer, so freezing BRR state while idle
    * is harmless. Pitch counter must still advance for correct sample timing
    * when key-on fires. sampleOut=0 keeps pitch-modulation for ch+1 correct. */
+#if SNES_DSP_CENSUS
+  g_dsp_ticks++;
+  if (dsp->channel[ch].gain == 0 && dsp->channel[ch].adsrState == 4 && !dsp->reset) {
+    g_dsp_idle++;
+    if (ch > 0 && dsp->channel[ch].pitchModulation) g_dsp_pm++;
+  } else g_dsp_active++;
+#endif
   if (dsp->channel[ch].gain == 0 && dsp->channel[ch].adsrState == 4 && !dsp->reset) {
     uint16_t pitch = dsp->channel[ch].pitch;
     if (ch > 0 && dsp->channel[ch].pitchModulation) {
@@ -333,6 +412,9 @@ static void dsp_cycleChannel(Dsp* dsp, int ch) {
     else
 #endif
     dsp_decodeBrr(dsp, ch);
+#if SNES_DSP_CENSUS
+    g_dsp_brr++;
+#endif
   }
   dsp->channel[ch].pitchCounter = newCounter;
   int16_t sample = 0;
@@ -348,7 +430,12 @@ static void dsp_cycleChannel(Dsp* dsp, int ch) {
      * output is bit-identical. Saves interpolation for every idle voice. */
     sample = 0;
   } else {
+#if SNES_ABLATE_DSP_INTERP
+    /* ABLATION, WRONG OUTPUT. The four-tap Gaussian interpolation alone. */
+    sample = 0;
+#else
     sample = dsp_getSample(dsp, ch, dsp->channel[ch].pitchCounter >> 12, (dsp->channel[ch].pitchCounter >> 4) & 0xff);
+#endif
   }
 #ifdef SNES_DSP_MONO
   }
@@ -402,6 +489,12 @@ static void dsp_cycleChannel(Dsp* dsp, int ch) {
 }
 
 static void dsp_handleGain(Dsp* dsp, int ch) {
+#if SNES_ABLATE_DSP_GAIN
+  /* ABLATION, WRONG OUTPUT. The ADSR/gain envelope alone. It runs for every
+   * voice on every one of the 534 DSP ticks a frame, and is the closed-form
+   * candidate -- the SPC's three timers were folded exactly this way. */
+  (void)dsp; (void)ch; return;
+#endif
   switch(dsp->channel[ch].adsrState) {
     case 0: { // attack
       uint16_t rate = dsp->channel[ch].adsrRates[dsp->channel[ch].adsrState];
@@ -506,6 +599,12 @@ static void dsp_decodeBrrIdle(Dsp* dsp, int ch) {
 #endif
 
 static void dsp_decodeBrr(Dsp* dsp, int ch) {
+#if SNES_ABLATE_DSP_BRR
+  /* ABLATION, WRONG OUTPUT. The BRR block decode alone -- sixteen nibbles and
+   * the two-tap filter. It fires whenever a voice's pitch counter overflows,
+   * which for a voice playing near 32 kHz is every tick. */
+  (void)dsp; (void)ch; return;
+#endif
   // copy last 3 samples (16-18) to first 3 for interpolation
   dsp->channel[ch].decodeBuffer[0] = dsp->channel[ch].decodeBuffer[16];
   dsp->channel[ch].decodeBuffer[1] = dsp->channel[ch].decodeBuffer[17];
