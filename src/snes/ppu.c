@@ -1268,6 +1268,67 @@ static inline uint32 PpuDecode2bpp(uint32 bits) {
 #ifndef SNES_ABLATE_BG
 #define SNES_ABLATE_BG 0
 #endif
+#ifndef SNES_PPU_SIMD_PIXELS
+#define SNES_PPU_SIMD_PIXELS 0
+#endif
+#if SNES_PPU_SIMD_PIXELS
+/* Two z-buffer pixels at a time, branchless, on the M7's halfword SIMD.
+ *
+ * The per-pixel rule is `if (pixel && z > dstz[i]) dstz[i] = z + pixel;` on
+ * uint16 -- a compare-and-select, which is what USUB16 (GE flags per halfword)
+ * and SEL (pick per halfword by those flags) do two lanes at a time. The
+ * transparent case folds into the same compare: substitute 0 for z where the
+ * pixel nibble is zero, and `d >= 0` is always true, so that lane keeps its old
+ * value with no extra test.
+ *
+ * USUB16 and SEL have to stay in one asm block: the GE flags live in APSR and
+ * nothing guarantees the compiler will not schedule an instruction between two
+ * separate statements.
+ *
+ * MEASURED, AND IT LOSES BADLY: 48.06 against a 55.57 baseline, -7.5 fps, with
+ * the rig hashes bit-identical so it is the same picture. The reason is the
+ * thing it deleted. `if (pixel && z > dstz[i])` is a test that SKIPS, and on
+ * this scene it skips constantly -- 46% of tiles are blank outright and a great
+ * many pixels inside the rest are transparent. Doing two lanes unconditionally
+ * pays for every transparent pixel in the frame. The pair version is not slower
+ * per pixel drawn; it draws pixels that the branch version never touched.
+ *
+ * So the 4.4 fps is not "eight pixels of arithmetic to vectorise". Much of it is
+ * the skipping machinery itself, and anything that replaces a skip with
+ * unconditional work loses. A coarser skip -- one test that drops four pixels at
+ * once, e.g. `(chunky & 0xffff) == 0` -- is the shape that could still win, and
+ * it is the next thing to build. (An unaligned 32-bit dstz access may be part of
+ * this loss too; not separated, and it cannot account for 7.5 fps on its own.)
+ *
+ * dstz is uint16* and a window edge can be odd, so the 32-bit accesses go
+ * through memcpy -- gcc emits a plain LDR/STR, and ARMv7-M handles an unaligned
+ * word access in hardware. Only 64-bit accesses trap on this core. */
+static inline uint32 PpuRd32(const void *p) { uint32 v; memcpy(&v, p, 4); return v; }
+static inline void PpuWr32(void *p, uint32 v) { memcpy(p, &v, 4); }
+#define PPU_SIMD_PAIR(i, s0, s1) do {                                          \
+    uint32 pp_ = ((chunky >> (s0)) & 0xf) | (((chunky >> (s1)) & 0xf) << 16);  \
+    uint32 dd_ = PpuRd32(dstz + (i)), vv_, zp_, rr_;                           \
+    __asm volatile ("uadd16 %0, %1, %2" : "=r"(vv_) : "r"(zz), "r"(pp_));      \
+    __asm volatile ("usub16 %0, %1, %2\n\tsel %0, %3, %4"                      \
+                    : "=&r"(zp_) : "r"(pp_), "r"(kOne16), "r"(zz), "r"(0)      \
+                    : "cc");                                                   \
+    __asm volatile ("usub16 %0, %1, %2\n\tsel %0, %3, %4"                      \
+                    : "=&r"(rr_) : "r"(dd_), "r"(zp_), "r"(dd_), "r"(vv_)      \
+                    : "cc");                                                   \
+    PpuWr32(dstz + (i), rr_);                                                  \
+  } while (0)
+#define PPU_SIMD_TILE_4BPP() do {                                              \
+    uint32 zz = (uint32)z | (uint32)z << 16;                                   \
+    if (tile & 0x4000) {                                                       \
+      PPU_SIMD_PAIR(0, 0, 4);   PPU_SIMD_PAIR(2, 8, 12);                       \
+      PPU_SIMD_PAIR(4, 16, 20); PPU_SIMD_PAIR(6, 24, 28);                      \
+    } else {                                                                   \
+      PPU_SIMD_PAIR(0, 28, 24); PPU_SIMD_PAIR(2, 20, 16);                      \
+      PPU_SIMD_PAIR(4, 12, 8);  PPU_SIMD_PAIR(6, 4, 0);                        \
+    }                                                                          \
+  } while (0)
+enum { kOne16 = 0x00010001 };
+#endif
 #ifndef SNES_PPU_PIPELINE
 #define SNES_PPU_PIPELINE 0
 #endif
@@ -1741,6 +1802,9 @@ static void PpuDrawBackground_4bpp(Ppu *ppu, uint y, bool sub, uint layer, PpuZb
         PPU_ABLATE_KEEP_BITS(bits);
         uint32 chunky = PpuDecode4bpp(bits);
         z += ((tile & 0x1c00) >> kPaletteShift);
+#if SNES_PPU_SIMD_PIXELS
+        PPU_SIMD_TILE_4BPP();
+#else
         if (tile & 0x4000) {
           DO_CHUNKY_PIXEL(0); DO_CHUNKY_PIXEL(1); DO_CHUNKY_PIXEL(2); DO_CHUNKY_PIXEL(3);
           DO_CHUNKY_PIXEL(4); DO_CHUNKY_PIXEL(5); DO_CHUNKY_PIXEL(6); DO_CHUNKY_PIXEL(7);
@@ -1748,6 +1812,7 @@ static void PpuDrawBackground_4bpp(Ppu *ppu, uint y, bool sub, uint layer, PpuZb
           DO_CHUNKY_PIXEL_HFLIP(0); DO_CHUNKY_PIXEL_HFLIP(1); DO_CHUNKY_PIXEL_HFLIP(2); DO_CHUNKY_PIXEL_HFLIP(3);
           DO_CHUNKY_PIXEL_HFLIP(4); DO_CHUNKY_PIXEL_HFLIP(5); DO_CHUNKY_PIXEL_HFLIP(6); DO_CHUNKY_PIXEL_HFLIP(7);
         }
+#endif
       }
       dstz += 8, w -= 8;
     }
