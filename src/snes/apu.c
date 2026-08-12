@@ -95,8 +95,20 @@ void apu_cycle(Apu* apu) {
   /* ABLATION, WRONG OUTPUT ON PURPOSE. Deletes the SPC700 and the DSP so the
    * device can price the whole APU chain the same way the background draw was
    * priced. Audio is silence and the emulated machine loses its sound CPU; the
-   * frame counter is the only valid reading. Diagnostic, never shippable. */
-  (void)apu;
+   * frame counter is the only valid reading. Diagnostic, never shippable.
+   *
+   * This was recorded as UNMEASURABLE -- "the game never gets past the boot
+   * handshake" -- and that is not what stops it. The caller drains the DSP with
+   * `while (dsp->sampleOffset < 534) apu_cycle(apu);`, so an apu_cycle that
+   * returns without advancing sampleOffset does not hang the GAME, it hangs
+   * that loop, on the first frame, forever. Advance the counter and the whole
+   * chain prices like any other block. (Resuming from a savestate also puts the
+   * handshake in the past, so neither objection survives.) The drain loop is
+   * stopped at its own call site in main_snes.c, not faked here: incrementing
+   * sampleOffset from inside apu_cycle makes the loop call apu_cycle 534 times
+   * (harmless when the whole APU is gone) or 17,088 times (when only the DSP
+   * is, because the SPC still runs) -- and that second case measured the DSP as
+   * COSTING 1.5 fps to delete. */
   return;
 #endif
   if(apu->cpuCyclesLeft == 0) {
@@ -195,6 +207,16 @@ static int apu_idleSkipCycles(Apu* apu, int budget) {
  * DSP branch every single cycle; an opcode already told us its whole cost. Cycle-exact:
  * the framebuffer/WRAM/SRAM state hash is bit-identical to the per-cycle loop. */
 void apu_run(Apu* apu, int cyclesToRun) {
+#if SNES_ABLATE_APU
+  /* ABLATION, WRONG OUTPUT ON PURPOSE -- and the guard has to be HERE as well
+   * as in apu_cycle. dsp_cycle has two callers and this is the one the frame
+   * loop drives (snes_catchupApu -> apu_run); guarding only apu_cycle deleted
+   * about a third of the chain and priced the whole APU at +1.62 fps, which is
+   * the "check what the ablation COMPILES to, not what its name says" trap in
+   * its purest form. Both doors, or the number is a lie. */
+  (void)apu; (void)cyclesToRun;
+  return;
+#endif
   while (cyclesToRun > 0) {
     int step;
     bool idle = false;
