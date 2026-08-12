@@ -1641,6 +1641,7 @@ uint32_t g_bg_pass[2], g_bg_tile[2], g_bg_tile_blank[2], g_spr_pass, g_render_li
 uint32_t g_tile_full[2], g_tile_mixed[2];
 uint32_t g_tile_flat[2], g_tile_opq_z[2];
 uint32_t g_t2_full[2], g_t2_mixed[2];
+uint32_t g_fir_ticks, g_fir_taps;   /* dsp.c's echo FIR census lives with the rest */
 uint64_t g_tile_opaque_px[2];
 /* The one that decides whether a shared decode is even possible: when the sub
  * pass draws layer N, was layer N also drawn on the main screen? hScroll and
