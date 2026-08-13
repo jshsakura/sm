@@ -73,6 +73,10 @@ typedef struct {
 
 extern SpinBake g_bake;
 
+#ifndef SNES_BAKE_NO_DMA_REENTRY
+#define SNES_BAKE_NO_DMA_REENTRY 0
+#endif
+
 #ifndef SNES_BAKE_BLIND_REPLAY
 #define SNES_BAKE_BLIND_REPLAY 0
 #endif

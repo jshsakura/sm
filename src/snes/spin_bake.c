@@ -2,6 +2,7 @@
  * cartridge image and install it. Nothing here is on any hot path. */
 #include "spin_bake.h"
 #include "cart.h"
+#include "dma.h"
 
 #ifndef SNES_BAKE_NO_INSTALL
 #define SNES_BAKE_NO_INSTALL 0
@@ -88,7 +89,19 @@ int spin_bake_run_span(Snes *s, Cpu *cpu, int dots) {
    * correctly parked it. Entering mid-opcode is the common case, not an edge. */
   for (;;) {
     if (dots <= 0) return dots;
-    if (s->dma->dmaBusy || s->dma->hdmaTimer > 0) return dots;
+    if (s->dma->dmaBusy || s->dma->hdmaTimer > 0) {
+      /* Run the burst here rather than handing the span back. Returning meant
+       * run_dots had to re-test the pc when the burst ended, and that test --
+       * on every DMA cycle, reaching into g_bake -- cost 1.1% of Super
+       * Metroid, a cartridge with no match in it at all. Handling DMA here
+       * deletes the test instead of making it cheaper, and A Link to the Past's
+       * rain (HDMA every scanline) keeps its replay across the burst. Copied
+       * from run_dots line for line; the hash gate is what proves it. */
+      dma_cycle(s->dma);
+      s->apuDotsAccum += 2;
+      s->hPos += 2; dots -= 2;
+      continue;
+    }
 
     if (s->cpuCyclesLeft == 0) {
       if (cpu->nmiWanted || cpu->irqWanted || cpu->waiting || cpu->stopped) return dots;
