@@ -244,7 +244,7 @@ bool spin_bake_scan(Snes *snes) {
   return false;
 #endif
 
-  const Cart *cart = snes->cart;
+  Cart *cart = snes->cart;
   if (!cart || !cart->rom || cart->romSize < 4) return false;
   const uint8_t *rom = cart->rom;
 
@@ -255,6 +255,21 @@ bool spin_bake_scan(Snes *snes) {
     uint16_t addr;
     if (!map_offset(cart->type, off, &bank, &addr)) continue;
     if (addr > 0xfffb) continue;         /* the BEQ's operand must not wrap */
+
+    /* Verify the mapping through the cart's own reader, not through the
+     * offset arithmetic that produced it.
+     *
+     * map_offset() knows LoROM and HiROM. The library has carts this project
+     * loads whose mapping it does not know, and on one of those a wrong pc is
+     * not a missed optimisation -- it is a pc where OTHER code lives, and this
+     * would execute LDA dp / BEQ in place of whatever is really there. Asking
+     * cart_read() closes that by construction: if the CPU fetching this address
+     * does not see the four bytes, nothing is installed. */
+    if (cart_read(cart, bank, addr)              != 0xa5 ||
+        cart_read(cart, bank, (uint16_t)(addr+1)) != rom[off + 1] ||
+        cart_read(cart, bank, (uint16_t)(addr+2)) != 0xf0 ||
+        cart_read(cart, bank, (uint16_t)(addr+3)) != 0xfc)
+      continue;
 
     g_bake.sites++;
     if (g_bake.on) continue;             /* first match wins; count the rest */
