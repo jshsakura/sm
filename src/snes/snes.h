@@ -56,7 +56,31 @@ typedef struct Snes Snes;
  * of the same banks, so every data read evicted the fetch page. Removing the
  * install fixed the thrash and FF6 still lost -- so the cost is the branch
  * itself, in the hottest function in ITCM, which is the shape this core has
- * lost to every time. It needs a two-entry cache, or nothing. */
+ * lost to every time.
+ *
+ * =2 IS THAT DIAGNOSIS, TESTED: the same serve, with the test moved out of ITCM
+ * into snes_read() -- the overlay call that was already happening. snes_cpuRead
+ * is then byte-for-byte what it is at =0 (disassembled from both; only branch
+ * targets move). Rig, 23 cartridges, every hash bit-identical:
+ *
+ *   Final Fantasy VI  -3.4%   Dark Law          -2.2%
+ *   Chrono Trigger    -1.6%   JB The Super Bass -1.4%
+ *   Seiken Densetsu 2 -1.1%   every LoROM cart  within +-0.03%
+ *
+ * The LoROM penalty is gone, which is what the diagnosis predicted. But =2
+ * taxes the cartridges that cannot be page-cached AT ALL -- a dump whose size
+ * is not a multiple of 64 KB, where romPageOk is 0 and bankLowRom is all
+ * zeroes. Every read on such a cart is a slow read, so it pays the test ~34,000
+ * times a frame and never collects: Jim Power +1.7%, JoJo's Bizarre Adventure
+ * +2.2%.
+ *
+ * The way out of that is not a cheaper test, it is making those carts
+ * cacheable: a 512-entry table keyed by 8 KB PAGE rather than by bank would
+ * fold at page granularity and could mark the individual straddling pages
+ * uncacheable. Not built.
+ *
+ * Nothing here is on by default until it has a device measurement -- =1's
+ * instruction count preferred it and the console did not. */
 #ifndef SNES_ROMPAGE_LOW
 #define SNES_ROMPAGE_LOW 0
 #endif
