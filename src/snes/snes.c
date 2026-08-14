@@ -557,6 +557,26 @@ uint8_t snes_read(Snes* snes, uint32_t adr) {
       return dma_read(snes->dma, adr); // dma registers
     }
   }
+#if SNES_ROMPAGE_LOW == 2
+  /* ROM below $8000 -- half of every HiROM bank, LoROM's $40-$7d -- served from
+   * the bank table HERE rather than in snes_cpuRead.
+   *
+   * SNES_ROMPAGE_LOW=1 puts the same test in snes_cpuRead, which is in ITCM and
+   * is the hottest function in the core; that version gains Chrono Trigger 21%
+   * of its drawn frames and LOSES Final Fantasy VI 5.5% of its, because a
+   * cartridge that rarely collects still pays the branch on every slow read.
+   * This variant costs snes_cpuRead nothing at all: it is one test in the
+   * overlay function that was already being called, and it saves cart_read's
+   * dispatch plus cart_read{Lo,Hi}rom's SRAM/DSP/mapper chain rather than the
+   * whole call. Less upside, no ITCM cost -- which is the trade this core has
+   * historically wanted. */
+  {
+    Cart* c = snes->cart;
+    if(c->bankLowRom[bank])
+      return (c->type == 1) ? c->bankBase[bank & 0x7f][adr & 0x7fff]
+                            : c->bankBase[bank & 0x3f][adr];
+  }
+#endif
   // read from cart
   return cart_read(snes->cart, bank, adr);
 }

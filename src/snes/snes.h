@@ -60,7 +60,7 @@ typedef struct Snes Snes;
 #ifndef SNES_ROMPAGE_LOW
 #define SNES_ROMPAGE_LOW 0
 #endif
-#if SNES_ROMPAGE_LOW && SNES_ROMPAGE_FOLD
+#if SNES_ROMPAGE_LOW == 1 && SNES_ROMPAGE_FOLD
 #define SNES_BANK_LOW_ROM(cart, bank) ((cart)->bankLowRom[(bank)])
 #else
 #define SNES_BANK_LOW_ROM(cart, bank) 0
