@@ -122,13 +122,20 @@ void cart_setRomSize(Cart* cart, int size) {
    * and was told NULL again every time: +1.8% instructions a frame on one such
    * dump. Ask once.
    *
-   * 64 KB, not 8 KB: the bank-base table is built once per bank, so the fold
-   * has to be linear across a whole HiROM bank, which needs every chunk of the
-   * decomposition -- and so the lowest set bit of romSize -- to be at least
-   * that. Every real cartridge is a multiple of 64 KB; a dump whose copier
-   * header the loader strips is not, and keeps the slow path. */
+   * A whole number of BANKS, because the bank-base table is built once per
+   * bank: the fold has to be linear across one, which needs every chunk of its
+   * decomposition -- and so the lowest set bit of romSize -- to be at least a
+   * bank wide.
+   *
+   * A HiROM bank is 64 KB and a LoROM bank is 32 KB, and that difference is not
+   * academic: demanding 64 KB of both took the cache away from a 32 KB LoROM
+   * cart, which is a cart that HAD one before any of this work (romMask is set
+   * for any power of two). 2,069 of the 2,074 cartridges in the reference
+   * library qualify; the five that do not are dumps carrying a 512-byte
+   * remainder, and they keep the slow path. */
+  const uint32_t bankGran = (cart->type == 2) ? 0xffffu : 0x7fffu;
   cart->romPageOk = (cart->rom != NULL && size > 0 &&
-                     ((uint32_t)size & 0xffffu) == 0 &&
+                     ((uint32_t)size & bankGran) == 0 &&
                      (cart->type == 1 || cart->type == 2)) ? 1 : 0;
   /* Tables here too, so a caller that only ever sets the size (main_sm.c,
    * the sm harness) still gets a consistent cart. cart_load() calls this
