@@ -32,6 +32,39 @@ typedef struct Snes Snes;
 #else
 #define SNES_ROM_PAGE_OK(cart) ((cart)->romMask)
 #endif
+
+/* SNES_ROMPAGE_LOW=1 also serves $0000-$7fff of the banks where that is ROM --
+ * half of every HiROM bank, and all of LoROM's $40-$7d -- straight out of the
+ * bank table, from the point where the $8000 test has already failed.
+ *
+ * OFF BY DEFAULT, by device measurement, and the numbers are worth keeping
+ * because the instruction count says the opposite. Rig, 1200 frames, hashes
+ * bit-identical throughout: Final Fantasy VI -4.5%, Chrono Trigger -2.0%,
+ * Seiken Densetsu 2 -0.8%, Dark Law -2.6% instructions a frame -- and Super
+ * Metroid +1.1%, Zelda 3 +0.8%, because a LoROM cart pays the test on every
+ * slow read and almost never collects.
+ *
+ * On hardware, savestate play scenes, bracketed:
+ *
+ *   Chrono Trigger   58.06 -> 60.45 emulated fps, 20.0 -> 24.3 drawn (+21%)
+ *   Final Fantasy VI 58.00 -> 55.80 emulated fps, 14.8 -> 14.0 drawn (-5.5%)
+ *   A Link to the Past 61.66 -> 61.40,            21.2 -> 21.0 drawn (-1%)
+ *
+ * Two of three lose. An earlier variant that also INSTALLED a page tag for
+ * those reads was worse still on FF6 (-6.5% drawn) while Chrono gained 36%: one
+ * cache entry, the opcode stream at $8000+, and FF6's data in the bottom half
+ * of the same banks, so every data read evicted the fetch page. Removing the
+ * install fixed the thrash and FF6 still lost -- so the cost is the branch
+ * itself, in the hottest function in ITCM, which is the shape this core has
+ * lost to every time. It needs a two-entry cache, or nothing. */
+#ifndef SNES_ROMPAGE_LOW
+#define SNES_ROMPAGE_LOW 0
+#endif
+#if SNES_ROMPAGE_LOW && SNES_ROMPAGE_FOLD
+#define SNES_BANK_LOW_ROM(cart, bank) ((cart)->bankLowRom[(bank)])
+#else
+#define SNES_BANK_LOW_ROM(cart, bank) 0
+#endif
 #if SNES_DSP_FASTPATH
 #define SNES_DSP_LOROM_WINDOW(cart, bank) \
   ((cart)->dsp1 && (cart)->type == 1 && (uint8_t)(((bank) & 0x7f) - 0x30) < 0x10u)

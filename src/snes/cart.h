@@ -29,6 +29,11 @@ struct Cart {
    * in snes_cpuRead is a table load and an add -- no romMask, no cart_fold(),
    * and above all no CALL inside the ITCM bus reader. */
   uint8_t* bankBase[128];
+  /* Per RAW bank: is $0000-$7fff of it ROM? Half of every HiROM bank is, and
+   * so is all of LoROM's $40-$7d, but snes_cpuRead's fast path only ever
+   * claimed $8000 and up. Indexed by the unmasked bank because the SRAM decode
+   * that has to be carved out of it is written against the unmasked bank. */
+  uint8_t bankLowRom[256];
   uint8_t* ram;
   uint32_t ramSize;
 

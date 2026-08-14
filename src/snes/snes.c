@@ -657,6 +657,18 @@ uint8_t snes_cpuRead(Snes* snes, uint32_t adr) {
 #ifdef RIG_CALL_PROFILE
     g_cpuRead_romhit++;
 #endif
+#ifdef SNES_ROMPAGE_VERIFY
+    {
+      uint8_t want = snes_read(snes, adr);
+      uint8_t got  = snes->romPageBase[adr & 0x1fff];
+      if (want != got) {
+        static int nh = 0;
+        if (nh++ < 40)
+          printf("ROMPAGE HIT MISMATCH adr=%06lx fast=%02x slow=%02x tag=%06lx\n",
+                 (unsigned long)adr, got, want, (unsigned long)snes->romPageTag);
+      }
+    }
+#endif
     return snes->romPageBase[adr & 0x1fff];
   }
   uint8_t bank = adr >> 16;
@@ -712,8 +724,63 @@ uint8_t snes_cpuRead(Snes* snes, uint32_t adr) {
 #ifdef RIG_CALL_PROFILE
     g_cpuRead_romhit++;
 #endif
+#ifdef SNES_ROMPAGE_VERIFY
+    /* The fast path is a claim about what cart_read would have answered. Check
+     * it against the thing it is short-circuiting, on the install (so once per
+     * page, not once per read) -- a mismatch is a mis-decoded bank, and it
+     * prints the address rather than showing up as a changed STATEHASH days
+     * later. Diagnostic build only. */
+    {
+      uint8_t want = snes_read(snes, adr);
+      uint8_t got  = base[adr & 0x1fff];
+      if (want != got) {
+        static int n = 0;
+        if (n++ < 40)
+          printf("ROMPAGE MISMATCH adr=%06lx bank=%02x off=%04x fast=%02x slow=%02x "
+                 "type=%d romSize=%lu ramSize=%lu lowRom=%d\n",
+                 (unsigned long)adr, bank, off, got, want, cart->type,
+                 (unsigned long)cart->romSize, (unsigned long)cart->ramSize,
+                 (int)cart->bankLowRom[bank]);
+      }
+    }
+#endif
     return base[adr & 0x1fff];
   }
+#if SNES_ROMPAGE_LOW
+  /* ROM below $8000 -- half of every HiROM bank, and LoROM's $40-$7d. Served
+   * from the bank table directly, and deliberately WITHOUT installing a page
+   * tag.
+   *
+   * The first version did install one, which is what a cache is for, and Final
+   * Fantasy VI got 6.5% SLOWER on hardware while Chrono Trigger got 36% faster
+   * -- both HiROM, both on the same code. There is one page-cache entry, the
+   * opcode stream lives at $8000 and up, and FF6 reads its data out of the
+   * bottom half of the same banks: every data read evicted the fetch page and
+   * the next fetch had to reinstall it. Not installing removes the thrash and
+   * keeps the win, because the bank table alone already replaces the whole
+   * snes_read -> cart_read -> cart_read{Lo,Hi}rom chain with a load and an add. */
+  if(SNES_BANK_LOW_ROM(cart, bank)) {
+#ifdef RIG_CALL_PROFILE
+    g_cpuRead_romhit++;
+#endif
+    uint8_t got = (cart->type == 1) ? cart->bankBase[bank & 0x7f][off & 0x7fff]
+                                    : cart->bankBase[bank & 0x3f][off];
+#ifdef SNES_ROMPAGE_VERIFY
+    {
+      uint8_t want = snes_read(snes, adr);
+      if (want != got) {
+        static int nl = 0;
+        if (nl++ < 40)
+          printf("ROMPAGE LOW MISMATCH adr=%06lx bank=%02x off=%04x fast=%02x "
+                 "slow=%02x type=%d ramSize=%lu\n",
+                 (unsigned long)adr, bank, off, got, want, cart->type,
+                 (unsigned long)cart->ramSize);
+      }
+    }
+#endif
+    return got;
+  }
+#endif
 #ifdef RIG_CALL_PROFILE
   g_cpuRead_slow++;
 #endif

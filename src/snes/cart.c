@@ -57,33 +57,58 @@ static inline uint32_t cart_romIndex(Cart* cart, uint32_t addr) {
   return cart_fold(addr, (uint32_t)cart->romSize);
 }
 
-/* The host address snes_cpuRead's fetch-page cache should serve an 8 KB page
- * from, or NULL if this cartridge cannot be page-cached at all.
+/* snes_cpuRead's fetch-page cache used to require cart->romMask -- a
+ * power-of-two ROM -- because that is the only size whose index is one AND.
+ * Every other size fell through to snes_read() -> cart_read() ->
+ * cart_readLorom(), four calls and a full classification chain, on EVERY
+ * opcode fetch. "Every other size" is not exotic: a 24 Mbit cartridge is 3 MB,
+ * and Super Metroid took the slow path for 30,463 of its 34,314 bus reads a
+ * frame.
  *
- * That cache used to require cart->romMask -- a power-of-two ROM -- because
- * that is the only size whose index is one AND. Every other size fell through
- * to snes_read() -> cart_read() -> cart_readLorom(), four calls and a full
- * classification chain, on EVERY opcode fetch. "Every other size" is not
- * exotic: a 24 Mbit cartridge is 3 MB. Super Metroid took the slow path for
- * 30,463 of its 34,314 bus reads a frame, and its interpreter measured 42.3%
- * of the device frame.
+ * cart_romIndex() already folds a non-power-of-two ROM, and the fold is
+ * piecewise linear in chunks that are powers of two no smaller than the lowest
+ * set bit of romSize. So the base of each BANK can be precomputed once and the
+ * offset added -- which is cheaper than the mask it replaces, and works for any
+ * size. That is what these two tables are.
  *
- * cart_romIndex() already folds a non-power-of-two ROM. The fold is piecewise
- * linear in chunks that are powers of two no smaller than the lowest set bit of
- * romSize, so if the ROM is a whole number of 8 KB pages then a page cannot
- * straddle a chunk boundary and one base pointer serves all of it -- the same
- * argument the power-of-two case already rests on. A cart that is not (there
- * are none in practice) keeps the slow path by returning NULL. */
+ * Which banks have ROM below $8000, transcribed from cart_read{Lo,Hi}rom's own
+ * decode rather than re-derived. The fast path used to require adr >= $8000,
+ * which is the whole of a LoROM bank but only HALF of a HiROM one -- so a HiROM
+ * cartridge fetched half its opcodes through the slow path no matter what.
+ *
+ * The banks that must NOT be claimed are the ones something else decodes:
+ * $00-$3f/$80-$bf below $8000 is WRAM and MMIO; LoROM SRAM sits at $70-$7d and
+ * $f0-$ff; HiROM SRAM (and its DSP window) at $00-$3f, $6000-$7fff -- all of
+ * which are below $40 after masking and so already excluded. */
+static void cart_buildBankLowRom(Cart* cart) {
+  for(int raw = 0; raw < 256; raw++) {
+    uint8_t b7 = (uint8_t)(raw & 0x7f);
+    uint8_t ok = 0;
+    if(raw != 0x7e && raw != 0x7f) {            /* WRAM banks, decoded earlier */
+      if(cart->type == 1) {
+        int isSram = (((raw >= 0x70 && raw < 0x7e) || raw >= 0xf0) &&
+                      cart->ramSize > 0);
+        ok = (!isSram && b7 >= 0x40) ? 1 : 0;
+      } else if(cart->type == 2) {
+        ok = (b7 >= 0x40) ? 1 : 0;
+      }
+    }
+    cart->bankLowRom[raw] = cart->romPageOk ? ok : 0;
+  }
+}
+
 static void cart_buildBankBases(Cart* cart) {
   for(int b = 0; b < 128; b++) cart->bankBase[b] = cart->rom;
-  if(!cart->romPageOk) return;
-  if(cart->type == 1) {
-    for(int b = 0; b < 128; b++)
-      cart->bankBase[b] = cart->rom + cart_romIndex(cart, (uint32_t)b << 15);
-  } else {
-    for(int b = 0; b < 64; b++)
-      cart->bankBase[b] = cart->rom + cart_romIndex(cart, (uint32_t)b << 16);
+  if(cart->romPageOk) {
+    if(cart->type == 1) {
+      for(int b = 0; b < 128; b++)
+        cart->bankBase[b] = cart->rom + cart_romIndex(cart, (uint32_t)b << 15);
+    } else {
+      for(int b = 0; b < 64; b++)
+        cart->bankBase[b] = cart->rom + cart_romIndex(cart, (uint32_t)b << 16);
+    }
   }
+  cart_buildBankLowRom(cart);
 }
 
 void cart_setRomSize(Cart* cart, int size) {
@@ -93,11 +118,11 @@ void cart_setRomSize(Cart* cart, int size) {
    * answer cannot change -- one load and a branch, exactly what the
    * `cart->romMask` test it replaces already cost.
    *
-   * A cart that is not a whole number of 8 KB pages cannot be page-cached (a
-   * dump whose copier header the loader strips leaves 0x7fe00, for instance).
-   * Without this flag such a cart calls cart_pageBase() on every read to be
-   * told NULL again: measured at +1.8% instructions a frame on one. */
-  /* 64 KB, not 8 KB: the bank-base table is built once per bank, so the fold
+   * An earlier version asked a helper per read whether the cart was cacheable
+   * and was told NULL again every time: +1.8% instructions a frame on one such
+   * dump. Ask once.
+   *
+   * 64 KB, not 8 KB: the bank-base table is built once per bank, so the fold
    * has to be linear across a whole HiROM bank, which needs every chunk of the
    * decomposition -- and so the lowest set bit of romSize -- to be at least
    * that. Every real cartridge is a multiple of 64 KB; a dump whose copier
@@ -105,6 +130,10 @@ void cart_setRomSize(Cart* cart, int size) {
   cart->romPageOk = (cart->rom != NULL && size > 0 &&
                      ((uint32_t)size & 0xffffu) == 0 &&
                      (cart->type == 1 || cart->type == 2)) ? 1 : 0;
+  /* Tables here too, so a caller that only ever sets the size (main_sm.c,
+   * the sm harness) still gets a consistent cart. cart_load() calls this
+   * BEFORE it assigns cart->ramSize, so it rebuilds them at the end -- see
+   * the comment there; that ordering is what made bank $70 read as ROM. */
   cart_buildBankBases(cart);
 }
 
@@ -123,6 +152,12 @@ Cart* cart_init(Snes* snes) {
   cart->ram = NULL;
   cart->ramSize = 0;
   cart->dsp1 = NULL;
+  /* malloc'd, and on the device the DTCM heap is not zeroed -- an uninitialised
+   * romPageOk would send snes_cpuRead through a bankBase[] full of garbage
+   * before the first cart_load(). */
+  cart->romPageOk = 0;
+  memset(cart->bankLowRom, 0, sizeof(cart->bankLowRom));
+  for(int b = 0; b < 128; b++) cart->bankBase[b] = NULL;
   return cart;
 }
 
@@ -191,6 +226,13 @@ void cart_load(Cart* cart, int type, uint8_t* rom, int romSize, int ramSize) {
     cart->ram = NULL;
   }
   cart->ramSize = ramSize;
+  /* AFTER ramSize. cart_setRomSize() above built the bank tables, and
+   * cart_buildBankLowRom() has to know whether banks $70-$7d are SRAM -- which
+   * at that point they were not, because cart->ramSize was still whatever the
+   * previous cartridge left. Super Metroid then served its 8 KB save RAM out of
+   * the ROM page cache and locked up around frame 400, with the fast path
+   * answering 0xcc where the bus says 0x00. */
+  cart_buildBankBases(cart);
 #else
   if(cart->rom != NULL) free(cart->rom);
   if(cart->ram != NULL) free(cart->ram);
@@ -204,6 +246,7 @@ void cart_load(Cart* cart, int type, uint8_t* rom, int romSize, int ramSize) {
   }
   cart->ramSize = ramSize;
   memcpy(cart->rom, rom, romSize);
+  cart_buildBankBases(cart);   /* AFTER ramSize -- see the device branch above */
 #endif
 }
 
