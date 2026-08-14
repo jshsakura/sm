@@ -245,7 +245,36 @@ void snes_handle_pos_stuff(Snes *snes) {
  * V-timer — so take the dot loop only when one is actually armed. The events,
  * their order, and the state they leave behind are identical either way. */
 void snes_run_line(Snes *snes) {
+#ifdef SNES_LINE_HIRQ_FORCE
+  /* Test-only: arm the H-timer so a harness whose window never reaches a raster
+   * split still drives the branch below. Applied identically in both arms of an
+   * A/B, so it changes what the game does and not which implementation is
+   * right. Super Metroid's cold-boot window arms no timer in 157,200 lines,
+   * which is why this exists. */
+  snes->hIrqEnabled = true;
+  snes->hTimer = (SNES_LINE_HIRQ_FORCE);
+#endif
+#if defined(GNW_SNES_CORE) || !SNES_LINE_HIRQ
   if (snes->hIrqEnabled || snes->hPos != 0) {
+#else
+  /* The port does not need the dot loop when an H-timer is armed, because for
+   * the port the dot loop cannot do anything this function does not.
+   *
+   * snes_handle_pos_stuff()'s H/V timer block is `#ifdef GNW_SNES_CORE`, and the
+   * native ports do not define it -- their reimplementation raises its own IRQ
+   * (main_sm.c calls Vector_IRQ() off vIrqEnabled). So with an H-timer armed the
+   * fallback walks 682 dots to perform exactly the three events below.
+   *
+   * Super Metroid arms one for its status-bar raster split, so its port took
+   * that walk on every line of every frame: a device PC sample put
+   * snes_handle_pos_stuff at 27.8% and snes_run_line at 26.6% -- the event
+   * scheduler was 54.4% of a port that has no interpreter at all.
+   *
+   * The SNES core keeps the old condition; it does define GNW_SNES_CORE, its
+   * dot loop really does raise timer IRQs, and it does not call this function
+   * anyway (it runs run_frame_events/run_dots in main_snes.c). */
+  if (snes->hPos != 0) {
+#endif
     do { snes_handle_pos_stuff(snes); } while (snes->hPos != 0);
     return;
   }

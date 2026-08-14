@@ -17,6 +17,15 @@ typedef struct Snes Snes;
  * SNES_DSP_FASTPATH=1 takes it out with one test, evaluated only where a page
  * tag is installed. =0 is the old way: clear cart->romMask, which takes the
  * fast path away from the whole cartridge. Kept as the A/B arm. */
+/* SNES_LINE_HIRQ=1 lets snes_run_line() keep its fast path when an H-timer is
+ * armed, by splitting the line at the one dot the timer matches instead of
+ * handing the whole line back to the dot loop. Only the native ports call
+ * snes_run_line (Core/Src/porting/sm/main_sm.c); the SNES core runs
+ * run_frame_events/run_dots and is untouched either way. */
+#ifndef SNES_LINE_HIRQ
+#define SNES_LINE_HIRQ 1
+#endif
+
 #ifndef SNES_DSP_FASTPATH
 #define SNES_DSP_FASTPATH 1
 #endif
