@@ -21,6 +21,14 @@ struct Cart {
   uint8_t* rom;
   uint32_t romSize;
   uint32_t romMask;   /* nonzero only when romSize is a power of 2 (fast path) */
+  /* Whether snes_cpuRead's fetch-page cache can serve this cart at all.
+   * Decided once at load so the hot path never re-asks; see cart_setRomSize. */
+  uint8_t romPageOk;
+  /* Host base of each mapped bank: LoROM indexes it by bank&0x7f in 32 KB
+   * steps, HiROM by bank&0x3f in 64 KB. Built once at load so the page install
+   * in snes_cpuRead is a table load and an add -- no romMask, no cart_fold(),
+   * and above all no CALL inside the ITCM bus reader. */
+  uint8_t* bankBase[128];
   uint8_t* ram;
   uint32_t ramSize;
 

@@ -10,6 +10,35 @@
 
 typedef struct Snes Snes;
 
+/* A LoROM DSP-1 board decodes the chip at banks $30-$3f (mirrored at $b0-$bf),
+ * $8000-$ffff. snes_cpuRead's ROM fast path and its fetch-page cache claim
+ * everything at $8000 and above, so that window has to come out of them.
+ *
+ * SNES_DSP_FASTPATH=1 takes it out with one test, evaluated only where a page
+ * tag is installed. =0 is the old way: clear cart->romMask, which takes the
+ * fast path away from the whole cartridge. Kept as the A/B arm. */
+#ifndef SNES_DSP_FASTPATH
+#define SNES_DSP_FASTPATH 1
+#endif
+/* SNES_ROMPAGE_FOLD=1 lets snes_cpuRead's fetch-page cache serve a cartridge
+ * whose size is not a power of two -- 3 MB, 1.5 MB, 2.5 MB, most of the real
+ * library. =0 is the old behaviour, where those carts had no cache and every
+ * opcode fetch walked snes_read -> cart_read -> cart_read{Lo,Hi}rom. */
+#ifndef SNES_ROMPAGE_FOLD
+#define SNES_ROMPAGE_FOLD 1
+#endif
+#if SNES_ROMPAGE_FOLD
+#define SNES_ROM_PAGE_OK(cart) ((cart)->romPageOk)
+#else
+#define SNES_ROM_PAGE_OK(cart) ((cart)->romMask)
+#endif
+#if SNES_DSP_FASTPATH
+#define SNES_DSP_LOROM_WINDOW(cart, bank) \
+  ((cart)->dsp1 && (cart)->type == 1 && (uint8_t)(((bank) & 0x7f) - 0x30) < 0x10u)
+#else
+#define SNES_DSP_LOROM_WINDOW(cart, bank) 0
+#endif
+
 #include "cpu.h"
 #include "apu.h"
 #include "dma.h"

@@ -678,17 +678,41 @@ uint8_t snes_cpuRead(Snes* snes, uint32_t adr) {
    * index differs. Power-of-2 ROMs (romMask set = the common case) index with one
    * AND; odd sizes fall to the folding slow path. */
   Cart* cart = snes->cart;
-  if(off >= 0x8000 && cart->romMask) {
+  /* A LoROM DSP board decodes the chip at banks $30-$3f (and their $b0-$bf
+   * mirrors), $8000-$ffff -- inside what this branch would otherwise claim as
+   * ROM. Excluding it here costs two loads and a compare, and only on the reads
+   * that INSTALL a page tag: a page hit returned above without reaching this.
+   * The alternative the code used to take was to clear cart->romMask for the
+   * whole cartridge, which cost every fetch the full slow path. See
+   * cart_attachDsp1(). */
+  if(off >= 0x8000 && SNES_ROM_PAGE_OK(cart) && !SNES_DSP_LOROM_WINDOW(cart, bank)) {
     uint32_t page = adr & ~(uint32_t)0x1fff;
+#if SNES_ROMPAGE_FOLD
+    /* One table load and an add. cart->bankBase[] already has the mapper and
+     * any non-power-of-two fold baked into it (cart_buildBankBases), so this
+     * serves a 3 MB cart exactly as cheaply as a 4 MB one -- and, unlike the
+     * shift/or/and it replaces, it does not need cart->romMask at all.
+     *
+     * It must not be a CALL. An earlier version asked cart_pageBase() for the
+     * folded base right here, and merely having that call in the ITCM bus
+     * reader cost 1.4% of A Link to the Past's frame -- a cartridge that never
+     * takes the branch -- because every caller-saved register is clobbered
+     * across it. Same lesson as the memcpy in EarthBound's scroll. */
+    uint8_t* base = (cart->type == 1)
+      ? cart->bankBase[bank & 0x7f] + (page & 0x7fff)
+      : cart->bankBase[bank & 0x3f] + (page & 0xffff);
+#else
     uint32_t pidx = (cart->type == 1)
       ? (((uint32_t)((page >> 16) & 0x7f) << 15) | (page & 0x7fff))  /* LoROM */
       : (((uint32_t)((page >> 16) & 0x3f) << 16) | (page & 0xffff)); /* HiROM */
-    snes->romPageBase = cart->rom + (pidx & cart->romMask);
+    uint8_t* base = cart->rom + (pidx & cart->romMask);
+#endif
+    snes->romPageBase = base;
     snes->romPageTag = page;
 #ifdef RIG_CALL_PROFILE
     g_cpuRead_romhit++;
 #endif
-    return snes->romPageBase[adr & 0x1fff];
+    return base[adr & 0x1fff];
   }
 #ifdef RIG_CALL_PROFILE
   g_cpuRead_slow++;

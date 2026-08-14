@@ -57,9 +57,55 @@ static inline uint32_t cart_romIndex(Cart* cart, uint32_t addr) {
   return cart_fold(addr, (uint32_t)cart->romSize);
 }
 
+/* The host address snes_cpuRead's fetch-page cache should serve an 8 KB page
+ * from, or NULL if this cartridge cannot be page-cached at all.
+ *
+ * That cache used to require cart->romMask -- a power-of-two ROM -- because
+ * that is the only size whose index is one AND. Every other size fell through
+ * to snes_read() -> cart_read() -> cart_readLorom(), four calls and a full
+ * classification chain, on EVERY opcode fetch. "Every other size" is not
+ * exotic: a 24 Mbit cartridge is 3 MB. Super Metroid took the slow path for
+ * 30,463 of its 34,314 bus reads a frame, and its interpreter measured 42.3%
+ * of the device frame.
+ *
+ * cart_romIndex() already folds a non-power-of-two ROM. The fold is piecewise
+ * linear in chunks that are powers of two no smaller than the lowest set bit of
+ * romSize, so if the ROM is a whole number of 8 KB pages then a page cannot
+ * straddle a chunk boundary and one base pointer serves all of it -- the same
+ * argument the power-of-two case already rests on. A cart that is not (there
+ * are none in practice) keeps the slow path by returning NULL. */
+static void cart_buildBankBases(Cart* cart) {
+  for(int b = 0; b < 128; b++) cart->bankBase[b] = cart->rom;
+  if(!cart->romPageOk) return;
+  if(cart->type == 1) {
+    for(int b = 0; b < 128; b++)
+      cart->bankBase[b] = cart->rom + cart_romIndex(cart, (uint32_t)b << 15);
+  } else {
+    for(int b = 0; b < 64; b++)
+      cart->bankBase[b] = cart->rom + cart_romIndex(cart, (uint32_t)b << 16);
+  }
+}
+
 void cart_setRomSize(Cart* cart, int size) {
   cart->romSize = size;
   cart->romMask = (size > 0 && (size & (size - 1)) == 0) ? (uint32_t)(size - 1) : 0;
+  /* Decided once, here, so snes_cpuRead's hot path never asks a question whose
+   * answer cannot change -- one load and a branch, exactly what the
+   * `cart->romMask` test it replaces already cost.
+   *
+   * A cart that is not a whole number of 8 KB pages cannot be page-cached (a
+   * dump whose copier header the loader strips leaves 0x7fe00, for instance).
+   * Without this flag such a cart calls cart_pageBase() on every read to be
+   * told NULL again: measured at +1.8% instructions a frame on one. */
+  /* 64 KB, not 8 KB: the bank-base table is built once per bank, so the fold
+   * has to be linear across a whole HiROM bank, which needs every chunk of the
+   * decomposition -- and so the lowest set bit of romSize -- to be at least
+   * that. Every real cartridge is a multiple of 64 KB; a dump whose copier
+   * header the loader strips is not, and keeps the slow path. */
+  cart->romPageOk = (cart->rom != NULL && size > 0 &&
+                     ((uint32_t)size & 0xffffu) == 0 &&
+                     (cart->type == 1 || cart->type == 2)) ? 1 : 0;
+  cart_buildBankBases(cart);
 }
 
 static uint8_t cart_readLorom(Cart* cart, uint8_t bank, uint16_t adr);
@@ -85,10 +131,25 @@ void cart_attachDsp1(Cart* cart) {
   if (cart->dsp1) {
     dsp1_reset(cart->dsp1);
     /* LoROM boards decode the DSP at banks $30-$3f, $8000-$ffff — inside the
-     * range snes_cpuRead's ROM fast path would otherwise claim. Dropping the
-     * power-of-2 mask sends this cart down the slow path where our branch
-     * runs; every other cart keeps the fast path untouched. */
+     * range snes_cpuRead's ROM fast path claims.
+     *
+     * This used to read `if (cart->type == 1) cart->romMask = 0;`, which turned
+     * the fast path AND the fetch-page cache off for the WHOLE 24-bit bus so
+     * that sixteen banks would decode correctly. Every opcode fetch on every
+     * LoROM DSP cartridge then went snes_cpuRead -> snes_read -> cart_read ->
+     * cart_readLorom, four calls and a full classification chain, three of them
+     * out of ITCM into the RAM_EMU overlay. A device PC sample of Pilotwings
+     * charged cart_read 12.1% and snes_read 9.8% of the frame for it.
+     *
+     * snes_cpuRead excludes the window itself now, and it does the test only
+     * where a page tag is INSTALLED -- a page hit never sees it. HiROM DSP
+     * boards need nothing: their window is $00-$1f:6000-7fff, below the
+     * $8000 the fast path requires.
+     *
+     * SNES_DSP_FASTPATH=0 restores the old behaviour, for the A/B arm. */
+#if !SNES_DSP_FASTPATH
     if (cart->type == 1) cart->romMask = 0;
+#endif
   }
 }
 
