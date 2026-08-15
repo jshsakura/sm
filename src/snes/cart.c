@@ -312,7 +312,7 @@ static void cart_writeLorom(Cart* cart, uint8_t bank, uint16_t adr, uint8_t val)
     if (adr < 0xc000) dsp1_writeDR(cart->dsp1, val);
     return;
   }
-  if(((bank >= 0x70 && bank < 0x7e) || bank > 0xf0) && adr < 0x8000 && cart->ramSize > 0) {
+  if(((bank >= 0x70 && bank < 0x7e) || bank >= 0xf0) && adr < 0x8000 && cart->ramSize > 0) {
     // banks 70-7e and f0-ff, adr 0000-7fff
     cart->ram[(((bank & 0xf) << 15) | adr) & (cart->ramSize - 1)] = val;
   }
