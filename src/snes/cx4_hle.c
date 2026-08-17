@@ -199,6 +199,50 @@ static int16_t c4_cos(int step) {
     return c4_cos_rom[step & 0x1ff];
 }
 
+/* ---- Bounds ------------------------------------------------------------- */
+
+#define CX4_RAM_SIZE ((uint32_t)sizeof(((Cx4*)0)->ram))
+
+/* Every length below arrives from the register file, which is to say from the
+ * cartridge: a byte pair the game left in $1f43, or a width and height that
+ * only have to be plausible. Nothing in the encoding bounds them -- $1f43
+ * alone reaches 64 KB, and a 255x255 image asks for 32,512 bytes -- while the
+ * chip's RAM is 8 KB and that is exactly what we allocate, out of a heap the
+ * launcher shares. So a length is clamped to what the buffer can still hold
+ * before it reaches memset or memmove.
+ *
+ * This cannot move a legitimate value: the reference implementation's own
+ * debug build prints "Dest unusual!" when destination + length leaves $6c00,
+ * which is well inside the window. It only turns a heap corruption -- the kind
+ * that surfaces later, somewhere else, as a launcher fault -- into a short
+ * copy. */
+static uint32_t clamp_to_ram(uint32_t offset, uint32_t len) {
+    if (offset >= CX4_RAM_SIZE) return 0;
+    uint32_t room = CX4_RAM_SIZE - offset;
+    return len > room ? room : len;
+}
+
+/* The two image commands index RAM directly from a width and a height that are
+ * single register bytes, for the 4bpp source at $0600 and again for the planar
+ * output at $0000. 255x255 asks for four times the whole 8 KB. Nothing a
+ * cartridge legitimately does comes near the limit, so an image that does not
+ * fit is refused whole -- one test per frame, rather than a bounds check per
+ * pixel in the innermost loop of the only two commands that have one. */
+/* Left-shifting a negative value is undefined, and the chip's centers, offsets
+ * and sines are signed 16-bit quantities that are negative about half the
+ * time. Going through uint32_t, where the shift is defined, keeps exactly the
+ * bits the chip keeps -- so this changes no result, only whether the
+ * sanitizer that guards this file has to be turned off to run it. */
+static int32_t shl(int32_t v, unsigned n) {
+    return (int32_t)((uint32_t)v << n);
+}
+
+#define CX4_IMAGE_SRC 0x600u
+
+static int image_fits(unsigned w, unsigned h) {
+    return (uint32_t)w * (uint32_t)h / 2u <= CX4_RAM_SIZE - CX4_IMAGE_SRC;
+}
+
 /* ---- ROM window --------------------------------------------------------- */
 
 /* The chip sees the cartridge through a LoROM map: bank bit 7 is mirrored
@@ -211,7 +255,22 @@ static const uint8_t* rom_at(uint32_t addr) {
     uint32_t bank = (addr >> 16) & 0x7f;
     uint32_t off = addr & 0xffff;
     if (off >= 0x8000) off &= 0x7fff;
+    /* s_rom_size is the cart image and cannot be zero once cart_load has run,
+     * which is the only way the chip gets attached -- but the divide is one
+     * instruction away from the guest, so do not let it be the thing that
+     * proves it. */
+    if (s_rom_size == 0) return s_rom;
     return s_rom + (((bank << 15) | off) % s_rom_size);
+}
+
+/* Same window, for a run of bytes rather than one: shortens len so the read
+ * stays inside the image instead of walking off its end. */
+static const uint8_t* rom_span(uint32_t addr, uint32_t* len) {
+    const uint8_t* p = rom_at(addr);
+    if (s_rom_size == 0) { *len = 0; return p; }
+    uint32_t room = s_rom_size - (uint32_t)(p - s_rom);
+    if (*len > room) *len = room;
+    return p;
 }
 
 /* ---- Shared 3D transform ------------------------------------------------ */
@@ -397,16 +456,17 @@ static void cmd_scale_rotate(Cx4* cx4, int row_extra) {
 
     unsigned w = ram[0x1f89] & ~7u;
     unsigned h = ram[0x1f8c] & ~7u;
+    if (!image_fits(w, h)) return;
 
-    memset(ram, 0, ((w + row_extra / 4) * h) / 2);
+    memset(ram, 0, clamp_to_ram(0, ((w + row_extra / 4) * h) / 2));
 
     int32_t cx = rds16(ram + 0x1f83);
     int32_t cy = rds16(ram + 0x1f86);
 
     /* 12.20 stepping: the matrix entries carry their own fractional part, so
      * only the center needs an explicit <<12. */
-    int32_t line_x = (cx << 12) - cx * a - cx * b;
-    int32_t line_y = (cy << 12) - cy * c - cy * d;
+    int32_t line_x = shl(cx, 12) - cx * a - cx * b;
+    int32_t line_y = shl(cy, 12) - cy * c - cy * d;
 
     uint32_t x, y;
     uint8_t byte;
@@ -458,8 +518,15 @@ static void cmd_transform_lines(Cx4* cx4) {
     g.rz = ram[0x1f89];
     g.scale = ram[0x1f8c];
 
+    /* The vertex count is a 16-bit register and the walk is 16 bytes a step,
+     * so an unbounded count runs a megabyte past an 8 KB RAM. The list cannot
+     * be longer than the RAM that holds it. */
+    int n = rd16(ram + 0x1f80);
+    int n_max = (int)(CX4_RAM_SIZE / 0x10u);
+    if (n > n_max) n = n_max;
+
     uint8_t* v = ram;
-    for (int i = rd16(ram + 0x1f80); i > 0; i--, v += 0x10) {
+    for (int i = n; i > 0; i--, v += 0x10) {
         g.x = rds16(v + 1);
         g.y = rds16(v + 5);
         g.z = rds16(v + 9);
@@ -477,9 +544,15 @@ static void cmd_transform_lines(Cx4* cx4) {
     wr16(ram + 0x60a, 0x60);
     wr16(ram + 0x60d, 0x40);
 
+    /* Second 16-bit count, same shape: the output record is 8 bytes at $0600
+     * and up, so the last one has to land inside the RAM. */
+    int lines = rd16(ram + 0xb00);
+    int lines_max = (int)((CX4_RAM_SIZE - 0x600u - 8u) / 8u);
+    if (lines > lines_max) lines = lines_max;
+
     uint8_t* seg = ram + 0xb02;
     uint8_t* out = ram;
-    for (int i = rd16(ram + 0xb00); i > 0; i--, seg += 2, out += 8) {
+    for (int i = lines; i > 0; i--, seg += 2, out += 8) {
         int16_t x = rds16(ram + ((seg[0] << 4) + 1));
         int16_t y = rds16(ram + ((seg[0] << 4) + 5));
         int16_t x2 = rds16(ram + ((seg[1] << 4) + 1));
@@ -547,14 +620,24 @@ static void cmd_draw_segment(Cx4* cx4, int32_t x1, int32_t y1, int16_t z1,
  * "previous segment's end": a $ffff marker chains backwards through the list. */
 static void cmd_draw_wireframe(Cx4* cx4) {
     uint8_t* ram = cx4->ram;
-    const uint8_t* seg = rom_at(rd24(ram + 0x1f80));
+    const uint8_t* seg0 = rom_at(rd24(ram + 0x1f80));
+    const uint8_t* seg = seg0;
     uint32_t bank = (uint32_t)ram[0x1f82] << 16;
 
     for (int i = ram[0x295]; i > 0; i--, seg += 5) {
         const uint8_t* p1;
         if (seg[0] == 0xff && seg[1] == 0xff) {
-            const uint8_t* prev = seg - 5;
-            while (seg[2] == 0xff && seg[3] == 0xff)
+            /* The chain-walk condition is invariant -- it reads seg, which the
+             * body never advances -- so an entry whose $02/$03 are also $ffff
+             * would spin here for ever. The reference has the identical shape
+             * and evidently never reaches it, but that was established on the
+             * attract loop, and this command is a gameplay path; on the device
+             * a spin inside a cart write handler never returns. Walking back
+             * is also unbounded below, off the front of the list. Both ends
+             * are now held: the walk stops at entry 0, which is as far as it
+             * could ever legitimately go. */
+            const uint8_t* prev = seg > seg0 ? seg - 5 : seg0;
+            while (seg[2] == 0xff && seg[3] == 0xff && prev > seg0)
                 prev -= 5;
             p1 = rom_at(bank | ((uint32_t)prev[2] << 8) | prev[3]);
         } else {
@@ -579,16 +662,17 @@ static void cmd_disintegrate(Cx4* cx4) {
     uint8_t* ram = cx4->ram;
     unsigned w = ram[0x1f89];
     unsigned h = ram[0x1f8c];
+    if (!image_fits(w, h)) return;
     int32_t cx = rds16(ram + 0x1f80);
     int32_t cy = rds16(ram + 0x1f83);
     int32_t sx = rds16(ram + 0x1f86);
     int32_t sy = rds16(ram + 0x1f8f);
 
-    int32_t start_x = -cx * sx + (cx << 8);
-    int32_t start_y = -cy * sy + (cy << 8);
+    int32_t start_x = -cx * sx + shl(cx, 8);
+    int32_t start_y = -cy * sy + shl(cy, 8);
     const uint8_t* src = ram + 0x600;
 
-    memset(ram, 0, (w * h) / 2);
+    memset(ram, 0, clamp_to_ram(0, (w * h) / 2));
 
     uint32_t y = (uint32_t)start_y;
     for (unsigned i = 0; i < h; i++, y += (uint32_t)sy) {
@@ -717,14 +801,25 @@ static void cmd_trapezoid(Cx4* cx4) {
     int a2 = rd16(ram + 0x1f8f) & 0x1ff;
     int16_t s1 = c4_sin(a1), c1 = c4_cos(a1);
     int16_t s2 = c4_sin(a2), c2 = c4_cos(a2);
-    int32_t t1 = c1 != 0 ? (((int32_t)s1 << 16) / c1) : (int32_t)0x80000000;
-    int32_t t2 = c2 != 0 ? (((int32_t)s2 << 16) / c2) : (int32_t)0x80000000;
+    /* Shifting a negative left is undefined, and a sine is negative half the
+     * time. Going through uint32_t keeps every bit and every result the chip
+     * produces, and stops the sanitizer that guards this file from having to
+     * be switched off to run it. */
+    int32_t t1 = c1 != 0 ? ((int32_t)((uint32_t)(int32_t)s1 << 16) / c1) : (int32_t)0x80000000;
+    int32_t t2 = c2 != 0 ? ((int32_t)((uint32_t)(int32_t)s2 << 16) / c2) : (int32_t)0x80000000;
     int16_t y = (int16_t)(rd16(ram + 0x1f83) - rd16(ram + 0x1f89));
     for (int j = 0; j < 225; j++) {
         int16_t left = 1, right = 0;
         if (y >= 0) {
-            left = (int16_t)(((t1 * y) >> 16) - rd16(ram + 0x1f80) + rd16(ram + 0x1f86));
-            right = (int16_t)(((t2 * y) >> 16) - rd16(ram + 0x1f80) + rd16(ram + 0x1f86)
+            /* A tangent times a row can leave int32 -- when cos is near zero
+             * t1 is enormous, and the c==0 case is INT_MIN outright. The chip
+             * keeps the low 32 bits, and so does this: the multiply is done in
+             * uint32_t, where wrapping is defined, and read back as signed.
+             * Same bits as before, minus the undefined behaviour. */
+            int32_t sl = (int32_t)((uint32_t)t1 * (uint32_t)(int32_t)y);
+            int32_t sr = (int32_t)((uint32_t)t2 * (uint32_t)(int32_t)y);
+            left = (int16_t)((sl >> 16) - rd16(ram + 0x1f80) + rd16(ram + 0x1f86));
+            right = (int16_t)((sr >> 16) - rd16(ram + 0x1f80) + rd16(ram + 0x1f86)
                               + rd16(ram + 0x1f93));
             if (left < 0 && right < 0) {
                 left = 1;
@@ -877,10 +972,13 @@ void cx4_write(Cx4* cx4, uint16_t addr, uint8_t val,
     if (addr == 0x7f4f) {
         run_command(cx4, val);
     } else if (addr == 0x7f47) {
-        /* DMA a block from the ROM image into data RAM. */
-        memmove(ram + (rd16(ram + 0x1f45) & 0x1fff),
-                rom_at(rd24(ram + 0x1f40)),
-                rd16(ram + 0x1f43));
+        /* DMA a block from the ROM image into data RAM. Both ends are the
+         * cart's to choose, so both ends are clamped: the destination to what
+         * is left of the 8 KB RAM, the source to what is left of the image. */
+        uint32_t dst = rd16(ram + 0x1f45) & 0x1fff;
+        uint32_t len = clamp_to_ram(dst, rd16(ram + 0x1f43));
+        const uint8_t* src = rom_span(rd24(ram + 0x1f40), &len);
+        if (len) memmove(ram + dst, src, len);
     }
 }
 
