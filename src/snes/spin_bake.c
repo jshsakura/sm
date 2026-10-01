@@ -122,6 +122,32 @@ int spin_bake_run_span(Snes *s, Cpu *cpu, int dots) {
         cpu->z = (val == 0);
         cpu->n = g_bake.mf ? ((val & 0x80) != 0) : ((val & 0x8000) != 0);
         if (val != 0) return dots;   /* loop is leaving -- let the interpreter leave it */
+#if SNES_BAKE_BULK
+        /* At this point the polled byte is zero and every interrupt/DMA/width
+         * guard above passed. Until the next scheduler event no writer can
+         * change this WRAM byte: these two instructions do not write it, the
+         * APU owns a different RAM, and DMA is inactive. Fold WHOLE laps only,
+         * leaving the usual path to execute the last partial instruction.
+         *
+         * Each complete lap leaves PC at pc_load, cyclesLeft at zero, and the
+         * same A/Z/N that the load above just produced. Unlike blind replay,
+         * this reads the real value again on each new span after its event.
+         * Even charges >=2 are required by the two-dot consume contract. */
+        const unsigned load = g_bake.charge_load;
+        const unsigned branch = g_bake.charge_branch;
+        if (load >= 2 && branch >= 2 && !((load | branch) & 1u)) {
+          const unsigned period = load + branch;
+          const unsigned laps = (unsigned)dots / period;
+          if (laps) {
+            const unsigned consumed = laps * period;
+            g_bake.laps += laps;
+            s->apuDotsAccum += consumed;
+            s->hPos += consumed;
+            dots -= (int)consumed;
+            if (dots == 0) return 0;
+          }
+        }
+#endif
         cpu->pc = g_bake.pc_branch;
         s->cpuCyclesLeft += g_bake.charge_load;
       } else if (cpu->pc == g_bake.pc_branch) {

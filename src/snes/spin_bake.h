@@ -81,6 +81,12 @@ extern SpinBake g_bake;
 #define SNES_BAKE_BLIND_REPLAY 0
 #endif
 
+/* Experimental: fold complete LDA/BEQ laps inside an event-free span.
+ * Keep the shipping path as the A/B reference until device measurements. */
+#ifndef SNES_BAKE_BULK
+#define SNES_BAKE_BULK 0
+#endif
+
 /* Scan a loaded cartridge for the signature and install the first match.
  * Call after snes_loadRom (it needs cart->type to map an offset to a pc).
  * Returns true if a loop was installed. */
